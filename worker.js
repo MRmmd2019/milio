@@ -39,18 +39,13 @@ const wsAdapter = new websocket_1.CloudflareWebSocketAdapter();
 // a ceiling an unauthenticated client can force worst-case buffering per
 // connection until the isolate's memory limit degrades every session.
 let activeSessions = 0;
-function jsonResponse(data, status = 200) { return new Response(JSON.stringify(data, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } }); }
-function textResponse(body, status = 200, extraHeaders) { return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", ...(extraHeaders ?? {}) } }); }
-// DS-I2 (RFC 6455 §4.2.1): the Upgrade header must CONTAIN the
-// "websocket" token, not equal it — "WebSocket, h2c" is a valid upgrade
-// offer. Split on commas, trim, and compare case-insensitively (mirrors
-// hasWebSocketUpgradeToken in the WebSocket adapter).
-function hasWebSocketUpgradeToken(request) {
-    const header = request.headers.get("Upgrade");
-    if (!header)
-        return false;
-    return header.split(",").some((token) => token.trim().toLowerCase() === "websocket");
-}
+// RT-2: worker-originated responses carry nosniff like the control layer
+// (DS-I17) — previously only control responses did.
+// RT-7: the Upgrade-token check is imported from the WebSocket adapter
+// instead of duplicated here (the adapter re-checks at accept time, so
+// this pre-check stays defense in depth, now from a single source).
+function jsonResponse(data, status = 200, extraHeaders) { return new Response(JSON.stringify(data, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", ...(extraHeaders ?? {}) } }); }
+function textResponse(body, status = 200, extraHeaders) { return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", ...(extraHeaders ?? {}) } }); }
 function requestId() { return crypto.randomUUID(); }
 function statusForCoreError(error) { switch (error.code) {
     case "BAD_REQUEST":
@@ -60,11 +55,20 @@ function statusForCoreError(error) { switch (error.code) {
     case "MESSAGE_TOO_LARGE": return 413;
     case "TIMEOUT": return 504;
     case "CONFIGURATION_ERROR": return 503;
+    case "CLIENT_CLOSED": return 499;
     default: return 500;
 } }
-function errorResponse(error, id) { const coreError = error instanceof errors_1.CoreError ? error : new errors_1.CoreError("INTERNAL", "Internal Worker error", false, { cause: error }); const payload = { error: coreError.message, code: coreError.code, retryable: coreError.retryable, request_id: id }; if ("issues" in coreError && Array.isArray(coreError.issues))
-    payload.issues = coreError.issues; if (statusForCoreError(coreError) >= 500)
-    console.error(JSON.stringify({ request_id: id, code: coreError.code, message: coreError.message })); return jsonResponse(payload, statusForCoreError(coreError)); }
+function errorResponse(error, id, stripIssues = false) {
+    const coreError = error instanceof errors_1.CoreError ? error : new errors_1.CoreError("INTERNAL", "Internal Worker error", false, { cause: error });
+    const payload = { error: coreError.message, code: coreError.code, retryable: coreError.retryable, request_id: id };
+    if (!stripIssues && "issues" in coreError && Array.isArray(coreError.issues))
+        payload.issues = coreError.issues;
+    if (statusForCoreError(coreError) >= 500)
+        console.error(JSON.stringify({ request_id: id, code: coreError.code, message: coreError.message }));
+    const status = statusForCoreError(coreError); // RT-3 (RFC 7235 §3.1): a 401 carries the Bearer challenge, like the
+    // control layer's error choke point — previously the worker path did not.
+    return jsonResponse(payload, status, status === 401 ? { "www-authenticate": "Bearer" } : undefined);
+}
 function chooseProtocol(path, env) { const vlessPath = env.VLESS_PATH?.trim() || "/vless"; const trojanPath = env.TROJAN_PATH?.trim() || "/trojan"; if (path === vlessPath)
     return "vless"; if (path === trojanPath)
     return "trojan"; return null; }
@@ -87,7 +91,12 @@ exports.default = {
                 return jsonResponse({ status: "ready", core_version: core_1.CORE_VERSION, bindings: { DB: Boolean(env.DB), KV: Boolean(env.KV) } });
             }
             catch (error) {
-                return errorResponse(error, requestId());
+                // C-7: /__core/ready is unauthenticated, so its error payload must
+                // not carry validation `issues` — some echo operator config text
+                // (e.g. routing rule entries). The admin-gated diagnostics route
+                // still surfaces the full issues list. Status and top-level error
+                // stay identical; only the issues array is stripped.
+                return errorResponse(error, requestId(), true);
             }
         }
         // Control-layer failures go through the same structured error path as
@@ -103,11 +112,11 @@ exports.default = {
             return control;
         const protocol = chooseProtocol(url.pathname, env);
         if (!protocol)
-            return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+            return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff" } });
         // DS-I1 (RFC 9110 §15.5.6): a 405 response carries an Allow header.
         if (request.method !== "GET")
             return textResponse("WebSocket endpoint requires GET", 405, { allow: "GET" });
-        if (!hasWebSocketUpgradeToken(request))
+        if (!(0, websocket_1.hasWebSocketUpgradeToken)(request))
             return (0, websocket_1.websocketUpgradeRequiredResponse)();
         if (activeSessions >= core_1.CORE_LIMITS.maxConcurrentSessions)
             return textResponse("Too many concurrent sessions", 503);
@@ -187,6 +196,9 @@ function statusForCoreError(error) {
         case "UNSUPPORTED_PROTOCOL":
         case "UNSUPPORTED_TRANSPORT": return 400;
         case "AUTH_FAILED": return 401;
+        // C-3: a client disconnect is not a server error — 499 (client closed
+        // request) with no error log (the >= 500 console.error below skips it).
+        case "CLIENT_CLOSED": return 499;
         case "MESSAGE_TOO_LARGE": return 413;
         case "TIMEOUT": return 504;
         case "CONFIGURATION_ERROR": return 503;
@@ -208,7 +220,7 @@ function errorResponse(error, id) {
     const status = statusForCoreError(coreError);
     return jsonResponse(payload, status, status === 401 ? { "www-authenticate": "Bearer" } : undefined);
 }
-function validateEnvironment(env) { (0, validation_1.validateEnvironment)(env); }
+function validateEnvironment(env) { return (0, validation_1.validateEnvironment)(env); }
 // Path-secret checks go through security/authorize's digest-based constant-time
 // comparison — the same treatment the bearer tokens get. A local === over the raw secret
 // short-circuited on the first differing character (audit F9).
@@ -220,6 +232,9 @@ async function handleControlRequest(request, env) {
     // authorization can never disagree over a stray slash.
     const dohPath = (env.DOH_PATH?.trim() || "/dns-query").replace(/\/+$/, "") || "/dns-query";
     const isDohPath = (url.pathname.replace(/\/+$/, "") || "/") === dohPath || (0, doh_1.privateDohPathSecretMatches)(request, env);
+    // P2 DoH JSON API: GET-only like the other control routes (405 + Allow:
+    // GET for other methods, via the shared guard below).
+    const isDohJsonPath = url.pathname === "/__core/doh-json";
     const isOutputPath = (base) => url.pathname === base || (0, authorize_1.pathSecretMatches)(request, base, env.CORE_OUTPUT_PATH_SECRET);
     // Derive the format from the route base that actually matched. Scanning the whole
     // pathname for "/xray" / "/sing-box" substrings let a path secret containing such a
@@ -228,6 +243,7 @@ async function handleControlRequest(request, env) {
         ["/__core/outputs/xray", "xray"],
         ["/__core/outputs/sing-box", "sing-box"],
         ["/__core/outputs/clash", "clash"],
+        ["/__core/outputs/surge", "surge"],
     ];
     const matchedOutput = outputRoutes.find(([base]) => isOutputPath(base));
     const isSubscriptionPath = url.pathname === "/sub" || (0, authorize_1.pathSecretMatches)(request, "/sub", env.CORE_OUTPUT_PATH_SECRET) || url.pathname === "/__core/outputs" || (0, authorize_1.pathSecretMatches)(request, "/__core/outputs", env.CORE_OUTPUT_PATH_SECRET) || url.pathname === "/__core/outputs/share" || (0, authorize_1.pathSecretMatches)(request, "/__core/outputs/share", env.CORE_OUTPUT_PATH_SECRET);
@@ -237,7 +253,7 @@ async function handleControlRequest(request, env) {
     // non-GET methods with 405 + Allow: GET (RFC 9110 §15.5.6). DoH paths
     // are excluded: the DoH handler itself allows GET and POST and already
     // answers other methods with 405 + Allow: GET, POST.
-    if (!isDohPath && request.method !== "GET" && (isAdminPath || matchedOutput || isSubscriptionPath)) {
+    if (!isDohPath && request.method !== "GET" && (isAdminPath || matchedOutput || isSubscriptionPath || isDohJsonPath)) {
         return textResponse("Method Not Allowed", 405, { allow: "GET" });
     }
     if (isAdminPath) {
@@ -245,7 +261,7 @@ async function handleControlRequest(request, env) {
         try {
             const scope = url.pathname === "/__core/tests" ? "tests:run" : "diagnostics:read";
             (0, authorize_1.requireAdminOperation)(request, env, scope);
-            validateEnvironment(env);
+            const validated = validateEnvironment(env);
             const runtime = (0, runtime_1.runtimeFor)(env);
             if (url.pathname === "/__core/tests")
                 return jsonResponse({ ...(await (0, runner_1.runSelfTests)(env)), request_id: id });
@@ -254,6 +270,10 @@ async function handleControlRequest(request, env) {
             const proxyip = (0, proxyip_1.hasProxyIp)(env);
             return jsonResponse({
                 ok: true, core_version: core_1.CORE_VERSION,
+                // Non-fatal startup warnings (CFG-5, CFG-6, PR-2) — admin-gated
+                // diagnostics is the right surface: never on unauthenticated
+                // paths, and warnings never carry variable values.
+                warnings: validated.warnings,
                 runtime: { platform: "cloudflare-workers", websocket: true, tcp_sockets: true, durable_objects: false },
                 protocols: ["vless", "trojan"], transports: ["websocket"],
                 egress: { direct: true, proxyip, relay: Boolean(env.PROXY_RELAY_ENDPOINTS?.trim()), nat64: Boolean((env.NAT64_PREFIXES?.trim() || env.EGRESS_MODE?.trim().toLowerCase() === "smart" || env.EGRESS_MODE?.trim().toLowerCase() === "nat64")) },
@@ -277,6 +297,14 @@ async function handleControlRequest(request, env) {
             return errorResponse(error, requestId());
         }
     }
+    if (isDohJsonPath) {
+        try {
+            return await (0, doh_1.handleDohJson)(request, env);
+        }
+        catch (error) {
+            return errorResponse(error, requestId());
+        }
+    }
     if (matchedOutput) {
         const [outputBase, format] = matchedOutput;
         const id = requestId();
@@ -284,7 +312,10 @@ async function handleControlRequest(request, env) {
             (0, authorize_1.requireOutputAccess)(request, env, [outputBase]);
             validateEnvironment(env);
             const runtime = (0, runtime_1.runtimeFor)(env);
-            const rendered = await (0, service_1.renderCoreFormat)(env, request, runtime.credentials, format);
+            // Pass the runtime DNS resolver so preferred-IP URL fetches can
+            // resolve hostname URLs on the render path (previously only the
+            // native subscription path received it).
+            const rendered = await (0, service_1.renderCoreFormat)(env, request, runtime.credentials, format, runtime.dns);
             return new Response(rendered.body, { status: 200, headers: { "content-type": rendered.contentType, "cache-control": "no-store", "x-content-type-options": "nosniff", ...(rendered.headers ?? {}) } });
         }
         catch (error) {
@@ -402,13 +433,23 @@ function requireScope(request, env, scope, allowQuery = false) {
     return identity;
 }
 function requireAdminOperation(request, env, scope) {
+    // C-8/SEC-5 (ACCEPTED, not changed): when no admin credential is
+    // configured, an unauthenticated caller gets CONFIGURATION_ERROR
+    // "configure CORE_ADMIN_TOKEN" — a mode oracle, but only about
+    // unconfigured-state (no values), and the 503 fail-closed behavior is
+    // the project's pinned contract (local-worker-contract asserts
+    // diagnostics fail closed with 503 when unconfigured). The finding
+    // itself frames the change as optional ("if the project wants to close
+    // it"); trading the operator's misconfiguration signal for this minimal
+    // oracle gain was judged the wrong trade. Recorded, not fixed.
     if (!env.CORE_ADMIN_TOKEN?.trim() && !(env.CORE_TEST_TOKEN?.trim() && legacyTestTokenEnabled(env))) {
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "Management endpoint disabled; configure CORE_ADMIN_TOKEN");
     }
     return requireScope(request, env, scope, false);
 }
-function requireOutputAccess(request, env, pathBases = ["/sub", "/__core/outputs", "/__core/outputs/share", "/__core/outputs/xray", "/__core/outputs/sing-box", "/__core/outputs/clash"]) {
+function requireOutputAccess(request, env, pathBases = ["/sub", "/__core/outputs", "/__core/outputs/share", "/__core/outputs/xray", "/__core/outputs/sing-box", "/__core/outputs/clash", "/__core/outputs/surge"]) {
     const configured = env.CORE_OUTPUT_TOKEN?.trim() || env.CORE_ADMIN_TOKEN?.trim() || env.CORE_OUTPUT_PATH_SECRET?.trim();
+    // C-8/SEC-5: same acceptance as requireAdminOperation (see above).
     if (!configured)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "Output API disabled; configure CORE_OUTPUT_TOKEN or CORE_OUTPUT_PATH_SECRET");
     if (pathBases.some((base) => pathSecretMatches(request, base, env.CORE_OUTPUT_PATH_SECRET))) {
@@ -538,14 +579,29 @@ exports.CoreError = CoreError;
 function isAbortError(error) {
     return error instanceof DOMException && error.name === "AbortError";
 }
+// CORE-5: central redaction for converted unknown errors. In-tree CoreError
+// messages are curated at creation (host-echoing paths already sanitize per
+// DS-M4/EG-07), but asCoreError converts arbitrary upstream errors whose
+// messages may embed credential-bearing URLs — and both errorResponse choke
+// points emit CoreError.message verbatim in HTTP error JSON. Strip userinfo
+// from any scheme://...@... substring at conversion time; the original
+// error stays attached as `cause` for server-side inspection only (never
+// serialized into the HTTP payload).
+function redactMessage(message) {
+    return message.replace(/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'<>]*@[^\s"'<>]*/g, (match) => {
+        const scheme = match.slice(0, match.indexOf("://") + 3);
+        const host = match.slice(match.lastIndexOf("@") + 1);
+        return `${scheme}[redacted]@${host}`;
+    });
+}
 function asCoreError(error, fallbackCode = "INTERNAL") {
     if (error instanceof CoreError)
         return error;
     if (isAbortError(error))
         return new CoreError("CLIENT_CLOSED", "Operation aborted", false, { cause: error });
     if (error instanceof Error)
-        return new CoreError(fallbackCode, error.message || "Core operation failed", false, { cause: error });
-    return new CoreError(fallbackCode, String(error));
+        return new CoreError(fallbackCode, redactMessage(error.message || "Core operation failed"), false, { cause: error });
+    return new CoreError(fallbackCode, redactMessage(String(error)));
 }
 function closeCodeForError(error) {
     switch (error.code) {
@@ -591,6 +647,7 @@ __m["handlers/doh"] = function(module, exports, __r) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.privateDohPathSecretMatches = privateDohPathSecretMatches;
 exports.handlePrivateDoh = handlePrivateDoh;
+exports.handleDohJson = handleDohJson;
 const errors_1 = __r("../core/errors");
 const limits_1 = __r("../core/limits");
 const sha224_1 = __r("../util/sha224");
@@ -659,9 +716,16 @@ async function handlePrivateDoh(request, env) {
         return new Response("Method Not Allowed", { status: 405, headers: { allow: "GET, POST" } });
     const token = env.CORE_DOH_TOKEN?.trim();
     const pathAuthorized = privateDohPathSecretMatches(request, env);
-    if (!token && !pathAuthorized)
-        return new Response("Private DoH disabled", { status: 503 });
+    // C-5: the old branches returned 503 for path-secret-only deployments
+    // and 401 for bearer-token deployments, revealing which credential mode
+    // is in use to an unauthenticated prober. Now the only distinction is
+    // enabled-vs-disabled: any enabled DoH (bearer token OR path secret)
+    // answers unauthenticated requests with 401; 503 means DoH has no
+    // credential configured at all.
     if (!pathAuthorized) {
+        const dohEnabled = Boolean(token) || Boolean(env.CORE_DOH_PATH_SECRET?.trim());
+        if (!dohEnabled)
+            return new Response("Private DoH disabled", { status: 503 });
         const supplied = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim();
         // DS-I14 (RFC 7235 §3.1; RFC 8484 §4.2.1 contemplates 401 for DoH):
         // a 401 response carries a WWW-Authenticate challenge.
@@ -694,6 +758,24 @@ async function handlePrivateDoh(request, env) {
     // and keep its identity for response matching (D1).
     const question = (0, doh_1.validateRawDnsQuery)(input);
     const requestId = ((input[0] << 8) | input[1]) >>> 0;
+    // C-3: a client disconnect anywhere in the upstream loop (backoff or
+    // fetch) surfaces as CLIENT_CLOSED, not as a raw abort reason that the
+    // control errorResponse would convert to a spurious logged 500. Both
+    // errorResponse choke points map CLIENT_CLOSED to 499 with no error log.
+    try {
+        const body = await queryUpstreamResolvers(input, question, requestId, env, request.signal);
+        return new Response(body, { status: 200, headers: { "content-type": "application/dns-message", "cache-control": "no-store" } });
+    }
+    catch (error) {
+        if (request.signal.aborted)
+            throw new errors_1.CoreError("CLIENT_CLOSED", "Client disconnected during DoH resolution");
+        throw error;
+    }
+}
+// Shared upstream loop for wire DoH and the JSON API (P2): same endpoints,
+// same retry/backoff budget, same response validation. Callers own the
+// request parsing and the response rendering.
+async function queryUpstreamResolvers(input, question, requestId, env, signal) {
     const endpoints = resolverUrls(env);
     if (!endpoints.length)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "No DoH resolver configured");
@@ -710,11 +792,16 @@ async function handlePrivateDoh(request, env) {
         for (let attempt = 0; attempt <= retries && attemptsLeft > 0 && !endpointDone; attempt++) {
             attemptsLeft--;
             if (attempt > 0)
-                await attemptBackoff(attempt, request.signal);
+                await attemptBackoff(attempt, signal);
+            // C-4: never issue an upstream POST for an already-disconnected
+            // client. The abort listener below never fires when the signal is
+            // already aborted at listener-registration time, so check first.
+            if (signal.aborted)
+                throw signal.reason ?? new DOMException("Aborted", "AbortError");
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(new errors_1.CoreError("TIMEOUT", "Private DoH upstream timeout", true)), parseTimeoutMs(env));
-            const onAbort = () => controller.abort(request.signal.reason ?? new DOMException("Aborted", "AbortError"));
-            request.signal.addEventListener("abort", onAbort, { once: true });
+            const onAbort = () => controller.abort(signal.reason ?? new DOMException("Aborted", "AbortError"));
+            signal.addEventListener("abort", onAbort, { once: true });
             try {
                 const response = await fetch(endpoint, {
                     method: "POST",
@@ -751,12 +838,12 @@ async function handlePrivateDoh(request, env) {
                     endpointDone = true;
                     throw error;
                 }
-                return new Response(body, { status: 200, headers: { "content-type": "application/dns-message", "cache-control": "no-store" } });
+                return body;
             }
             catch (error) {
                 lastError = error;
-                if (request.signal.aborted)
-                    throw request.signal.reason;
+                if (signal.aborted)
+                    throw signal.reason;
                 // DS-L20: a certainly-oversize response (MESSAGE_TOO_LARGE) is
                 // deterministic for this endpoint, exactly like a non-retryable
                 // DNS_FAILED — retrying it up to DNS_RETRIES cannot succeed, so
@@ -768,7 +855,7 @@ async function handlePrivateDoh(request, env) {
             }
             finally {
                 clearTimeout(timer);
-                request.signal.removeEventListener("abort", onAbort);
+                signal.removeEventListener("abort", onAbort);
             }
         }
         if (!fallback)
@@ -890,6 +977,294 @@ async function cappedResponseBody(response, maxBytes) {
         offset += chunk.byteLength;
     }
     return out;
+}
+// ---------------------------------------------------------------------------
+// DoH JSON API (P2 benchmark candidate): GET /__core/doh-json?name=…&type=…
+// Same upstream posture as wire DoH (same resolvers, same retry/backoff
+// budget, same response validation) with a Google-style JSON rendering.
+// Auth posture: bearer token ONLY (Authorization header). The wire path's
+// path-secret form has no JSON-route equivalent, and query tokens are
+// deliberately never accepted (they would leak in logs) — so a
+// path-secret-only deployment answers the JSON route with 503, documented
+// in OUTPUTS.md. DNS_ENABLED=false disables this route exactly like wire
+// DoH, checked after auth so the gate is not an oracle.
+// Scope: answers only (authority/additional sections are not rendered);
+// rdata presentation covers A, AAAA, CNAME, NS, PTR, MX, SOA, SRV, TXT,
+// CAA, and falls back to base64 for other types.
+// ---------------------------------------------------------------------------
+const DNS_TYPE_NAMES = {
+    A: 1, NS: 2, CNAME: 5, SOA: 6, PTR: 12, MX: 15, TXT: 16, AAAA: 28,
+    SRV: 33, DNSKEY: 48, DS: 43, NSEC: 47, RRSIG: 46, CAA: 257, HTTPS: 65, SVCB: 64,
+};
+function parseDohJsonType(raw) {
+    const value = (raw ?? "A").trim();
+    if (/^\d+$/.test(value)) {
+        const n = Number(value);
+        if (n >= 1 && n <= 65535)
+            return n;
+        throw new errors_1.CoreError("BAD_REQUEST", "DoH JSON type must be 1..65535 or a known type name");
+    }
+    const upper = value.toUpperCase();
+    const known = DNS_TYPE_NAMES[upper];
+    if (known !== undefined)
+        return known;
+    throw new errors_1.CoreError("BAD_REQUEST", `Unknown DoH JSON type: ${value}`);
+}
+function encodeDnsName(name) {
+    const labels = name.split(".");
+    const bytes = [];
+    for (const label of labels) {
+        if (!/^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label) || label.length > 63) {
+            throw new errors_1.CoreError("BAD_REQUEST", `Invalid DNS name label: ${label}`);
+        }
+        bytes.push(label.length, ...new TextEncoder().encode(label));
+    }
+    bytes.push(0);
+    return new Uint8Array(bytes);
+}
+function buildDnsQuery(name, type, id) {
+    const qname = encodeDnsName(name);
+    const out = new Uint8Array(12 + qname.byteLength + 4);
+    const view = new DataView(out.buffer);
+    view.setUint16(0, id, false);
+    view.setUint16(2, 0x0100, false); // RD
+    view.setUint16(4, 1, false); // QDCOUNT
+    out.set(qname, 12);
+    view.setUint16(12 + qname.byteLength, type, false);
+    view.setUint16(14 + qname.byteLength, 1, false); // QCLASS IN
+    return out;
+}
+// Bounds-checked DNS name reader with compression-pointer support and a
+// jump cap (a malicious loop of pointers must terminate).
+function readDnsName(message, view, start) {
+    const labels = [];
+    let offset = start;
+    let next = -1;
+    let jumps = 0;
+    while (true) {
+        if (offset >= message.byteLength)
+            throw new errors_1.CoreError("DNS_FAILED", "Truncated DNS name in response");
+        const len = message[offset];
+        if (len === 0) {
+            if (next < 0)
+                next = offset + 1;
+            break;
+        }
+        if ((len & 0xc0) === 0xc0) {
+            if (offset + 1 >= message.byteLength)
+                throw new errors_1.CoreError("DNS_FAILED", "Truncated DNS compression pointer");
+            if (++jumps > 10)
+                throw new errors_1.CoreError("DNS_FAILED", "Too many DNS compression jumps");
+            if (next < 0)
+                next = offset + 2;
+            offset = view.getUint16(offset, false) & 0x3fff;
+            continue;
+        }
+        if (len & 0xc0)
+            throw new errors_1.CoreError("DNS_FAILED", "Invalid DNS name label type");
+        if (offset + 1 + len > message.byteLength)
+            throw new errors_1.CoreError("DNS_FAILED", "Truncated DNS name label");
+        labels.push(new TextDecoder().decode(message.subarray(offset + 1, offset + 1 + len)));
+        offset += 1 + len;
+    }
+    return { name: labels.join("."), next: next < 0 ? offset + 1 : next };
+}
+function formatIpv6Bytes(bytes) {
+    const groups = [];
+    for (let i = 0; i < 16; i += 2)
+        groups.push((bytes[i] << 8) | bytes[i + 1]);
+    let bestStart = -1;
+    let bestLen = 0;
+    let runStart = -1;
+    let runLen = 0;
+    for (let i = 0; i < 8; i++) {
+        if (groups[i] === 0) {
+            if (runStart < 0) {
+                runStart = i;
+                runLen = 1;
+            }
+            else
+                runLen++;
+            if (runLen > bestLen) {
+                bestStart = runStart;
+                bestLen = runLen;
+            }
+        }
+        else {
+            runStart = -1;
+            runLen = 0;
+        }
+    }
+    if (bestLen < 2)
+        return groups.map((g) => g.toString(16)).join(":");
+    const parts = [];
+    for (let i = 0; i < 8;) {
+        if (i === bestStart) {
+            parts.push("");
+            i += bestLen;
+            if (i >= 8)
+                parts.push("");
+            continue;
+        }
+        parts.push(groups[i].toString(16));
+        i++;
+    }
+    return parts.join(":");
+}
+function decodeRdata(message, view, offset, length, type) {
+    const end = offset + length;
+    const slice = message.subarray(offset, end);
+    const u16 = (at) => view.getUint16(at, false);
+    const u32 = (at) => view.getUint32(at, false);
+    switch (type) {
+        case 1: return slice.length === 4 ? [...slice].join(".") : "";
+        case 28: return slice.length === 16 ? formatIpv6Bytes(slice) : "";
+        case 2:
+        case 5:
+        case 12: {
+            try {
+                return readDnsName(message, view, offset).name;
+            }
+            catch {
+                return "";
+            }
+        }
+        case 15: {
+            if (length < 3)
+                return "";
+            try {
+                return `${u16(offset)} ${readDnsName(message, view, offset + 2).name}`;
+            }
+            catch {
+                return "";
+            }
+        }
+        case 6: {
+            try {
+                const mname = readDnsName(message, view, offset);
+                const rname = readDnsName(message, view, mname.next);
+                const p = rname.next;
+                if (p + 20 > message.byteLength)
+                    return "";
+                return `${mname.name} ${rname.name} ${u32(p)} ${u32(p + 4)} ${u32(p + 8)} ${u32(p + 12)} ${u32(p + 16)}`;
+            }
+            catch {
+                return "";
+            }
+        }
+        case 33: {
+            if (length < 7)
+                return "";
+            try {
+                return `${u16(offset)} ${u16(offset + 2)} ${u16(offset + 4)} ${readDnsName(message, view, offset + 6).name}`;
+            }
+            catch {
+                return "";
+            }
+        }
+        case 16: {
+            const parts = [];
+            let p = offset;
+            while (p < end) {
+                const len = message[p];
+                if (p + 1 + len > end)
+                    break;
+                parts.push(`"${new TextDecoder().decode(message.subarray(p + 1, p + 1 + len))}"`);
+                p += 1 + len;
+            }
+            return parts.join(" ");
+        }
+        case 257: {
+            if (length < 3)
+                return "";
+            const tagLen = message[offset + 1];
+            if (offset + 2 + tagLen > end)
+                return "";
+            return `${message[offset]} ${new TextDecoder().decode(message.subarray(offset + 2, offset + 2 + tagLen))} ${new TextDecoder().decode(message.subarray(offset + 2 + tagLen, end))}`;
+        }
+        default: {
+            let binary = "";
+            for (const byte of slice)
+                binary += String.fromCharCode(byte);
+            return btoa(binary);
+        }
+    }
+}
+function renderDohJson(message, questionName, questionType) {
+    const view = new DataView(message.buffer, message.byteOffset, message.byteLength);
+    if (message.byteLength < 12)
+        throw new errors_1.CoreError("DNS_FAILED", "Upstream DoH response too short");
+    const flags = view.getUint16(2, false);
+    const qd = view.getUint16(4, false);
+    const an = view.getUint16(6, false);
+    let offset = 12;
+    for (let i = 0; i < qd; i++) {
+        const q = readDnsName(message, view, offset);
+        offset = q.next + 4;
+        if (offset > message.byteLength)
+            throw new errors_1.CoreError("DNS_FAILED", "Truncated DNS question in response");
+    }
+    const answers = [];
+    for (let i = 0; i < an; i++) {
+        const name = readDnsName(message, view, offset);
+        offset = name.next;
+        if (offset + 10 > message.byteLength)
+            throw new errors_1.CoreError("DNS_FAILED", "Truncated DNS answer in response");
+        const type = view.getUint16(offset, false);
+        const ttl = view.getUint32(offset + 4, false);
+        const rdlength = view.getUint16(offset + 8, false);
+        const rdataAt = offset + 10;
+        if (rdataAt + rdlength > message.byteLength)
+            throw new errors_1.CoreError("DNS_FAILED", "Truncated DNS rdata in response");
+        const data = decodeRdata(message, view, rdataAt, rdlength, type);
+        if (data !== "")
+            answers.push({ name: name.name, type, TTL: ttl, data });
+        offset = rdataAt + rdlength;
+    }
+    return {
+        Status: flags & 0x000f,
+        TC: (flags & 0x0200) !== 0,
+        RD: (flags & 0x0100) !== 0,
+        RA: (flags & 0x0080) !== 0,
+        AD: (flags & 0x0020) !== 0,
+        CD: (flags & 0x0010) !== 0,
+        Question: [{ name: questionName, type: questionType }],
+        ...(answers.length ? { Answer: answers } : {}),
+    };
+}
+async function handleDohJson(request, env) {
+    if (request.method !== "GET")
+        return new Response("Method Not Allowed", { status: 405, headers: { allow: "GET" } });
+    // Bearer-token auth only (see module header for the path-secret rationale).
+    const token = env.CORE_DOH_TOKEN?.trim();
+    if (!token)
+        return new Response("DoH JSON API requires a bearer token (CORE_DOH_TOKEN); path-secret-only deployments use wire DoH", { status: 503 });
+    const supplied = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim();
+    if (!supplied || !constantTimeEqual(supplied, token))
+        return new Response("Unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
+    const dnsEnabledRaw = env.DNS_ENABLED?.trim().toLowerCase();
+    if (dnsEnabledRaw && ["0", "false", "no", "off"].includes(dnsEnabledRaw))
+        return new Response("Private DoH disabled", { status: 503 });
+    const params = new URL(request.url).searchParams;
+    const rawName = params.get("name")?.trim().toLowerCase().replace(/\.$/, "");
+    if (!rawName || rawName.length > 253)
+        throw new errors_1.CoreError("BAD_REQUEST", "DoH JSON requires a name parameter (<= 253 chars)");
+    const type = parseDohJsonType(params.get("type") ?? undefined);
+    const id = Math.floor(Math.random() * 65536);
+    const query = buildDnsQuery(rawName, type, id);
+    const question = { name: rawName, type, classCode: 1 };
+    try {
+        const body = await queryUpstreamResolvers(query, question, id, env, request.signal);
+        return new Response(JSON.stringify(renderDohJson(body, rawName, type)), {
+            status: 200,
+            headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+        });
+    }
+    catch (error) {
+        if (request.signal.aborted)
+            throw new errors_1.CoreError("CLIENT_CLOSED", "Client disconnected during DoH resolution");
+        throw error;
+    }
 }
 
 };
@@ -1081,7 +1456,7 @@ function parseMessage(bytes, expectedId, expectedName, expectedType) {
                 throw new errors_1.CoreError("DNS_FAILED", "Malformed DNS answer", true);
             const type = view.getUint16(offset);
             const klass = view.getUint16(offset + 2);
-            const ttl = view.getUint32(offset + 4);
+            const ttl = normalizeTtl(view.getUint32(offset + 4));
             const rdLength = view.getUint16(offset + 8);
             offset += 10;
             if (offset + rdLength > bytes.length)
@@ -1112,7 +1487,7 @@ function parseMessage(bytes, expectedId, expectedName, expectedType) {
                     const mname = readName(bytes, rdataOffset);
                     const rname = readName(bytes, mname.next);
                     if (rname.next + 20 <= rdataOffset + rdLength) {
-                        soaMinimum = view.getUint32(rname.next + 16);
+                        soaMinimum = normalizeTtl(view.getUint32(rname.next + 16));
                         soaTtl = ttl;
                     }
                 }
@@ -1145,6 +1520,9 @@ function normalizeEndpoint(value) {
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "Only credential-free HTTPS DoH endpoints are supported");
     if (url.hostname.length > 253 || url.href.length > 2048)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "DoH endpoint is too long");
+    // DNS-2 (defense in depth — config.ts strips it first): never send an
+    // endpoint query string on upstream POSTs.
+    url.search = "";
     return url.toString();
 }
 /**
@@ -1179,8 +1557,22 @@ exports.DnsAttemptBudgetCounter = DnsAttemptBudgetCounter;
  * Returns undefined when the response carries no usable SOA, in which case
  * the cache's configured default applies.
  */
-function negativeCacheTtlSeconds(message) {
-    const soa = message.authority.find((item) => item.type === TYPE_SOA && item.soaMinimum !== undefined);
+// DNS-3 (RFC 2181 §8): a TTL with the high bit set is treated as zero,
+// not cached for up to the cache cap. Applied at parse time so every
+// downstream consumer (answer TTLs, SOA TTLs, MINIMUM) sees the
+// normalized value.
+function normalizeTtl(value) { return value >= 0x80000000 ? 0 : value; }
+function negativeCacheTtlSeconds(message, queryHost) {
+    // DNS-5 (RFC 2308 §5): the SOA must belong to the queried name's zone —
+    // an unrelated SOA in the authority section must not set the negative
+    // TTL. Accept the SOA whose owner is the queried name itself or any
+    // parent zone of it (suffix match on a label boundary).
+    const soa = message.authority.find((item) => {
+        if (item.type !== TYPE_SOA || item.soaMinimum === undefined)
+            return false;
+        const owner = canonicalDnsName(item.name);
+        return owner === queryHost || queryHost.endsWith(`.${owner}`);
+    });
     if (!soa || soa.soaMinimum === undefined)
         return undefined;
     // DS-L15: a computed TTL of 0 is a real value (RFC 2308 §5: do not
@@ -1390,6 +1782,10 @@ class DoHResolver {
             if (attempt > 0)
                 await retryBackoff(attempt, signal);
             this.q++;
+            // DNS-7: deterministic failures (4xx, wrong content type, malformed
+            // response) break the retry loop — retrying the same resolver cannot
+            // fix them; the engine still falls through to the next resolver.
+            let deterministicFailure = false;
             try {
                 const controller = new AbortController();
                 let timedOut = false;
@@ -1417,6 +1813,17 @@ class DoHResolver {
                     if (!response.ok) {
                         const error = new errors_1.CoreError("DNS_FAILED", `DoH resolver returned HTTP ${response.status}`, true);
                         this.recordFailure("http", error, attempt, response.status);
+                        if (response.status >= 400 && response.status < 500)
+                            deterministicFailure = true;
+                        throw error;
+                    }
+                    // DNS-6 (RFC 8484 §4, matching the handler path): a wrong
+                    // content type is rejected even if the body would parse — the
+                    // message-validation gates alone do not make it a DNS response.
+                    if (response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/dns-message") {
+                        const error = new errors_1.CoreError("DNS_FAILED", "DoH resolver returned a non-DNS content type", true);
+                        this.recordFailure("validation", error, attempt);
+                        deterministicFailure = true;
                         throw error;
                     }
                     let bytes;
@@ -1430,6 +1837,7 @@ class DoHResolver {
                     if (bytes.byteLength < 12) {
                         const error = new errors_1.CoreError("DNS_FAILED", "DoH response is not a DNS message", true);
                         this.recordFailure("validation", error, attempt);
+                        deterministicFailure = true;
                         throw error;
                     }
                     try {
@@ -1438,6 +1846,7 @@ class DoHResolver {
                     catch (error) {
                         const wrapped = error instanceof errors_1.CoreError ? error : new errors_1.CoreError("DNS_FAILED", "Malformed DoH DNS response", true, { cause: error });
                         this.recordFailure("validation", wrapped, attempt);
+                        deterministicFailure = true;
                         throw wrapped;
                     }
                     this.s++;
@@ -1454,6 +1863,8 @@ class DoHResolver {
                     throw signal.reason;
                 if (error instanceof errors_1.CoreError && (error.code === "MESSAGE_TOO_LARGE" || error.code === "CONFIGURATION_ERROR"))
                     throw error;
+                if (deterministicFailure)
+                    break;
             }
         }
         this.f++;
@@ -1564,6 +1975,8 @@ class DoHResolver {
             if (attempt > 0)
                 await retryBackoff(attempt, signal);
             this.q++;
+            // DNS-7: see queryRaw — deterministic failures break the retry loop.
+            let deterministicFailure = false;
             try {
                 const controller = new AbortController();
                 let timedOut = false;
@@ -1594,6 +2007,15 @@ class DoHResolver {
                     if (!response.ok) {
                         const error = new errors_1.CoreError("DNS_FAILED", `DoH resolver returned HTTP ${response.status}`, true);
                         this.recordFailure("http", error, attempt, response.status);
+                        if (response.status >= 400 && response.status < 500)
+                            deterministicFailure = true;
+                        throw error;
+                    }
+                    // DNS-6: see queryRaw.
+                    if (response.headers.get("content-type")?.split(";")[0].trim().toLowerCase() !== "application/dns-message") {
+                        const error = new errors_1.CoreError("DNS_FAILED", "DoH resolver returned a non-DNS content type", true);
+                        this.recordFailure("validation", error, attempt);
+                        deterministicFailure = true;
                         throw error;
                     }
                     const contentLength = Number(response.headers.get("content-length") ?? "0");
@@ -1616,20 +2038,22 @@ class DoHResolver {
                     }
                     catch (error) {
                         this.recordFailure("parse", error, attempt);
+                        deterministicFailure = true;
                         throw error;
                     }
                     if (parsed.status === 3) {
-                        this.options.cache?.setNegative(host, type, negativeCacheTtlSeconds(parsed));
+                        this.options.cache?.setNegative(host, type, negativeCacheTtlSeconds(parsed, host));
                         this.s++;
                         return parsed;
                     }
                     if (parsed.status !== 0) {
                         const error = new errors_1.CoreError("DNS_FAILED", `DoH resolver returned DNS RCODE ${parsed.status}`, true);
                         this.recordFailure("rcode", error, attempt);
+                        deterministicFailure = true;
                         throw error;
                     }
                     if (!parsed.answers.length) {
-                        this.options.cache?.setNegative(host, type, negativeCacheTtlSeconds(parsed));
+                        this.options.cache?.setNegative(host, type, negativeCacheTtlSeconds(parsed, host));
                         this.s++;
                         return parsed;
                     }
@@ -1655,6 +2079,8 @@ class DoHResolver {
                 lastError = error;
                 if (signal.aborted)
                     throw signal.reason;
+                if (deterministicFailure)
+                    break;
             }
         }
         this.f++;
@@ -1672,6 +2098,8 @@ exports.normalizeHostname = normalizeHostname;
 exports.isCanonicalIpv4 = isCanonicalIpv4;
 exports.isAsciiHostname = isAsciiHostname;
 exports.toAsciiHostname = toAsciiHostname;
+exports.isPrivateIpLiteral = isPrivateIpLiteral;
+exports.sanitizeHostForMessage = sanitizeHostForMessage;
 function normalizeHostname(value) {
     let input = value.trim().toLowerCase();
     if (input.startsWith("[") && input.endsWith("]"))
@@ -1693,9 +2121,16 @@ function isAsciiHostname(value) {
     const labels = normalized.split(".");
     if (labels.some((label) => !label || label.length > 63 || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)))
         return false;
-    // A dotted all-numeric string is an IPv4-literal attempt, not a hostname: accept it only
-    // as a canonical dotted quad, so "999.1.1.1" or "1.2.3.4.5" cannot pass as hostnames (F18).
-    if (labels.length >= 2 && labels.every((label) => /^\d+$/.test(label)))
+    // TU-5: a numeric-like string is an IPv4-literal attempt, not a hostname, even when
+    // it has a single label ("2130706433" is 127.0.0.1 to WHATWG URL and to several
+    // downstream parsers) or uses hex/octal spellings ("0x7f.1", "0177.0.0.1"). Accept
+    // such a string only as a canonical dotted quad. This is hardening, not a
+    // confirmed bypass: toAsciiHostname already canonicalizes-and-rejects these
+    // spellings, but isAsciiHostname is also used on paths that never canonicalize.
+    // A label is "numeric-like" if it is all digits (decimal, incl. leading zeros)
+    // or a 0x-prefixed hex token.
+    const numericLike = (label) => /^(0x[0-9a-f]+|\d+)$/i.test(label);
+    if (labels.every(numericLike))
         return isCanonicalIpv4(normalized);
     return true;
 }
@@ -1706,12 +2141,19 @@ function isValidIpv6Literal(value) {
     const halves = input.split("::");
     if (halves.length > 2)
         return false;
-    const countSide = (side) => {
+    // TU-4 (RFC 4291): a dotted-quad tail may appear only as the FINAL token of the
+    // whole address. The binary.ts validator already enforces this; port the rule here
+    // so a mid-address "1.2.3.4" segment (e.g. "1.2.3.4::1") cannot pass as IPv6.
+    const countSide = (side, isFinalSide) => {
         if (!side)
             return 0;
+        const tokens = side.split(":");
         let count = 0;
-        for (const part of side.split(":")) {
+        for (let i = 0; i < tokens.length; i++) {
+            const part = tokens[i];
             if (part.includes(".")) {
+                if (!isFinalSide || i !== tokens.length - 1)
+                    return null;
                 const octets = part.split(".");
                 if (octets.length !== 4 || octets.some((x) => !/^\d{1,3}$/.test(x) || Number(x) > 255))
                     return null;
@@ -1725,8 +2167,8 @@ function isValidIpv6Literal(value) {
         }
         return count;
     };
-    const left = countSide(halves[0]);
-    const right = countSide(halves[1] ?? "");
+    const left = countSide(halves[0], halves.length === 1);
+    const right = countSide(halves[1] ?? "", true);
     if (left === null || right === null)
         return false;
     return halves.length === 2 ? left + right < 8 : left === 8;
@@ -1759,6 +2201,115 @@ function toAsciiHostname(value) {
         return "";
     }
 }
+// EG-02: private/loopback/link-local/unspecified IP literals. Used by the
+// egress layer to fail closed on client-requested private literals (proxyip,
+// nat64) and by direct.ts to drop private addresses from DNS results (the
+// DNS-rebinding vector: a hostname that passed rule matching must not be
+// re-resolved to a private address and dialed). Scope is deliberately the
+// finding's enumerated families: IPv4 0/8, 10/8, 127/8, 169.254/16,
+// 172.16/12, 192.168/16; IPv6 ::, ::1, fc00::/7 (ULA), fe80::/10
+// (link-local); IPv4-mapped IPv6 (::ffff:a.b.c.d) is judged by its tail.
+// Anything that does not parse as an IP literal returns false — the guard
+// applies to recognizable literals only, and hostnames pass through to
+// downstream validation (never silently treated as private).
+function parseIpv4Octets(value) {
+    const parts = value.split(".");
+    if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part)))
+        return null;
+    const numbers = parts.map(Number);
+    return numbers.every((x) => x >= 0 && x <= 255) ? numbers : null;
+}
+function isPrivateIpv4(octets) {
+    const [a, b] = octets;
+    if (a === 0 || a === 10 || a === 127)
+        return true;
+    if (a === 169 && b === 254)
+        return true;
+    if (a === 172 && b >= 16 && b <= 31)
+        return true;
+    if (a === 192 && b === 168)
+        return true;
+    return false;
+}
+// Expand an IPv6 literal to 8 groups, or null when it is not a literal.
+// Dotted-quad tails are expanded to two groups (final-token rule, TU-4).
+function expandIpv6Groups(value) {
+    const input = value.trim();
+    if (!input.includes(":"))
+        return null;
+    const pieces = input.split("::");
+    if (pieces.length > 2)
+        return null;
+    const parseSide = (side, allowTail) => {
+        if (!side)
+            return [];
+        const tokens = side.split(":");
+        const out = [];
+        for (const [index, token] of tokens.entries()) {
+            if (token.includes(".")) {
+                if (!allowTail || index !== tokens.length - 1)
+                    return null;
+                const ipv4 = parseIpv4Octets(token);
+                if (!ipv4)
+                    return null;
+                out.push((ipv4[0] << 8) | ipv4[1], (ipv4[2] << 8) | ipv4[3]);
+                continue;
+            }
+            if (!/^[0-9a-fA-F]{1,4}$/.test(token))
+                return null;
+            out.push(Number.parseInt(token, 16));
+        }
+        return out;
+    };
+    const left = parseSide(pieces[0], pieces.length === 1);
+    const right = parseSide(pieces[1] ?? "", pieces.length === 2);
+    if (!left || !right)
+        return null;
+    if (pieces.length === 2) {
+        const missing = 8 - (left.length + right.length);
+        if (missing < 1)
+            return null;
+        return [...left, ...new Array(missing).fill(0), ...right];
+    }
+    return left.length === 8 ? left : null;
+}
+function isPrivateIpLiteral(host) {
+    let value = host.trim();
+    if (value.startsWith("[") && value.endsWith("]"))
+        value = value.slice(1, -1);
+    const ipv4 = parseIpv4Octets(value);
+    if (ipv4)
+        return isPrivateIpv4(ipv4);
+    // IPv4-mapped / compatible tails are judged by the embedded IPv4.
+    if (value.includes(".")) {
+        const tail = value.slice(value.lastIndexOf(":") + 1);
+        const tailV4 = parseIpv4Octets(tail);
+        if (tailV4) {
+            const groups = expandIpv6Groups(value);
+            if (groups && groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff)
+                return isPrivateIpv4(tailV4);
+        }
+        return false;
+    }
+    const groups = expandIpv6Groups(value.toLowerCase());
+    if (!groups)
+        return false;
+    if (groups.every((g) => g === 0))
+        return true; // ::
+    if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1)
+        return true; // ::1
+    if (groups[0] >= 0xfc00 && groups[0] <= 0xfdff)
+        return true; // fc00::/7 ULA
+    if (groups[0] >= 0xfe80 && groups[0] <= 0xfebf)
+        return true; // fe80::/10 link-local
+    return false;
+}
+// EG-07: the DS-M4 log sanitizer, shared by the DNS failure paths. A host
+// that looks credential-bearing (URL-shaped) is never echoed into an error
+// message; ordinary hosts keep their useful detail.
+function sanitizeHostForMessage(host) {
+    return /[\s/?#@]/.test(host) || host.includes("://") ? "the requested host" : host;
+}
 
 };
 
@@ -1766,9 +2317,17 @@ __m["core/limits"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.CORE_LIMITS = exports.CORE_VERSION = void 0;
-exports.CORE_VERSION = "0.9.1";
+exports.CORE_VERSION = "1.0.0";
 exports.CORE_LIMITS = {
-    maxWebSocketBufferedBytes: 8 * 1024 * 1024,
+    // CORE-1: bounded session x queue product under the 128 MB isolate ceiling.
+    // Worst case: maxConcurrentSessions (256) x 2 directions x 128 KiB = 64 MiB,
+    // leaving headroom for the isolate itself, connection state and DNS/egress
+    // buffers. The previous 8 MiB per-direction bound allowed 256 x 16 MiB = 4 GiB
+    // of queued bytes in theory — far past any isolate ceiling. The 64 KiB write
+    // chunk size is unchanged; a slow client now pauses upstream (see C-1) instead
+    // of queueing unboundedly, so the smaller bound is a backstop, not the
+    // primary flow-control mechanism.
+    maxWebSocketBufferedBytes: 128 * 1024,
     maxInitialPayloadBytes: 64 * 1024,
     maxWebSocketWriteChunkBytes: 64 * 1024,
     maxEarlyDataBytes: 8192,
@@ -1814,6 +2373,9 @@ exports.CORE_LIMITS = {
     // Per-session budgets for the VLESS UDP/53 DNS bridge (A11).
     maxDnsQueriesPerSession: 2048,
     defaultDnsSessionIdleTimeoutMs: 120_000,
+    // CORE-4: sessions idle longer than this are closed instead of lingering
+    // forever on a half-open socket. 0 (via CORE_MAX_IDLE_MS) still disables.
+    defaultIdleTimeoutMs: 300_000,
 };
 
 };
@@ -1875,8 +2437,13 @@ function normalizeDohResolverEndpoint(value) {
         }
         if (!looksLikeUrl || url.pathname === "/" || url.pathname === "") {
             url.pathname = "/dns-query";
-            url.search = "";
         }
+        // DNS-2: a full URL's query string is stripped unconditionally. A
+        // query on the endpoint URI would otherwise be sent on every upstream
+        // POST (e.g. ?token=...), contradicting the DS-L16 rationale for
+        // rejecting embedded userinfo credentials. The path is kept (an
+        // operator-chosen custom path is legitimate); only the query goes.
+        url.search = "";
         return url.toString();
     }
     catch (error) {
@@ -1949,8 +2516,10 @@ const metrics_1 = __r("../observability/metrics");
 const service_1 = __r("../output/service");
 const limits_1 = __r("../core/limits");
 const doh_3 = __r("../handlers/doh");
-const lifecycle_1 = __r("../util/lifecycle");
+const generator_options_1 = __r("../output/generator-options");
 const hostname_1 = __r("../util/hostname");
+const lifecycle_1 = __r("../util/lifecycle");
+const hostname_2 = __r("../util/hostname");
 const byte_writer_1 = __r("../transport/websocket/byte-writer");
 const runtime_1 = __r("../runtime/runtime");
 const adapters_1 = __r("../output/adapters");
@@ -2004,7 +2573,14 @@ async function runOne(id, name, group, fn, timeoutMs = 5000) {
 }
 async function envFlag(env, name, id, testName, group, fn, timeoutMs = 5000) {
     const raw = env[name];
-    const enabled = /^(1|true|yes|on)$/i.test(raw?.trim() ?? "");
+    const trimmed = raw?.trim() ?? "";
+    // T-11 (v1.0.0): a mistyped flag value previously skipped silently,
+    // hiding the typo. Unset/empty still skips; a set-but-unparseable value
+    // now FAILS loudly instead of masquerading as "not enabled".
+    if (trimmed && !/^(1|true|yes|on|0|false|no|off)$/i.test(trimmed)) {
+        return { id, name: testName, group, status: "FAIL", durationMs: 0, error: `${name} has an unparseable boolean value: ${JSON.stringify(trimmed)}` };
+    }
+    const enabled = /^(1|true|yes|on)$/i.test(trimmed);
     return enabled ? runOne(id, testName, group, fn, timeoutMs) : Promise.resolve(skipped(id, testName, group, `${name} is not enabled`));
 }
 function rounded(value) {
@@ -2216,6 +2792,22 @@ async function runSelfTests(env) {
         if (!session.udpDns || session.destination.port !== 53)
             throw new Error("VLESS DNS UDP session was not marked correctly");
     }));
+    // T-1 (v1.0.0): the negative case — VLESS UDP to a non-DNS port must fail,
+    // not just the positive port-53 case asserted above.
+    tests.push(await runOne("protocol.vless-udp-non-dns-rejected", "VLESS UDP to a non-DNS port is rejected (T-1 negative case)", "protocol", async (signal) => {
+        const reader = new byte_queue_1.ByteQueue(8192);
+        const host = new TextEncoder().encode("example.com");
+        reader.push((0, binary_1.concatBytes)(new Uint8Array([0]), vlessBytes, new Uint8Array([0]), new Uint8Array([2]), new Uint8Array([0x01, 0xbb]), new Uint8Array([2, host.length]), host));
+        try {
+            await new parser_1.VlessHandler(new StaticProvider("vless", vlessBytes)).parse(reader, ctx(signal), signal);
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError && error.code === "BAD_REQUEST")
+                return;
+            throw error;
+        }
+        throw new Error("VLESS UDP to port 443 was accepted");
+    }));
     tests.push(await runOne("protocol.trojan", "Trojan framing/auth/domain/initial-payload", "protocol", async (signal) => {
         const reader = new byte_queue_1.ByteQueue(8192);
         const domain = new TextEncoder().encode("example.com");
@@ -2243,12 +2835,12 @@ async function runSelfTests(env) {
     }));
     tests.push(await runOne("protocol.hostname-integrity", "Protocol destination hostname canonicalization never truncates URL syntax", "protocol", async () => {
         for (const bad of ["foo?bar", "foo/bar", "foo\\bar", "user:pass@bar", " foo.example.com", "foo.example.com "]) {
-            if ((0, hostname_1.toAsciiHostname)(bad))
+            if ((0, hostname_2.toAsciiHostname)(bad))
                 throw new Error(`Malformed hostname was canonicalized instead of rejected: ${bad}`);
         }
-        if ((0, hostname_1.toAsciiHostname)("bücher.example") !== "xn--bcher-kva.example")
+        if ((0, hostname_2.toAsciiHostname)("bücher.example") !== "xn--bcher-kva.example")
             throw new Error("IDNA hostname conversion failed");
-        if ((0, hostname_1.toAsciiHostname)("2001:db8::1") !== "2001:db8::1")
+        if ((0, hostname_2.toAsciiHostname)("2001:db8::1") !== "2001:db8::1")
             throw new Error("IPv6 hostname literal was rejected");
     }));
     tests.push(await runOne("routing.modes", "Routing modes produce expected egress decisions", "routing", async (signal) => {
@@ -2259,7 +2851,11 @@ async function runSelfTests(env) {
         const smart = await new router_1.DefaultRouter("smart", undefined, { proxyip: true, relay: true, nat64: true }).route(context, signal);
         if (direct.egress !== "direct" || proxy.egress !== "proxyip" || fallback.fallbackEgress !== "proxyip")
             throw new Error("Routing decision mismatch");
-        if (smart.egress !== "direct" || smart.fallbackEgresses?.join(",") !== "proxyip,relay,nat64")
+        // EG-01 (v1.0.0): relay left the smart chain — a raw relay dials a
+        // fixed endpoint and cannot reach the requested destination, so the
+        // smart chain is direct → proxyip → nat64. Relay stays reachable
+        // only via an explicit rule or fallback.
+        if (smart.egress !== "direct" || smart.fallbackEgresses?.join(",") !== "proxyip,nat64")
             throw new Error("Smart egress ordering mismatch");
         if ((0, router_1.parseEgressMode)("DIRECT") !== "direct" || (0, router_1.parseEgressMode)(undefined) !== "smart")
             throw new Error("Egress mode parser mismatch");
@@ -2364,13 +2960,26 @@ async function runSelfTests(env) {
         };
         const provider = new cloudflare_1.D1CredentialProvider(db);
         const testSignal = signal;
-        const first = await provider.authenticate("vless", (0, binary_1.uuidToBytes)(vlessUuid), testSignal);
-        const second = await provider.authenticate("vless", (0, binary_1.uuidToBytes)(vlessUuid), testSignal);
-        if (!first || !second || first.id !== second.id || queries !== 1)
-            throw new Error(`Positive auth cache miss: queries=${queries}`);
+        // T-7 (v1.0.0): the old test exercised the bound with a single entry,
+        // which cannot distinguish a bounded cache from an unbounded one. Three
+        // distinct credentials must produce three entries (one query each) and
+        // a repeat of the first must still hit (no fourth query).
+        const uuids = [vlessUuid, "11111111-2222-4333-8444-555555555555", "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"];
+        for (const uuid of uuids) {
+            const principal = await provider.authenticate("vless", (0, binary_1.uuidToBytes)(uuid), testSignal);
+            if (!principal)
+                throw new Error(`Positive auth failed for ${uuid}`);
+        }
+        if (queries !== 3)
+            throw new Error(`Expected 3 cache-miss queries, got ${queries}`);
         const cache = provider.positiveCache;
+        if (cache.size !== 3)
+            throw new Error(`Expected 3 positive cache entries, got ${cache.size}`);
         if (cache.size > limits_1.CORE_LIMITS.maxPositiveAuthCacheEntries)
             throw new Error(`Positive cache exceeded bound: ${cache.size}`);
+        await provider.authenticate("vless", (0, binary_1.uuidToBytes)(vlessUuid), testSignal);
+        if (queries !== 3)
+            throw new Error(`Repeat authentication re-queried: queries=${queries}`);
     }));
     tests.push(await runOne("storage.kv-ttl-validation", "KV adapter enforces Cloudflare expirationTtl minimum", "storage", async () => {
         const writes = [];
@@ -3046,7 +3655,10 @@ async function runSelfTests(env) {
             view.setUint16(off + 8, 4);
             off += 10;
             out.set([1, 2, 3, 4], off);
-            return new Response(out, { status: 200 });
+            // DNS-6: engine-path responses must carry application/dns-message,
+            // like the handler path requires — the fixture mimics a compliant
+            // DoH server (the test's assertion is CNAME following, unchanged).
+            return new Response(out, { status: 200, headers: { "content-type": "application/dns-message" } });
         };
         const resolver = new doh_1.DoHResolver({ endpoint: "https://dns.example/dns-query", timeoutMs: 1000, retries: 0, fetchImpl: requestFetch });
         const result = await resolver.resolve("example.com", "ipv4", signal);
@@ -4325,7 +4937,10 @@ async function runSelfTests(env) {
             const xraySniff = xrayProto.inbounds[0]?.sniffing;
             if (xraySniff?.enabled !== true || JSON.stringify(xraySniff?.destOverride) !== JSON.stringify(["http", "tls", "quic"]) || xraySniff?.routeOnly !== true)
                 throw new Error(`Xray protocol rule did not enable route-only sniffing: ${JSON.stringify(xraySniff)}`);
-            if (!JSON.stringify(xrayProto.routing).includes('"protocol":"bittorrent"'))
+            // R-9 (v1.0.0): Xray routing `protocol` is emitted in the
+            // documented array form, not the single-string form (string
+            // coercion for this exact field was UNVERIFIED).
+            if (!JSON.stringify(xrayProto.routing).includes('"protocol":["bittorrent"]'))
                 throw new Error("Xray protocol rule was not emitted");
             const xrayPlain = (0, xray_1.buildXrayConfig)([node], { routingRules: [{ domain_suffix: ["example.com"], action: "direct" }] });
             if (xrayPlain.inbounds[0]?.sniffing?.enabled !== false)
@@ -4364,6 +4979,19 @@ async function runSelfTests(env) {
         }
         if (!xrayPrefixRejected)
             throw new Error("Xray accepted a custom tag with the balancer prefix");
+        // T-4 (v1.0.0): the case above is ambiguous — empty `servers` could be
+        // the rejection reason instead of the prefix. Isolate the prefix rule:
+        // non-empty servers + proxy- tag must still reject, with the
+        // prefix-specific message.
+        let prefixIsolated = false;
+        try {
+            (0, xray_1.buildXrayConfig)([node], { customOutbounds: [{ tag: "proxy-foo", protocol: "socks", settings: { servers: [{ address: "1.2.3.4", port: 1080 }] } }] });
+        }
+        catch (error) {
+            prefixIsolated = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR" && /must not start with 'proxy-'/.test(error.message);
+        }
+        if (!prefixIsolated)
+            throw new Error("Generic proxy- prefix rejection was not isolated from the empty-servers failure");
         // DS-L24 (YAML half): geosite and multi-matcher (AND) rulesets carry
         // the Mihomo-only header comment; a plain ruleset carries neither it
         // nor any marker.
@@ -4383,6 +5011,14 @@ async function runSelfTests(env) {
         const node = { protocol: "trojan", server: "proxy.example.com", port: 80, credential: password, name: "trojan-http", security: "none", scheme: "http", endpointKind: "domain", websocket: { path: "/trojan", host: "proxy.example.com" } };
         const sing = (0, singbox_1.buildSingboxConfig)([node]);
         JSON.parse(JSON.stringify(sing));
+        // T-2 (v1.0.0): the sing-box side was a bare JSON round-trip. Assert the
+        // plaintext boundary itself: no TLS object is invented for a plaintext
+        // node, and the WS transport is preserved.
+        const singOutbound = sing.outbounds[0];
+        if (singOutbound.tls !== undefined)
+            throw new Error("Sing-box invented a TLS block for a plaintext node");
+        if (singOutbound.transport?.type !== "ws")
+            throw new Error("Sing-box plaintext node lost its WS transport");
         let clashRejected = false;
         try {
             (0, clash_1.buildClashConfig)([node]);
@@ -4437,6 +5073,31 @@ async function runSelfTests(env) {
         // Offset 5 means one complete fingerprint block (4 candidates) plus one from firefox.
         if (page1.length !== 3 || page2.length !== 3)
             throw new Error(`Unexpected pagination result: ${page1.length}/${page2.length}`);
+        // T-3 (v1.0.0): lengths alone cannot prove "no dropping or duplication".
+        // Walk three DISJOINT pages (offsets 0/3/6 = 3+3+2 = 8 candidates) and
+        // assert the union of node names is exactly 8 distinct names. (An
+        // earlier draft of this assertion used overlapping windows 0/5/6,
+        // where shared names are correct, and it exposed a real
+        // countSkippedBaseNames partial-block bug — fixed alongside.)
+        const d1 = (0, bundle_2.buildOutputNodesFromRecords)(env, "proxy.example.com", selection, { vless: records }, { defaultNodes: 256, maxNodes: 3, maxBytes: 4096 });
+        const d2 = (0, bundle_2.buildOutputNodesFromRecords)(env, "proxy.example.com", { ...selection, offset: 3 }, { vless: records }, { defaultNodes: 256, maxNodes: 3, maxBytes: 4096 });
+        const d3 = (0, bundle_2.buildOutputNodesFromRecords)(env, "proxy.example.com", { ...selection, offset: 6 }, { vless: records }, { defaultNodes: 256, maxNodes: 3, maxBytes: 4096 });
+        if (d1.length !== 3 || d2.length !== 3 || d3.length !== 2)
+            throw new Error(`Unexpected disjoint pages: ${d1.length}/${d2.length}/${d3.length}`);
+        const names = [...d1, ...d2, ...d3].map((n) => n.name);
+        if (new Set(names).size !== 8)
+            throw new Error(`Pagination dropped or duplicated nodes: ${names.join(",")}`);
+        // Same walk with a non-discriminating template: the seeded namer must
+        // number nodes continuously across pages (node, node-2, …, node-8),
+        // including across the fingerprint-block boundary at offset 6.
+        const flat = { ...selection, remarkTemplate: "node" };
+        const f1 = (0, bundle_2.buildOutputNodesFromRecords)(env, "proxy.example.com", flat, { vless: records }, { defaultNodes: 256, maxNodes: 3, maxBytes: 4096 });
+        const f2 = (0, bundle_2.buildOutputNodesFromRecords)(env, "proxy.example.com", { ...flat, offset: 3 }, { vless: records }, { defaultNodes: 256, maxNodes: 3, maxBytes: 4096 });
+        const f3 = (0, bundle_2.buildOutputNodesFromRecords)(env, "proxy.example.com", { ...flat, offset: 6 }, { vless: records }, { defaultNodes: 256, maxNodes: 3, maxBytes: 4096 });
+        const flatNames = [...f1, ...f2, ...f3].map((n) => n.name);
+        const expectedFlat = ["node", "node-2", "node-3", "node-4", "node-5", "node-6", "node-7", "node-8"];
+        if (JSON.stringify(flatNames) !== JSON.stringify(expectedFlat))
+            throw new Error(`Seeded namer mismatch: ${flatNames.join(",")}`);
     }));
     tests.push(await runOne("output.http-none-both-protocols", "Canonical native output supports HTTP/none for VLESS and Trojan", "output", async () => {
         const env = { VLESS_USERS: vlessUuid, TROJAN_USERS: password, OUTPUT_HOST: "proxy.example.com", OUTPUT_PORT: "80" };
@@ -4520,7 +5181,10 @@ async function runSelfTests(env) {
         const xray = await (0, artifacts_1.renderOutputArtifact)(env, request, provider, "xray");
         if (xray.headers?.["X-Core-Output-Count"] !== "40" || xray.headers?.["X-Core-Output-Total"] !== "60" || xray.headers?.["X-Core-Output-Next-Offset"] !== "2")
             throw new Error(`Xray fragment pagination contract mismatch: ${JSON.stringify(xray.headers)}`);
-        if (!xray.headers?.["X-Core-Client-Requirements"]?.includes("v26.6.27"))
+        // v1.0.0: the exact tag v26.6.27 is UNVERIFIED (delta §17 — tags
+        // 26.7.28/26.10.21/26.9.30 were seen, not 26.6.27), so the requirement
+        // names the v26 core family instead of a tag that was never confirmed.
+        if (!xray.headers?.["X-Core-Client-Requirements"]?.includes("v26+"))
             throw new Error("Xray Fragment compatibility header is missing");
         const fragmentConfig = JSON.parse(xray.body);
         const observatory = fragmentConfig.observatory;
@@ -4536,7 +5200,7 @@ async function runSelfTests(env) {
             throw new Error(`Sing-box fragment pagination contract mismatch: ${JSON.stringify(singbox.headers)}`);
         const xrayManifestResponse = await (0, artifacts_1.renderOutputArtifact)(env, new Request("https://proxy.example.com/__core/outputs/xray?artifact=manifest&protocol=vless"), provider, "xray");
         const xrayManifest = JSON.parse(xrayManifestResponse.body);
-        if (!xrayManifest.artifacts?.find((item) => item.id === "best-fragment")?.clientRequirements?.some((item) => item.includes("v26.6.27")))
+        if (!xrayManifest.artifacts?.find((item) => item.id === "best-fragment")?.clientRequirements?.some((item) => item.includes("v26+")))
             throw new Error("Xray Fragment client requirements missing from manifest");
         const singboxManifestResponse = await (0, artifacts_1.renderOutputArtifact)(env, new Request("https://proxy.example.com/__core/outputs/sing-box?artifact=manifest&protocol=vless"), provider, "sing-box");
         const singboxManifest = JSON.parse(singboxManifestResponse.body);
@@ -5028,8 +5692,11 @@ async function runSelfTests(env) {
         // one line no longer fits the old 1024-byte budget (the service
         // throws instead of truncating below one node). The budget itself
         // is covered by the aggregation-cache-policy test; this test is
-        // about offset/total preservation, so its fixture budget is 2048.
-        const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: longHost, OUTPUT_PORT: "443", CORE_OUTPUT_MAX_NODES: "3", CORE_OUTPUT_MAX_BYTES: "2048", OUTPUT_CUSTOM_SUBS: "https://subs.example.com/list", CORE_OUTPUT_SUBS_ALLOWLIST: "subs.example.com" };
+        // about offset/total preservation, so its fixture budget fits the
+        // whole merged page (2 native + 1 external at ~1158 bytes per
+        // native line with this long host). Byte-truncated resume (SCAN-02)
+        // is covered separately by v1.0.0.output-native-byte-resume.
+        const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: longHost, OUTPUT_PORT: "443", CORE_OUTPUT_MAX_NODES: "3", CORE_OUTPUT_MAX_BYTES: "8192", OUTPUT_CUSTOM_SUBS: "https://subs.example.com/list", CORE_OUTPUT_SUBS_ALLOWLIST: "subs.example.com" };
         const provider = { authenticate: async () => null, count: async (protocol) => protocol === "vless" ? 4 : 0, listPage: async (protocol, offset, limit) => protocol === "vless" ? [1, 2, 3, 4].slice(offset, offset + limit).map((id) => ({ id: String(id), protocol: "vless", credential: vlessUuid, rawCredential: vlessUuid, enabled: true })) : [] };
         const resolver = { resolve: async () => [{ address: "93.184.216.34", family: 4, ttl: 60 }] };
         const output = await (0, service_1.renderSubscriptionWithProvider)(env, new Request("https://proxy.example.com/sub?protocol=vless&limit=3&aggregate=true&encode=raw"), provider, resolver, async () => new Response("vless://external@example.com:443?security=tls&type=ws&host=example.com&path=%2Fvless"));
@@ -5037,6 +5704,11 @@ async function runSelfTests(env) {
             throw new Error(`Native pagination offset was changed by rendering/aggregation: ${JSON.stringify(output.headers)}`);
         if (output.headers?.["X-Core-Output-Total"] !== "4")
             throw new Error(`Native candidate total was changed by aggregation: ${JSON.stringify(output.headers)}`);
+        // SCAN-03 (v1.0.0): with room reserved, the external line must
+        // actually be present in the merged page — the old loop dropped it
+        // whenever native lines filled the limit.
+        if (!output.body.includes("vless://external@example.com:443"))
+            throw new Error("External line did not contribute to the merged page");
     }));
     tests.push(await runOne("dns.prefer-family-fallback", "Preferred DNS family falls back after resolver exceptions", "dns", async (signal) => {
         let calls = 0;
@@ -5068,7 +5740,9 @@ async function runSelfTests(env) {
                 for (let i = 0; i < 15; i++)
                     out[off + 10 + i] = 0;
                 out[off + 25] = 1;
-                return new Response(out, { status: 200 });
+                // DNS-6: engine-path responses must carry application/dns-message
+                // (this fixture's assertion is family fallback, unchanged).
+                return new Response(out, { status: 200, headers: { "content-type": "application/dns-message" } });
             },
         });
         const values = await resolver.resolve("example.com", "prefer_ipv4", signal);
@@ -5103,7 +5777,7 @@ async function runSelfTests(env) {
                 view.setUint32(off + 4, 10);
                 view.setUint16(off + 8, cnameRdata.length);
                 out.set(cnameRdata, off + 10);
-                return new Response(out, { status: 200 });
+                return new Response(out, { status: 200, headers: { "content-type": "application/dns-message" } });
             }
             const out = new Uint8Array(questionEnd + 2 + 10 + 4);
             const view = new DataView(out.buffer);
@@ -5119,7 +5793,7 @@ async function runSelfTests(env) {
             view.setUint32(off + 4, 60);
             view.setUint16(off + 8, 4);
             out.set([1, 2, 3, 4], off + 10);
-            return new Response(out, { status: 200 });
+            return new Response(out, { status: 200, headers: { "content-type": "application/dns-message" } });
         };
         const cache = new cache_1.DnsCache();
         const resolver = new doh_1.DoHResolver({ endpoint: "https://dns.example/dns-query", timeoutMs: 1000, retries: 0, fetchImpl: requestFetch, cache });
@@ -5255,6 +5929,496 @@ async function runSelfTests(env) {
         const snap = metrics.snapshot();
         if (snap["session.first_byte_ms.count"] !== 1 || snap["session.first_byte_ms.sum"] !== 42 || snap["session.first_byte_ms.bucket_le_50"] !== 1 || snap["session.first_byte_ms.bucket_le_25"] !== undefined || snap["session.first_byte_ms.min"] !== 42 || snap["session.first_byte_ms.max"] !== 42)
             throw new Error("Latency histogram snapshot mismatch");
+    }));
+    // ---- v1.0.0 additions: fixed behaviors + Scope B generator options ----
+    tests.push(await runOne("v1.0.0.hostname-guards", "Numeric-like host spellings are rejected unless a canonical dotted quad (TU-5)", "core", async () => {
+        if ((0, hostname_1.isAsciiHostname)("2130706433") || (0, hostname_1.isAsciiHostname)("0x7f.1") || (0, hostname_1.isAsciiHostname)("0177.0.0.1") || (0, hostname_1.isAsciiHostname)("256.1.1.1"))
+            throw new Error("Numeric-like host was accepted");
+        if (!(0, hostname_1.isAsciiHostname)("127.0.0.1") || !(0, hostname_1.isAsciiHostname)("example.com"))
+            throw new Error("Canonical host was rejected");
+    }));
+    tests.push(await runOne("v1.0.0.byte-queue-default-bound", "ByteQueue default bound is the 128 KiB isolate-safe limit (CORE-1)", "core", async () => {
+        const q = new byte_queue_1.ByteQueue();
+        q.push(new Uint8Array(128 * 1024));
+        if ((q.readAvailable()?.length ?? 0) !== 128 * 1024)
+            throw new Error("Exact-bound push did not round-trip");
+        const q2 = new byte_queue_1.ByteQueue();
+        try {
+            q2.push(new Uint8Array(128 * 1024 + 1));
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError && error.code === "MESSAGE_TOO_LARGE")
+                return;
+            throw error;
+        }
+        throw new Error("Default-bound overflow was accepted");
+    }));
+    tests.push(await runOne("v1.0.0.xray-fallback", "Balancer fallback resolves to a node, never to direct unless allowed (F1)", "output", async () => {
+        const tags = ["proxy-1", "proxy-2", "proxy-3"];
+        if ((0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: "first" }, tags) !== "proxy-1")
+            throw new Error("first did not resolve");
+        if ((0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: "last" }, tags) !== "proxy-3")
+            throw new Error("last did not resolve");
+        if ((0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: "1" }, tags) !== "proxy-2")
+            throw new Error("index did not resolve");
+        if ((0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: "proxy-3" }, tags) !== "proxy-3")
+            throw new Error("exact tag did not resolve");
+        if ((0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: "missing" }, tags) !== undefined)
+            throw new Error("Unresolvable node fell back instead of omitting");
+        if ((0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: null, allowDirectFallback: true }, tags) !== "direct")
+            throw new Error("allowDirectFallback did not yield direct");
+        if ((0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: null }, tags) !== undefined)
+            throw new Error("Default yielded a fallback");
+        if ((0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: "proxy-1", fallbackTag: "proxy-2" }, tags) !== "proxy-2")
+            throw new Error("Explicit fallbackTag did not take precedence");
+    }));
+    tests.push(await runOne("v1.0.0.sockopt-mapping", "Sockopt maps per target; freedom gets only mark + domainStrategy (F6)", "output", async () => {
+        const gen = (0, generator_options_1.parseGeneratorOptions)({ CORE_OUTPUT_SOCKOPT_MARK: "100", CORE_OUTPUT_SOCKOPT_TCP_FAST_OPEN: "true", CORE_OUTPUT_SOCKOPT_DOMAIN_STRATEGY: "UseIP", CORE_OUTPUT_SOCKOPT_ACCEPT_PROXY_PROTOCOL: "true" });
+        const sockopt = (0, generator_options_1.buildXraySockopt)(gen);
+        if (sockopt.mark !== 100 || sockopt.tcpFastOpen !== true || sockopt.domainStrategy !== "UseIP")
+            throw new Error(`Xray sockopt mismatch: ${JSON.stringify(sockopt)}`);
+        if ("acceptProxyProtocol" in sockopt)
+            throw new Error("acceptProxyProtocol leaked into outbound sockopt (it is inbound-only)");
+        const freedom = (0, generator_options_1.buildXrayFreedomSockopt)(gen);
+        if (freedom.mark !== 100 || freedom.domainStrategy !== "UseIP" || Object.keys(freedom).length !== 2)
+            throw new Error(`Freedom sockopt mismatch: ${JSON.stringify(freedom)}`);
+    }));
+    tests.push(await runOne("v1.0.0.sni-case", "SNI case mode: original passes through, random is deterministic (F7)", "output", async () => {
+        if ((0, generator_options_1.applySniCase)("Example.COM", "original", "seed") !== "Example.COM")
+            throw new Error("Original SNI was modified");
+        const a = (0, generator_options_1.applySniCase)("example.com", "random", "node-1");
+        const b = (0, generator_options_1.applySniCase)("example.com", "random", "node-1");
+        if (a !== b || a.length !== "example.com".length || !/^[A-Za-z0-9.-]+$/.test(a))
+            throw new Error("Randomized SNI is not deterministic or not hostname-shaped");
+    }));
+    tests.push(await runOne("v1.0.0.dns-follow-worker", "Client DNS follows worker resolvers when opted in, else keeps the default (F8)", "output", async () => {
+        const env = { DNS_RESOLVERS: "https://dns.example/dns-query,https://dns2.example/dns-query", CORE_OUTPUT_DNS_FOLLOW_WORKER: "true" };
+        const gen = (0, generator_options_1.parseGeneratorOptions)(env);
+        const xdns = (0, generator_options_1.buildXrayDns)(env, gen);
+        if (!JSON.stringify(xdns.servers).includes("dns.example") || xdns.disableFallback !== false)
+            throw new Error(`Follow-worker Xray DNS mismatch: ${JSON.stringify(xdns)}`);
+        const sbox = (0, generator_options_1.buildSingboxDns)(env, gen);
+        if (sbox.final !== String(sbox.servers[0].tag))
+            throw new Error("Sing-box final is not the first worker resolver");
+        const defGen = (0, generator_options_1.parseGeneratorOptions)({});
+        const defDns = (0, generator_options_1.buildXrayDns)({}, defGen);
+        if (defDns.disableFallback !== true || defDns.servers.length !== 2)
+            throw new Error("Default Xray DNS changed");
+    }));
+    tests.push(await runOne("v1.0.0.fake-dns-shapes", "Fake DNS emits per-target shapes only when enabled (Scope B 2)", "output", async () => {
+        const off = (0, generator_options_1.parseGeneratorOptions)({});
+        if ((0, generator_options_1.buildXrayFakeDns)(off) !== undefined)
+            throw new Error("Fake DNS emitted while disabled");
+        const on = (0, generator_options_1.parseGeneratorOptions)({ CORE_OUTPUT_FAKE_DNS_ENABLED: "true" });
+        const fake = (0, generator_options_1.buildXrayFakeDns)(on);
+        const pool = fake?.fakedns?.[0];
+        if (!pool || typeof pool.ipPool !== "string")
+            throw new Error("Xray fakedns object missing");
+        const sbox = (0, generator_options_1.buildSingboxDns)({}, on);
+        if (!sbox.servers.some((server) => server.type === "fakeip") || !sbox.rules?.some((rule) => rule.server === "fakeip"))
+            throw new Error("Sing-box fakeip server/rule missing");
+    }));
+    tests.push(await runOne("v1.0.0.ech-gating", "ECH is a sing-box-only client field and fails other targets closed (Scope B 3)", "output", async () => {
+        const gen = (0, generator_options_1.parseGeneratorOptions)({ CORE_OUTPUT_ECH_ENABLED: "true", CORE_OUTPUT_ECH_CONFIG: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==" });
+        const ech = (0, generator_options_1.buildSingboxEch)({}, gen);
+        if (ech?.enabled !== true || !Array.isArray(ech.config) || ech.config.length !== 1)
+            throw new Error("Sing-box ECH object missing");
+        for (const target of ["xray", "clash", "surge"]) {
+            try {
+                (0, generator_options_1.assertEchCompatible)(gen, target);
+            }
+            catch (error) {
+                if (error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR")
+                    continue;
+                throw error;
+            }
+            throw new Error(`ECH was silently accepted for ${target}`);
+        }
+        (0, generator_options_1.assertEchCompatible)(gen, "sing-box");
+    }));
+    tests.push(await runOne("v1.0.0.inbound-types", "Inbound type maps per target (Scope B 4)", "output", async () => {
+        const node = { protocol: "vless", server: "proxy.example.com", port: 443, credential: vlessUuid, name: "node", security: "tls", scheme: "https", endpointKind: "domain", tls: { serverName: "proxy.example.com", alpn: ["http/1.1"], fingerprint: "chrome" }, websocket: { path: "/vless", host: "proxy.example.com" } };
+        const httpGen = (0, generator_options_1.parseGeneratorOptions)({ CORE_OUTPUT_INBOUND_TYPE: "http" });
+        const xray = (0, xray_1.buildXrayConfig)([node], { generatorOptions: httpGen });
+        if (!xray.inbounds.some((item) => item.protocol === "http"))
+            throw new Error("Xray http inbound missing");
+        const sing = (0, singbox_1.buildSingboxConfig)([node], { generatorOptions: httpGen });
+        if (!sing.inbounds.some((item) => item.type === "http"))
+            throw new Error("Sing-box http inbound missing");
+    }));
+    tests.push(await runOne("v1.0.0.domain-strategies", "Domain strategy is explicit in routing, sockopt, and DNS query (Scope B 5)", "output", async () => {
+        const node = { protocol: "vless", server: "proxy.example.com", port: 443, credential: vlessUuid, name: "node", security: "tls", scheme: "https", endpointKind: "domain", tls: { serverName: "proxy.example.com", alpn: ["http/1.1"], fingerprint: "chrome" }, websocket: { path: "/vless", host: "proxy.example.com" } };
+        const genEnv = { CORE_OUTPUT_ROUTING_DOMAIN_STRATEGY: "IPIfNonMatch", CORE_OUTPUT_DNS_QUERY_STRATEGY: "UseIPv4" };
+        const gen = (0, generator_options_1.parseGeneratorOptions)(genEnv);
+        // The builder consumes the precomputed section (artifacts.baseOptions
+        // computes it from env + generator options); a direct builder call must
+        // pass it explicitly or the default section applies.
+        const xray = (0, xray_1.buildXrayConfig)([node], { generatorOptions: gen, xrayDns: (0, generator_options_1.buildXrayDns)(genEnv, gen) });
+        if (xray.routing.domainStrategy !== "IPIfNonMatch")
+            throw new Error("Xray routing domainStrategy not applied");
+        if (xray.dns.queryStrategy !== "UseIPv4")
+            throw new Error("Xray DNS queryStrategy not applied");
+    }));
+    tests.push(await runOne("v1.0.0.warp-shape", "Warp renders as a WireGuard pool outbound per target (benchmark P1)", "output", async () => {
+        const warp = { privateKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", peerPublicKey: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", endpointHost: "engage.cloudflareclient.com", endpointPort: 2408, localIpv4: "172.16.0.2", localIpv6: null, mtu: 1280, reserved: [0, 0, 0] };
+        const x = (0, generator_options_1.buildWarpXray)(warp);
+        if (x.protocol !== "wireguard" || x.tag !== "proxy-warp")
+            throw new Error("Xray Warp shape mismatch");
+        const s = (0, generator_options_1.buildWarpSingbox)(warp);
+        if (s.type !== "wireguard" || s.tag !== "proxy-warp")
+            throw new Error("Sing-box Warp shape mismatch");
+        const c = (0, generator_options_1.buildWarpClash)(warp);
+        if (c.name !== "Warp")
+            throw new Error("Clash Warp shape mismatch");
+    }));
+    tests.push(await runOne("v1.0.0.chain-translation", "Chain entries translate per target (benchmark P2)", "output", async () => {
+        const entry = { type: "socks", tag: "chain-1", server: "127.0.0.1", port: 1080, username: null, password: null, uuid: null, method: null, tls: false, wsPath: null, wsHost: null, sni: null };
+        const x = (0, generator_options_1.translateChainToXray)(entry);
+        if (x.protocol !== "socks" || x.tag !== "chain-1")
+            throw new Error("Chain Xray translation mismatch");
+    }));
+    tests.push(await runOne("v1.0.0.preferred-ips", "Preferred IPs parse with labels and bracketed IPv6 ports", "output", async () => {
+        const entries = (0, endpoints_1.parsePreferredIpEntries)("1.2.3.4:443#MyNode,[2001:db8::1]:8443");
+        if (entries.length !== 2 || entries[0].label !== "MyNode" || entries[0].port !== 443)
+            throw new Error(`Preferred IP parse mismatch: ${JSON.stringify(entries)}`);
+        if (entries[1].address !== "2001:db8::1" || entries[1].port !== 8443)
+            throw new Error("Bracketed IPv6 preferred IP mismatch");
+    }));
+    tests.push(await runOne("v1.0.0.routing-packs", "Named routing packs append after user rules (benchmark P1)", "output", async () => {
+        const rules = (0, rules_2.parseRoutingPacks)("ads,ir-bypass");
+        if (!rules.some((rule) => rule.action === "block" && (rule.domain_suffix ?? []).some((d) => d.includes("doubleclick"))) || !rules.some((rule) => rule.action === "direct" && (rule.domain_suffix ?? []).includes("ir")))
+            throw new Error(`Routing packs mismatch: ${JSON.stringify(rules)}`);
+    }));
+    tests.push(await runOne("v1.0.0.subscription-split", "Subscription splitter keeps commas inside URLs (SCAN-18)", "output", async () => {
+        const parts = (0, aggregation_1.splitSubscriptionSources)("https://a.example/x?y=1,2,https://b.example/z");
+        if (parts.length !== 2 || parts[0] !== "https://a.example/x?y=1,2" || parts[1] !== "https://b.example/z")
+            throw new Error(`Split mismatch: ${JSON.stringify(parts)}`);
+    }));
+    tests.push(await runOne("v1.0.0.re2-guard", "JS-only regex constructs are rejected at layer 1 (SCAN-10)", "output", async () => {
+        try {
+            (0, rules_2.parseRoutingRules)(JSON.stringify([{ domain_regex: ["(?=x)"], action: "block" }]));
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR") {
+                const ok = (0, rules_2.parseRoutingRules)(JSON.stringify([{ domain_regex: ["example\\.com"], action: "block" }]));
+                if (ok.length !== 1)
+                    throw new Error("Valid regex was rejected");
+                return;
+            }
+            throw error;
+        }
+        throw new Error("Lookahead regex was accepted");
+    }));
+    tests.push(await runOne("v1.0.0.rule-normalization", "Suffix leading dots normalize; keyword matchers skip hostname validation (SCAN-09)", "output", async () => {
+        const rules = (0, rules_2.parseRoutingRules)(JSON.stringify([{ domain_suffix: [".example.com"], action: "direct" }, { domain_keyword: ["foo_bar"], action: "block" }]));
+        if (!rules[0].domain_suffix?.includes("example.com") || rules[0].domain_suffix?.some((d) => d.startsWith(".")))
+            throw new Error("Suffix was not normalized");
+        if (rules[1].domain_keyword?.[0] !== "foo_bar")
+            throw new Error("Keyword rule was rejected or mangled");
+    }));
+    tests.push(await runOne("v1.0.0.canonical-ip", "IPv6 literals canonicalize before clean-IP dedup (SCAN-08)", "output", async () => {
+        if ((0, endpoints_1.canonicalizeIpLiteral)("0:0:0:0:0:0:0:1") !== "::1")
+            throw new Error("Loopback was not compressed");
+        if ((0, endpoints_1.canonicalizeIpLiteral)("2001:0DB8:0000:0000:0000:0000:0000:0001") !== "2001:db8::1")
+            throw new Error("Expanded IPv6 was not normalized");
+    }));
+    tests.push(await runOne("v1.0.0.shadowed-rules", "Fully-covered later CORE_RULES are reported as shadowed (PR-2)", "routing", async () => {
+        const found = (0, rules_1.findShadowedCoreRules)(["suffix=example.com|direct", "host=sub.example.com|proxyip"]);
+        if (found.length !== 1 || found[0].index !== 1 || found[0].shadowedBy !== 0)
+            throw new Error(`Shadow detection mismatch: ${JSON.stringify(found)}`);
+        if ((0, rules_1.findShadowedCoreRules)(["port=443|direct", "host=example.com|proxyip"]).length !== 0)
+            throw new Error("Port rule wrongly shadows a host rule");
+    }));
+    tests.push(await runOne("v1.0.0.validation-warnings", "Deprecated vars and shadowed rules warn without failing startup (CFG-5/PR-2)", "configuration", async () => {
+        const env = { VLESS_USERS: vlessUuid, TROJAN_USERS: password, OUTPUT_HOST: "proxy.example.com", CORE_OUTPUT_MAX_ENDPOINTS: "10", CORE_RULES: "suffix=example.com|direct,host=sub.example.com|nat64" };
+        const validated = (0, validation_1.validateEnvironment)(env);
+        if (!validated.warnings.some((w) => w.field === "CORE_OUTPUT_MAX_ENDPOINTS"))
+            throw new Error("Deprecated-var warning missing");
+        if (!validated.warnings.some((w) => w.field === "CORE_RULES" && w.message.includes("shadowed")))
+            throw new Error("Shadowed-rule warning missing");
+    }));
+    tests.push(await runOne("v1.0.0.dns-enabled-typo", "An invalid DNS_ENABLED value fails closed instead of silently disabling (DNS-1)", "dns", async () => {
+        try {
+            new engine_2.DnsEngine({ DNS_ENABLED: "enable" });
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR")
+                return;
+            throw error;
+        }
+        throw new Error("Typo DNS_ENABLED was silently accepted");
+    }));
+    tests.push(await runOne("v1.0.0.hosts-terminal", "A hosts pin is terminal on family mismatch (DNS-9)", "dns", async (signal) => {
+        const hosts = new hosts_1.HostsResolver("example.com=10.0.0.1,example.com=10.0.0.1");
+        if ((await hosts.resolve("example.com", "ipv4", signal)).length !== 1)
+            throw new Error("Duplicate hosts IP was not deduped");
+        if (!hosts.has("example.com"))
+            throw new Error("hosts.has missed an existing pin");
+        const engine = new engine_2.DnsEngine({ DNS_HOSTS: "example.com=10.0.0.1", DNS_IP_PREFERENCE: "ipv6" });
+        if ((await engine.resolve("example.com", "ipv6", signal)).length !== 0)
+            throw new Error("Family-mismatched pin fell through to DoH");
+    }));
+    tests.push(await runOne("v1.0.0.credential-mode-guard", "d1-without-DB fails closed; hybrid-without-DB stays env-only (SEC-1)", "security", async (signal) => {
+        try {
+            (0, cloudflare_1.createCredentialProvider)({ CORE_CREDENTIAL_MODE: "d1" });
+        }
+        catch (error) {
+            if (error instanceof Error && /requires the DB binding/.test(error.message)) {
+                const hybrid = (0, cloudflare_1.createCredentialProvider)({ CORE_CREDENTIAL_MODE: "hybrid", VLESS_USERS: vlessUuid });
+                const principal = await hybrid.authenticate("vless", (0, binary_1.uuidToBytes)(vlessUuid), signal);
+                if (!principal)
+                    throw new Error("Hybrid-without-DB lost env authentication");
+                return;
+            }
+            throw error;
+        }
+        throw new Error("d1-without-DB silently became env-only");
+    }));
+    tests.push(await runOne("v1.0.0.hybrid-recount", "A stale-high primary count is re-checked before dropping the fallback tail (SEC-2)", "security", async (signal) => {
+        const rec = (id) => ({ id, protocol: "vless", credential: `cred-${id}`, enabled: true });
+        let counts = 0;
+        const primary = { authenticate: async () => null, count: async () => (++counts === 1 ? 3 : 2), listPage: async () => [rec("1"), rec("2")] };
+        const fallback = { authenticate: async () => null, listPage: async (_p, offset) => offset === 0 ? [rec("9")] : [] };
+        const repo = new cloudflare_3.CredentialRepository(primary, fallback, "hybrid");
+        const page = await repo.listPage("vless", 0, 256, signal);
+        if (page.length !== 3 || page[2].id !== "9")
+            throw new Error(`Fallback tail was dropped: ${JSON.stringify(page.map((r) => r.id))}`);
+    }));
+    tests.push(await runOne("v1.0.0.doh-auth-401", "Configured private DoH answers unauthenticated requests with 401, not 503 (C-5)", "dns", async () => {
+        // The wire handler returns Responses (not throws) for auth outcomes.
+        const denied = await (0, doh_3.handlePrivateDoh)(new Request("https://proxy.example.com/dns-query?dns=AA=="), { CORE_DOH_TOKEN: "doh-token-fixture-7f3a9c1e5b2d4806" });
+        if (denied.status !== 401 || denied.headers.get("www-authenticate") !== "Bearer")
+            throw new Error(`Unauthenticated DoH was not a Bearer 401 (got ${denied.status})`);
+        const disabled = await (0, doh_3.handlePrivateDoh)(new Request("https://proxy.example.com/dns-query?dns=AA=="), {});
+        if (disabled.status !== 503)
+            throw new Error(`Unconfigured DoH was not 503 (got ${disabled.status})`);
+    }));
+    tests.push(await runOne("v1.0.0.doh-json-auth", "DoH JSON is bearer-only; path-secret-only deployments fail closed (benchmark P2)", "dns", async () => {
+        // Auth failures are plain Responses (401/503); only a malformed request
+        // (missing name) throws BAD_REQUEST.
+        const denied = await (0, doh_3.handleDohJson)(new Request("https://proxy.example.com/__core/doh-json?name=example.com&type=A"), { CORE_DOH_TOKEN: "doh-token-fixture-7f3a9c1e5b2d4806" });
+        if (denied.status !== 401)
+            throw new Error(`Unauthenticated DoH JSON was not 401 (got ${denied.status})`);
+        const pathOnly = await (0, doh_3.handleDohJson)(new Request("https://proxy.example.com/__core/doh-json?name=example.com&type=A"), { CORE_DOH_PATH_SECRET: "path-secret-fixture" });
+        if (pathOnly.status !== 503)
+            throw new Error(`Path-secret-only DoH JSON was not 503 (got ${pathOnly.status})`);
+        try {
+            await (0, doh_3.handleDohJson)(new Request("https://proxy.example.com/__core/doh-json", { headers: { Authorization: "Bearer doh-token-fixture-7f3a9c1e5b2d4806" } }), { CORE_DOH_TOKEN: "doh-token-fixture-7f3a9c1e5b2d4806" });
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError && error.code === "BAD_REQUEST")
+                return;
+            throw error;
+        }
+        throw new Error("DoH JSON without parameters was accepted");
+    }));
+    tests.push(await runOne("v1.0.0.native-byte-resume", "Byte-truncated native pages resume at the first unrendered item (SCAN-02)", "output", async () => {
+        const provider = { authenticate: async () => null, count: async (protocol) => protocol === "vless" ? 4 : 0, listPage: async (protocol, offset, limit) => protocol === "vless" ? [1, 2, 3, 4].slice(offset, offset + limit).map((id) => ({ id: String(id), protocol: "vless", credential: vlessUuid, rawCredential: vlessUuid, enabled: true })) : [] };
+        // A long OUTPUT_HOST inflates each share link so that a two-line budget
+        // stays above the CORE_OUTPUT_MAX_BYTES 1024-byte validation floor.
+        const longHost = `${"a".repeat(60)}.${"b".repeat(60)}.example.com`;
+        const base = { VLESS_USERS: vlessUuid, OUTPUT_HOST: longHost, OUTPUT_PORT: "443", CORE_OUTPUT_MAX_NODES: "10" };
+        const full = await (0, service_1.renderSubscriptionWithProvider)({ ...base, CORE_OUTPUT_MAX_BYTES: "1048576" }, new Request("https://proxy.example.com/sub?protocol=vless&limit=3&encode=raw"), provider);
+        const lines = full.body.split("\n").filter(Boolean);
+        if (lines.length !== 3)
+            throw new Error("Fixture did not render 3 lines");
+        const budget = new TextEncoder().encode(lines[0]).byteLength + 1 + new TextEncoder().encode(lines[1]).byteLength;
+        if (budget < 1024)
+            throw new Error(`Fixture lines too short for the byte floor (budget ${budget})`);
+        const cut = await (0, service_1.renderSubscriptionWithProvider)({ ...base, CORE_OUTPUT_MAX_BYTES: String(budget) }, new Request("https://proxy.example.com/sub?protocol=vless&limit=3&encode=raw"), provider);
+        if (cut.headers?.["X-Core-Output-Count"] !== "2" || cut.headers?.["X-Core-Output-Next-Offset"] !== "2" || cut.headers?.["X-Core-Output-Truncated"] !== "true")
+            throw new Error(`Byte resume mismatch: ${JSON.stringify(cut.headers)}`);
+    }));
+    tests.push(await runOne("v1.0.0.surge-render", "Surge renderer emits proxy lines and a select group (benchmark P3)", "output", async () => {
+        const node = { protocol: "vless", server: "proxy.example.com", port: 443, credential: vlessUuid, name: "node", security: "tls", scheme: "https", endpointKind: "domain", tls: { serverName: "proxy.example.com", alpn: ["http/1.1"], fingerprint: "chrome" }, websocket: { path: "/vless", host: "proxy.example.com" } };
+        const out = adapters_1.outputAdapters.surge.render([node], "bundle");
+        if (!out.includes("[Proxy]") || !out.includes("type=vless") && !out.includes("vless"))
+            throw new Error("Surge proxy section missing");
+        if (!out.includes("PROXY"))
+            throw new Error("Surge PROXY group missing");
+    }));
+    tests.push(await runOne("v1.0.0.clash-name-cap", "Over-long Clash custom proxy names are rejected (SCAN-12 hygiene)", "output", async () => {
+        const node = { protocol: "vless", server: "proxy.example.com", port: 443, credential: vlessUuid, name: "node", security: "tls", scheme: "https", endpointKind: "domain", tls: { serverName: "proxy.example.com", alpn: ["http/1.1"], fingerprint: "chrome" }, websocket: { path: "/vless", host: "proxy.example.com" } };
+        try {
+            (0, clash_1.buildClashConfig)([node], { customOutbounds: [{ type: "socks5", name: "x".repeat(129), server: "1.2.3.4", port: 1080 }] });
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR")
+                return;
+            throw error;
+        }
+        throw new Error("129-char Clash custom name was accepted");
+    }));
+    tests.push(await runOne("v1.0.0.cfg-durations", "Xray durations accept compound grammar within the 1s..1h range (CFG-1)", "configuration", async () => {
+        const base = { VLESS_USERS: vlessUuid, TROJAN_USERS: password, OUTPUT_HOST: "proxy.example.com" };
+        (0, validation_1.validateEnvironment)({ ...base, CORE_XRAY_PROBE_INTERVAL: "45m30s" });
+        (0, validation_1.validateEnvironment)({ ...base, CORE_XRAY_PROBE_INTERVAL: "1500ms" });
+        try {
+            (0, validation_1.validateEnvironment)({ ...base, CORE_XRAY_PROBE_INTERVAL: "500ms" });
+        }
+        catch (error) {
+            if (error instanceof validation_1.ConfigurationValidationError)
+                return;
+            throw error;
+        }
+        throw new Error("Sub-second probe interval was accepted");
+    }));
+    tests.push(await runOne("v1.0.0.cfg-reserved-sub", "Protocol paths under /sub/ are rejected (CFG-2)", "configuration", async () => {
+        try {
+            (0, validation_1.validateEnvironment)({ VLESS_USERS: vlessUuid, TROJAN_USERS: password, OUTPUT_HOST: "proxy.example.com", VLESS_PATH: "/sub/vless" });
+        }
+        catch (error) {
+            if (error instanceof validation_1.ConfigurationValidationError)
+                return;
+            throw error;
+        }
+        throw new Error("/sub/vless path was accepted");
+    }));
+    tests.push(await runOne("v1.0.0.cfg-path-probe", "Bare-root paths and fragment probe URLs are rejected (CFG-8)", "configuration", async () => {
+        const base = { VLESS_USERS: vlessUuid, TROJAN_USERS: password, OUTPUT_HOST: "proxy.example.com" };
+        try {
+            (0, validation_1.validateEnvironment)({ ...base, VLESS_PATH: "/" });
+        }
+        catch (error) {
+            if (error instanceof validation_1.ConfigurationValidationError) {
+                try {
+                    (0, validation_1.validateEnvironment)({ ...base, CORE_OUTPUT_PROBE_URL: "https://probe.example.com/x#frag" });
+                }
+                catch (inner) {
+                    if (inner instanceof validation_1.ConfigurationValidationError)
+                        return;
+                    throw inner;
+                }
+                throw new Error("Fragment probe URL was accepted");
+            }
+            throw error;
+        }
+        throw new Error("Bare-root path was accepted");
+    }));
+    tests.push(await runOne("v1.0.0.cfg-structured-port", "Structured ProxyIP ports must be numbers and credentials strings (CFG-4)", "configuration", async () => {
+        const base = { VLESS_USERS: vlessUuid, TROJAN_USERS: password, OUTPUT_HOST: "proxy.example.com" };
+        try {
+            (0, validation_1.validateEnvironment)({ ...base, PROXY_IP_ENDPOINTS_JSON: '[{"host":"proxy.example.com","port":true}]' });
+        }
+        catch (error) {
+            if (error instanceof validation_1.ConfigurationValidationError) {
+                try {
+                    (0, validation_1.validateEnvironment)({ ...base, PROXY_IP_ENDPOINTS_JSON: '[{"host":"proxy.example.com","port":1080,"username":123}]' });
+                }
+                catch (inner) {
+                    if (inner instanceof validation_1.ConfigurationValidationError) {
+                        (0, validation_1.validateEnvironment)({ ...base, PROXY_IP_ENDPOINTS_JSON: '[{"host":"proxy.example.com","port":1080}]' });
+                        return;
+                    }
+                    throw inner;
+                }
+                throw new Error("Non-string credential was accepted");
+            }
+            throw error;
+        }
+        throw new Error("Boolean port was accepted");
+    }));
+    tests.push(await runOne("v1.0.0.protobuf-skip", "VLESS addons skip groups and 64-bit varints per protobuf rules (PR-1)", "protocol", async (signal) => {
+        const domain = new TextEncoder().encode("example.com");
+        // Addons: group field 2 { field 1 varint 1 } + field 3 varint (10 bytes,
+        // value 2^63) — both unknown, both skipped; flow stays empty.
+        const addons = new Uint8Array([0x13, 0x08, 0x01, 0x14, 0x18, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01]);
+        const reader = new byte_queue_1.ByteQueue(8192);
+        reader.push((0, binary_1.concatBytes)(new Uint8Array([0x00]), (0, binary_1.uuidToBytes)(vlessUuid), new Uint8Array([addons.length]), addons, new Uint8Array([0x01]), new Uint8Array([0x01, 0xbb]), new Uint8Array([0x02, domain.length]), domain));
+        const session = await new parser_1.VlessHandler(new StaticProvider("vless", (0, binary_1.uuidToBytes)(vlessUuid))).parse(reader, ctx(signal), signal);
+        if (session.destination.host !== "example.com")
+            throw new Error("Group/varint addons broke parsing");
+    }));
+    tests.push(await runOne("v1.0.0.fragment-expander", "Fragment expansion is shared, not inlined per builder (SCAN-16)", "output", async () => {
+        const tlsNode = { protocol: "vless", server: "proxy.example.com", port: 443, credential: vlessUuid, name: "node", security: "tls", scheme: "https", endpointKind: "domain", tls: { serverName: "proxy.example.com", alpn: ["http/1.1"], fingerprint: "chrome" }, websocket: { path: "/vless", host: "proxy.example.com" } };
+        const plainNode = { ...tlsNode, name: "plain", security: "none" };
+        const expanded = (0, profiles_1.expandXrayFragments)([tlsNode, plainNode], [{ id: "p1", packets: "1-3", lengths: ["100-200"], delays: ["10-20"] }]);
+        if (expanded.length !== 1 || expanded[0].node.name !== "node-p1")
+            throw new Error(`Expander mismatch: ${JSON.stringify(expanded.map((e) => e.node.name))}`);
+    }));
+    tests.push(await runOne("v1.0.0.dns-query-strip", "DoH endpoint query strings are stripped, never sent upstream (DNS-2)", "dns", async () => {
+        const endpoints = (0, config_1.parseDohResolverEndpoints)("https://resolver.example/custom?token=abc");
+        if (endpoints.length !== 1 || endpoints[0] !== "https://resolver.example/custom")
+            throw new Error(`Endpoint query was kept: ${JSON.stringify(endpoints)}`);
+        const resolver = new doh_1.DoHResolver({ endpoint: "https://dns.example/dns-query?token=abc", timeoutMs: 1000, retries: 0 });
+        if (resolver.diagnostics().endpoint !== "https://dns.example/dns-query")
+            throw new Error("Resolver kept an endpoint query string");
+    }));
+    tests.push(await runOne("v1.0.0.ttl-highbit", "TTLs with the high bit set normalize to zero (DNS-3, RFC 2181 §8)", "dns", async (signal) => {
+        const requestFetch = async (_input, init) => {
+            const query = new Uint8Array(init?.body);
+            const id = new DataView(query.buffer, query.byteOffset, query.byteLength).getUint16(0);
+            const qnameLength = query.findIndex((x, i) => i >= 12 && x === 0) - 12 + 1;
+            const questionEnd = 12 + qnameLength + 4;
+            const out = new Uint8Array(questionEnd + 2 + 10 + 4);
+            const view = new DataView(out.buffer);
+            view.setUint16(0, id);
+            view.setUint16(2, 0x8180);
+            view.setUint16(4, 1);
+            view.setUint16(6, 1);
+            out.set(query.subarray(12, questionEnd), 12);
+            out.set(new Uint8Array([0xc0, 0x0c]), questionEnd);
+            let off = questionEnd + 2;
+            view.setUint16(off, 1);
+            view.setUint16(off + 2, 1);
+            view.setUint32(off + 4, 0x80000001);
+            view.setUint16(off + 8, 4);
+            out.set([1, 2, 3, 4], off + 10);
+            return new Response(out, { status: 200, headers: { "content-type": "application/dns-message" } });
+        };
+        const resolver = new doh_1.DoHResolver({ endpoint: "https://dns.example/dns-query", timeoutMs: 1000, retries: 0, fetchImpl: requestFetch });
+        const result = await resolver.resolve("example.com", "ipv4", signal);
+        if (result[0]?.address !== "1.2.3.4" || result[0]?.ttl !== 0)
+            throw new Error(`High-bit TTL was not normalized: ${JSON.stringify(result[0])}`);
+    }));
+    tests.push(await runOne("v1.0.0.dns-deterministic-noretry", "Deterministic DoH failures are not retried against the same resolver (DNS-7)", "dns", async (signal) => {
+        let calls4xx = 0;
+        const bad = new doh_1.DoHResolver({ endpoint: "https://dns.example/dns-query", timeoutMs: 1000, retries: 2, fetchImpl: async () => { calls4xx++; return new Response("", { status: 400 }); } });
+        try {
+            await bad.resolve("example.com", "ipv4", signal);
+        }
+        catch { /* expected */ }
+        if (calls4xx !== 1)
+            throw new Error(`4xx was retried ${calls4xx} times`);
+        let calls5xx = 0;
+        const transient = new doh_1.DoHResolver({ endpoint: "https://dns.example/dns-query", timeoutMs: 1000, retries: 2, fetchImpl: async () => { calls5xx++; return new Response("", { status: 500 }); } });
+        try {
+            await transient.resolve("example.com", "ipv4", signal);
+        }
+        catch { /* expected */ }
+        if (calls5xx !== 3)
+            throw new Error(`5xx retry count changed: ${calls5xx}`);
+    }));
+    tests.push(await runOne("v1.0.0.sharelink-ed", "Non-digit ed= params are stripped, never duplicated (SCAN-05)", "output", async () => {
+        if ((0, share_link_1.webSocketPathWithoutEarlyData)("/vless?ed=abc&x=1") !== "/vless?x=1")
+            throw new Error("Non-digit ed= survived the strip");
+        if ((0, share_link_1.webSocketPathWithoutEarlyData)("/vless?ed=100") !== "/vless")
+            throw new Error("Digit ed= was not stripped");
+        const kept = (0, share_link_1.effectiveWebSocketPath)("/vless?ed=abc", 100);
+        if ((kept.match(/ed=/g) ?? []).length !== 1)
+            throw new Error(`ed= was duplicated: ${kept}`);
+        if ((0, share_link_1.effectiveWebSocketPath)("/vless", 100) !== "/vless?ed=100")
+            throw new Error("Clean path did not gain ed=");
+        if ((0, share_link_1.effectiveWebSocketPath)("/vless?ed=100", 200) !== "/vless?ed=100")
+            throw new Error("Digit ed= precedence changed");
+    }));
+    tests.push(await runOne("v1.0.0.engine-deadline", "One overall deadline bounds a resolve call (DNS-8)", "dns", async (signal) => {
+        const engine = new engine_2.DnsEngine({ DNS_HOSTS: "", DNS_RESOLVERS: "https://dns.example/dns-query", DNS_OVERALL_TIMEOUT_MS: "1000" });
+        const hanging = {
+            diagnostics: () => ({ type: "doh", queries: 0, successes: 0, failures: 0 }),
+            resolve: (_host, _strategy, s) => new Promise((_resolve, reject) => { s.addEventListener("abort", () => reject(new Error("aborted")), { once: true }); }),
+        };
+        engine.resolvers = [hanging];
+        const started = Date.now();
+        try {
+            await engine.resolve("example.com", "ipv4", signal);
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError && error.code === "TIMEOUT" && Date.now() - started < 5000)
+                return;
+            throw error;
+        }
+        throw new Error("Hung resolve was not deadline-bounded");
     }));
     const passed = tests.filter((x) => x.status === "PASS").length;
     const failed = tests.filter((x) => x.status === "FAIL").length;
@@ -5450,10 +6614,24 @@ class FakeSocks5Socket {
 __m["output/aggregation"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.splitSubscriptionSources = splitSubscriptionSources;
 exports.subscriptionSources = subscriptionSources;
+exports.isValidShareLinkLine = isValidShareLinkLine;
 exports.subscriptionSourceLogLabel = subscriptionSourceLogLabel;
 exports.validateSubscriptionUrl = validateSubscriptionUrl;
+exports.assertPublicSubscriptionHost = assertPublicSubscriptionHost;
+exports.fetchNativeSubscriptionSourcesWithReport = fetchNativeSubscriptionSourcesWithReport;
 exports.fetchNativeSubscriptionSources = fetchNativeSubscriptionSources;
+// P1 benchmark (SSRF/bounded-fetch standard): every fetch this module performs
+// goes through validateSubscriptionUrl (HTTPS-by-default, no userinfo/fragment,
+// literal-IP allowlist of disallowed ranges, mandatory host allowlist) plus
+// pre-fetch DNS validation against public addresses, manual redirects, a
+// per-source timeout, a byte cap enforced while streaming, and a TTL cache
+// (no per-request refetch). The same standard governs the preferred-IP URL
+// fetch in src/output/generator-options.ts. Residual boundary, disclosed in
+// fetchOneReport: Workers fetch re-resolves DNS, so validation is not address
+// pinning and a rebinding between validation and connect remains possible;
+// operators must only aggregate sources they trust.
 const errors_1 = __r("../core/errors");
 const limits_1 = __r("../core/limits");
 const bounded_cache_1 = __r("../util/bounded-cache");
@@ -5482,8 +6660,42 @@ function normalizeBody(text) {
     const decoded = decodeBase64(trimmed);
     return decoded?.trim() ?? trimmed;
 }
+// SCAN-18: split on newlines always, but on commas ONLY when the next
+// non-space text starts a URL scheme (https?://). A bare comma split breaks
+// subscription URLs carrying a comma in the query (e.g. ?token=a,b), silently
+// dropping the tail half as an invalid source.
+function splitSubscriptionSources(raw) {
+    return (raw ?? "")
+        .split(/[\r\n]+/)
+        .flatMap((line) => line.split(/,(?=\s*https?:\/\/)/i))
+        .map((x) => x.trim())
+        .filter(Boolean);
+}
 function subscriptionSources(env) {
-    return (env.OUTPUT_CUSTOM_SUBS ?? "").split(/[\r\n,]+/).map((x) => x.trim()).filter(Boolean);
+    return splitSubscriptionSources(env.OUTPUT_CUSTOM_SUBS);
+}
+// P2 benchmark (collector validation): an aggregated line is only usable if it
+// parses as a share link with a host, a port and a credential. Malformed lines
+// are dropped (counted, never logged — a line carries a credential) instead of
+// being emitted verbatim into a subscription the client then fails to parse.
+function isValidShareLinkLine(line) {
+    let url;
+    try {
+        url = new URL(line);
+    }
+    catch {
+        return false;
+    }
+    if (url.protocol !== "vless:" && url.protocol !== "trojan:")
+        return false;
+    if (!url.hostname)
+        return false;
+    const port = Number(url.port);
+    if (!url.port || !Number.isInteger(port) || port < 1 || port > 65535)
+        return false;
+    if (!url.username)
+        return false;
+    return true;
 }
 function subscriptionAllowlist(env) {
     return (env.CORE_OUTPUT_SUBS_ALLOWLIST ?? "").split(/[\r\n,]+/).map((x) => (0, hostname_1.normalizeHostname)(x)).filter(Boolean);
@@ -5640,24 +6852,32 @@ function validateSubscriptionUrl(source, env) {
     return url;
 }
 const subscriptionCache = new bounded_cache_1.BoundedTtlLru(32, 10_000);
-async function fetchOne(source, env, signal, maxBytes, fetchImpl, resolver) {
-    const url = validateSubscriptionUrl(source, env);
+// Shared pre-fetch DNS gate (used by subscription fetches and by the
+// preferred-IP URL fetch): a non-literal hostname must resolve to public
+// addresses only, and a resolver is mandatory for that check. This is NOT
+// address pinning — Workers fetch re-resolves (TOCTOU disclosed in the module
+// header) — but it closes the trivial SSRF cases.
+async function assertPublicSubscriptionHost(url, signal, resolver) {
     const hostname = (0, hostname_1.normalizeHostname)(url.hostname);
-    if (!isDisallowedHost(hostname) && !isIpv4Literal(hostname) && !isIpv6Literal(hostname)) {
-        if (!resolver)
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `DNS validation is required before fetching external subscription host: ${hostname}`);
-        const resolved = await resolver.resolve(hostname, "auto", signal);
-        if (!resolved.length)
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `External subscription host did not resolve to a public address: ${hostname}`);
-        for (const address of resolved) {
-            if (isDisallowedHost(address.address))
-                throw new errors_1.CoreError("CONFIGURATION_ERROR", `External subscription host resolves to a non-public address: ${hostname} -> ${address.address}`);
-        }
+    if (isDisallowedHost(hostname) || isIpv4Literal(hostname) || isIpv6Literal(hostname))
+        return;
+    if (!resolver)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `DNS validation is required before fetching external subscription host: ${hostname}`);
+    const resolved = await resolver.resolve(hostname, "auto", signal);
+    if (!resolved.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `External subscription host did not resolve to a public address: ${hostname}`);
+    for (const address of resolved) {
+        if (isDisallowedHost(address.address))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `External subscription host resolves to a non-public address: ${hostname} -> ${address.address}`);
     }
+}
+async function fetchOneReport(source, env, signal, maxBytes, fetchImpl, resolver) {
+    const url = validateSubscriptionUrl(source, env);
+    await assertPublicSubscriptionHost(url, signal, resolver);
     const cacheKey = `${url.toString()}\u0000${maxBytes}`;
     const cached = subscriptionCache.get(cacheKey);
     if (cached)
-        return [...cached];
+        return { lines: [...cached.lines], dropped: cached.dropped };
     // Residual boundary (audit F6): the addresses validated above cannot be pinned into the
     // Workers fetch below — fetch re-resolves DNS, so a rebinding between validation and
     // connect remains theoretically possible. The mandatory host allowlist, HTTPS-by-default,
@@ -5676,7 +6896,7 @@ async function fetchOne(source, env, signal, maxBytes, fetchImpl, resolver) {
         throw new errors_1.CoreError("MESSAGE_TOO_LARGE", `External subscription exceeds ${maxBytes} bytes`);
     const reader = response.body?.getReader();
     if (!reader)
-        return [];
+        return { lines: [], dropped: 0 };
     const chunks = [];
     let total = 0;
     try {
@@ -5712,31 +6932,44 @@ async function fetchOne(source, env, signal, maxBytes, fetchImpl, resolver) {
     }
     const out = [];
     const seen = new Set();
+    let dropped = 0;
     for (const line of body.split(/\r?\n/).map((x) => x.trim()).filter((x) => /^(vless|trojan):\/\//i.test(x))) {
+        if (!isValidShareLinkLine(line)) {
+            dropped++;
+            continue;
+        }
         if (!seen.has(line)) {
             seen.add(line);
             out.push(line);
         }
     }
-    subscriptionCache.set(cacheKey, out);
-    return out;
+    if (dropped)
+        console.warn(`External subscription source dropped ${dropped} malformed share-link line(s) (${subscriptionSourceLogLabel(source)})`);
+    subscriptionCache.set(cacheKey, { lines: out, dropped });
+    return { lines: out, dropped };
 }
-async function fetchNativeSubscriptionSources(env, signal, maxSources = limits_1.CORE_LIMITS.maxSubscriptionSources, maxBytes = limits_1.CORE_LIMITS.maxSubscriptionSourceBytes, fetchImpl = fetch, resolver) {
+async function fetchNativeSubscriptionSourcesWithReport(env, signal, maxSources = limits_1.CORE_LIMITS.maxSubscriptionSources, maxBytes = limits_1.CORE_LIMITS.maxSubscriptionSourceBytes, fetchImpl = fetch, resolver) {
     const sources = subscriptionSources(env);
     if (sources.length > maxSources)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `Too many external subscription sources: ${sources.length}`);
     const out = [];
     const seen = new Set();
+    let sourcesFailed = 0;
+    let sourcesEmpty = 0;
+    let droppedMalformed = 0;
     const sourceTimeout = Number(env.CORE_OUTPUT_SUBS_TIMEOUT_MS ?? limits_1.CORE_LIMITS.defaultExternalSubscriptionTimeoutMs);
     const boundedTimeout = Number.isFinite(sourceTimeout) && sourceTimeout >= 250 ? Math.min(sourceTimeout, 30_000) : limits_1.CORE_LIMITS.defaultExternalSubscriptionTimeoutMs;
     for (const source of sources) {
         try {
-            const lines = await (0, lifecycle_1.withTimeout)((sourceSignal) => fetchOne(source, env, sourceSignal, maxBytes, fetchImpl, resolver), boundedTimeout, signal, "External subscription fetch timeout");
+            const { lines, dropped } = await (0, lifecycle_1.withTimeout)((sourceSignal) => fetchOneReport(source, env, sourceSignal, maxBytes, fetchImpl, resolver), boundedTimeout, signal, "External subscription fetch timeout");
+            droppedMalformed += dropped;
             // DS-L26: an HTTP-200 source that yields zero lines is as silent a
             // failure as a fetch error was before the warn channel existed, so
             // warn on the same console.warn channel instead of returning nothing.
-            if (!lines.length)
+            if (!lines.length) {
+                sourcesEmpty++;
                 console.warn(`External subscription source yielded no lines (${subscriptionSourceLogLabel(source)})`);
+            }
             for (const line of lines) {
                 if (!seen.has(line)) {
                     seen.add(line);
@@ -5749,10 +6982,14 @@ async function fetchNativeSubscriptionSources(env, signal, maxSources = limits_1
                 throw error;
             if (signal.aborted)
                 throw signal.reason;
+            sourcesFailed++;
             console.warn(`Skipping unavailable external subscription source (${subscriptionSourceLogLabel(source)})`);
         }
     }
-    return out;
+    return { lines: out, sourcesAttempted: sources.length, sourcesFailed, sourcesEmpty, droppedMalformed };
+}
+async function fetchNativeSubscriptionSources(env, signal, maxSources = limits_1.CORE_LIMITS.maxSubscriptionSources, maxBytes = limits_1.CORE_LIMITS.maxSubscriptionSourceBytes, fetchImpl = fetch, resolver) {
+    return [...(await fetchNativeSubscriptionSourcesWithReport(env, signal, maxSources, maxBytes, fetchImpl, resolver)).lines];
 }
 
 };
@@ -5792,6 +7029,12 @@ function remainingMs(deadlineAt, fallbackMs) {
         return fallbackMs;
     return Math.max(0, Math.min(fallbackMs, deadlineAt - Date.now()));
 }
+// TU-11 (documented difference, intentional): deadlineAtFromNow treats
+// 0/negative/undefined as "no deadline" (deadline composition: a missing
+// deadline means unbounded), while withTimeout below clamps 0 to an
+// immediate timeout (operation bounding: a 0 budget means "fail now").
+// The two APIs answer different questions; callers must not assume 0 means
+// the same thing in both.
 function deadlineAtFromNow(timeoutMs) {
     if (timeoutMs === undefined || timeoutMs <= 0)
         return undefined;
@@ -5858,10 +7101,15 @@ async function withTimeout(factory, timeoutMs, parent, message) {
         return result;
     }
     catch (error) {
-        if (timedOut)
-            throw combined.signal.reason ?? timeoutError();
+        // TU-11: a parent abort in the same tick as the timer firing used to be
+        // masked as a TIMEOUT (timedOut checked first). The parent's reason is
+        // the more informative cause — it names who aborted and why — so it
+        // wins when both fired. Either way the operation is aborted; only the
+        // diagnostic changes.
         if (parent.aborted)
             throw parent.reason;
+        if (timedOut)
+            throw combined.signal.reason ?? timeoutError();
         throw error;
     }
     finally {
@@ -5931,6 +7179,13 @@ __m["util/bounded-cache"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.BoundedTtlLru = void 0;
+// TU-12 (accepted design limit, documented): eviction counts ENTRIES, not
+// bytes — one entry can be arbitrarily large. That is bounded in practice
+// by the callers: the subscription cache holds string[] values already
+// capped upstream by the fetch byte cap, and the auth caches hold small
+// fixed-shape values. Entry-count bounding prevents unbounded growth; a
+// byte-accounting cache would need a caller-supplied sizer for values whose
+// size is not measurable generically (string[] vs digests vs objects).
 class BoundedTtlLru {
     maxEntries;
     ttlMs;
@@ -5994,7 +7249,13 @@ function isCorePath(pathname, env) {
     const path = stripTrailingSlashes(pathname);
     const vlessPath = stripTrailingSlashes(env.VLESS_PATH?.trim() || "/vless");
     const trojanPath = stripTrailingSlashes(env.TROJAN_PATH?.trim() || "/trojan");
-    const dohPath = stripTrailingSlashes(env.DOH_PATH?.trim() || "/dns-query");
+    // RT-1: DOH_PATH="/" strips to "" and then to "/" here, but the control
+    // layer falls back to "/dns-query" for the same value — Pages used to
+    // classify /dns-query as a static asset while Workers served DoH there.
+    // Match the control layer exactly; validation (CFG-8) now also rejects
+    // a bare "/" path at startup, so this is defense in depth.
+    const dohStripped = stripTrailingSlashes(env.DOH_PATH?.trim() || "/dns-query");
+    const dohPath = dohStripped === "/" ? "/dns-query" : dohStripped;
     return (path === vlessPath ||
         path === trojanPath ||
         path === dohPath ||
@@ -6004,6 +7265,14 @@ function isCorePath(pathname, env) {
         path.startsWith("/sub/") ||
         // The stripped form of "/__core/" is "/__core", which no longer
         // matches the "/__core/" prefix, so accept the bare prefix too.
+        // RT-5 (documented breadth, NOT narrowed): these prefix matches are
+        // deliberately broader than the real route surface (only exact
+        // /sub/<secret> and a fixed /__core/* list are real routes). The
+        // direction is fail-closed — over-classified paths reach the worker
+        // and get its generic 404 instead of an asset — while narrowing
+        // would risk under-classification, the dangerous direction. Cost:
+        // no static asset may live under /dns-query/…, /sub/…, or
+        // /__core/… on Pages.
         path === "/__core" ||
         path.startsWith("/__core/"));
 }
@@ -6035,13 +7304,15 @@ exports.default = {
 __m["output/rules"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.WELL_KNOWN_OUTBOUND_TAGS = exports.MAX_CLASH_EXPANDED_LINES = exports.MAX_ROUTING_RULES = exports.MAX_ROUTING_RULES_BYTES = void 0;
+exports.ROUTING_PACKS = exports.WELL_KNOWN_OUTBOUND_TAGS = exports.MAX_CLASH_EXPANDED_LINES = exports.MAX_ROUTING_RULES = exports.MAX_ROUTING_RULES_BYTES = void 0;
 exports.collectRoutingRuleIssues = collectRoutingRuleIssues;
 exports.parseRoutingRules = parseRoutingRules;
+exports.parseRoutingPacks = parseRoutingPacks;
 exports.translateSingboxRules = translateSingboxRules;
 exports.translateXrayRules = translateXrayRules;
 exports.translateClashRules = translateClashRules;
 exports.countClashExpandedLines = countClashExpandedLines;
+exports.translateSurgeRules = translateSurgeRules;
 const errors_1 = __r("../core/errors");
 const hostname_1 = __r("../util/hostname");
 exports.MAX_ROUTING_RULES_BYTES = 128 * 1024;
@@ -6137,6 +7408,27 @@ function validCidr(value) {
         return isIpv6Literal(address) && prefix <= 128;
     return isIpv4Literal(address) && prefix <= 32;
 }
+// SCAN-10 helper: detects JavaScript-only regex constructs RE2 rejects.
+// Escaped characters are stripped first so a literal "\(?=" is not mistaken for
+// a lookahead; backreferences are checked on the raw text because they ARE an
+// escape sequence. Atomic groups "(?>...)", possessive quantifiers ("a++",
+// "a*+", "a?+", "a{2,3}+") and conditionals "(?(...)...)" complete the set.
+function hasJsOnlyRegexConstruct(value) {
+    if (/\\[1-9]/.test(value))
+        return true;
+    const unescaped = value.replace(/\\./g, "");
+    if (/\(\?[=!]/.test(unescaped))
+        return true;
+    if (/\(\?<[=!]/.test(unescaped))
+        return true;
+    if (/\(\?>/.test(unescaped))
+        return true;
+    if (/\(\?\(/.test(unescaped))
+        return true;
+    if (/(\*|\+|\?|\{\d+(,\d*)?\})\+/.test(unescaped))
+        return true;
+    return false;
+}
 // Normalizes one raw rule object into the parsed shape, returning issue strings
 // (empty = valid). Normalization is lenient where it is unambiguous: a single
 // string/int is accepted where a list is expected, and network/protocol are
@@ -6163,7 +7455,7 @@ function normalizeRule(raw, index) {
     const normalized = { action };
     if (typeof raw.outbound === "string")
         normalized.outbound = raw.outbound;
-    for (const field of ["domain", "domain_suffix", "domain_keyword"]) {
+    for (const field of ["domain", "domain_suffix"]) {
         if (raw[field] === undefined)
             continue;
         const list = asStringList(raw[field]);
@@ -6181,7 +7473,10 @@ function normalizeRule(raw, index) {
                 issues.push(`${prefix}: ${field} '${value}' must not contain '*' or ','`);
                 continue;
             }
-            const normalizedValue = normalizeHostnameValue(value);
+            // SCAN-09: a leading-dot suffix (".example.com") is the same suffix as
+            // the bare form in every target; normalize it instead of rejecting it.
+            const dotted = field === "domain_suffix" ? value.replace(/^\.+/, "") : value;
+            const normalizedValue = normalizeHostnameValue(dotted);
             if (!normalizedValue) {
                 issues.push(`${prefix}: ${field} '${value}' is not a valid hostname`);
                 continue;
@@ -6191,6 +7486,26 @@ function normalizeRule(raw, index) {
         // Store the TRIMMED, trailing-dot-stripped, lowercased form so what is
         // validated is exactly what every target renders.
         normalized[field] = normalizedList;
+    }
+    // SCAN-09: domain_keyword is a SUBSTRING match, not a hostname — it must not
+    // go through hostname validation (underscores and other non-LDH characters are
+    // legitimate substrings). Only ',' (Clash line delimiter), CR/LF and emptiness
+    // are rejected; '*' stays allowed because it is a literal substring here.
+    if (raw.domain_keyword !== undefined) {
+        const list = asStringList(raw.domain_keyword);
+        if (list === null)
+            issues.push(`${prefix}: domain_keyword must be a string or an array of strings`);
+        else {
+            const normalizedList = [];
+            for (const value of list) {
+                if (!value.trim() || value.includes(",") || /[\r\n]/.test(value)) {
+                    issues.push(`${prefix}: domain_keyword '${value}' must be non-empty and must not contain ',' or line breaks`);
+                    continue;
+                }
+                normalizedList.push(value.trim().toLowerCase());
+            }
+            normalized.domain_keyword = normalizedList;
+        }
     }
     if (raw.domain_regex !== undefined) {
         const list = asStringList(raw.domain_regex);
@@ -6213,6 +7528,14 @@ function normalizeRule(raw, index) {
                 }
                 catch {
                     issues.push(`${prefix}: domain_regex '${value}' does not compile`);
+                    continue;
+                }
+                // SCAN-10: sing-box and Mihomo use RE2 (and Xray RE2 for domain
+                // matching), which rejects JavaScript-only constructs. Reject them at
+                // layer 1 so a rule that compiles under JS RegExp cannot fail closed
+                // at render time or, worse, match differently per target.
+                if (hasJsOnlyRegexConstruct(value)) {
+                    issues.push(`${prefix}: domain_regex '${value}' uses a JavaScript-only construct (lookahead/lookbehind, backreference, atomic group, possessive quantifier or conditional) that RE2 does not support`);
                     continue;
                 }
                 normalizedRegexList.push(value);
@@ -6301,13 +7624,19 @@ function normalizeRule(raw, index) {
         if (list === null)
             issues.push(`${prefix}: geosite must be a string or an array of strings`);
         else {
+            // SCAN-11: the old comment claimed lowercasing that only geoip received.
+            // Geosite categories are case-sensitive per target (and lowercased in
+            // practice by every list publisher), so normalize here like geoip.
+            const normalizedList = [];
             for (const value of list) {
                 if (!value || /\s/.test(value))
                     issues.push(`${prefix}: geosite '${value}' must be a non-empty name without whitespace`);
                 else if (value.includes("*") || value.includes(","))
                     issues.push(`${prefix}: geosite '${value}' must not contain '*' or ','`);
+                else
+                    normalizedList.push(value.toLowerCase());
             }
-            normalized.geosite = list;
+            normalized.geosite = normalizedList;
         }
     }
     return { rule: issues.length ? null : normalized, issues };
@@ -6352,6 +7681,43 @@ function parseRoutingRules(raw) {
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_OUTPUT_ROUTING_RULES: ${issues[0]}`);
     const parsed = JSON.parse(trimmed);
     return parsed.map((entry, index) => normalizeRule(entry, index).rule);
+}
+// P1 benchmark: named routing packs (CORE_OUTPUT_ROUTING_PACK). Pack rules are
+// appended AFTER user CORE_OUTPUT_ROUTING_RULES, so user rules always win on
+// conflict (first-match in every target). Every pack matcher is chosen to
+// translate to all three targets — notably quic-block uses network=udp +
+// port=443 rather than protocol=quic, which Clash cannot express (layer 2
+// would fail the whole Clash artifact). The ads/malware lists are starter
+// sets of well-known suffixes; operators extend them via CORE_OUTPUT_ROUTING_RULES.
+exports.ROUTING_PACKS = {
+    "ir-bypass": [
+        { domain_suffix: ["ir"], action: "direct" },
+    ],
+    ads: [
+        { domain_suffix: ["doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com", "ads.yahoo.com", "advertising.com", "adnxs.com", "criteo.com", "taboola.com", "outbrain.com"], action: "block" },
+    ],
+    malware: [
+        { domain_suffix: ["coinhive.com", "coinimp.com", "cryptoloot.pro", "minero.cc"], action: "block" },
+    ],
+    "quic-block": [
+        { network: "udp", port: [443], action: "block" },
+    ],
+    "private-direct": [
+        { ip_cidr: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "::1/128", "fc00::/7", "fe80::/10"], action: "direct" },
+    ],
+};
+function parseRoutingPacks(raw) {
+    const trimmed = raw?.trim();
+    if (!trimmed)
+        return [];
+    const out = [];
+    for (const name of trimmed.split(/[\r\n,]+/).map((value) => value.trim().toLowerCase()).filter(Boolean)) {
+        const pack = exports.ROUTING_PACKS[name];
+        if (!pack)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_OUTPUT_ROUTING_PACK: unknown pack '${name}'; known packs are ${Object.keys(exports.ROUTING_PACKS).join(", ")}`);
+        out.push(...pack);
+    }
+    return out;
 }
 // A rule's explicit outbound tag resolves per target: the three well-known tags
 // always resolve, a custom tag must be defined for that target, anything else is
@@ -6468,8 +7834,11 @@ function translateXrayRules(rules, ctx) {
             entry.sourcePort = rule.source_port.map(String).join(",");
         if (rule.network)
             entry.network = rule.network;
+        // R-9: the routing doc shows `protocol` as an ARRAY (["http", "tls",
+        // ...]). Single-string coercion was UNVERIFIED for this field, so emit
+        // the documented array form instead of relying on coercion.
         if (rule.protocol)
-            entry.protocol = rule.protocol;
+            entry.protocol = [rule.protocol];
         if (target.kind === "proxy") {
             if (ctx.multi)
                 entry.balancerTag = "proxy-balancer";
@@ -6573,6 +7942,53 @@ function countClashExpandedLines(rules) {
     });
     return total;
 }
+function translateSurgeRules(rules, ctx) {
+    const lines = [];
+    rules.forEach((rule, index) => {
+        const target = resolveTarget(rule, index, ctx.customNames);
+        const action = target.kind === "proxy" ? "PROXY" : target.kind === "direct" ? "DIRECT" : target.kind === "block" ? "REJECT" : target.tag;
+        const groups = new Map();
+        const push = (type, value) => {
+            const list = groups.get(type) ?? [];
+            list.push(value);
+            groups.set(type, list);
+        };
+        for (const value of rule.domain ?? [])
+            push("DOMAIN", value);
+        for (const value of rule.domain_suffix ?? [])
+            push("DOMAIN-SUFFIX", value);
+        for (const value of rule.domain_keyword ?? [])
+            push("DOMAIN-KEYWORD", value);
+        for (const value of rule.domain_regex ?? [])
+            push("DOMAIN-REGEX", value);
+        for (const value of rule.ip_cidr ?? [])
+            push(value.includes(":") ? "IP-CIDR6" : "IP-CIDR", value);
+        for (const value of rule.source_ip_cidr ?? [])
+            push("SRC-IP-CIDR", value);
+        for (const value of rule.port ?? [])
+            push("DST-PORT", String(value));
+        for (const value of rule.source_port ?? [])
+            push("SRC-PORT", String(value));
+        if (rule.port_range !== undefined)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: port_range is not supported for Surge in v1`);
+        if (rule.network)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: network matcher is not supported for Surge in v1`);
+        if (rule.protocol !== undefined)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: protocol matcher is not supported for Surge in v1`);
+        if ((rule.geoip ?? []).length)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: geoip matcher is not supported for Surge in v1`);
+        if ((rule.geosite ?? []).length)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: geosite matcher is not supported for Surge in v1`);
+        const types = [...groups.keys()];
+        if (types.length === 0)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: at least one matcher is required`);
+        if (types.length > 1)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: multi-matcher rules are not supported for Surge in v1 (no AND combinator)`);
+        for (const value of groups.get(types[0]) ?? [])
+            lines.push(`${types[0]},${value},${action}`);
+    });
+    return lines;
+}
 
 };
 
@@ -6581,9 +7997,12 @@ __m["output/adapters"] = function(module, exports, __r) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.outputAdapters = void 0;
 const errors_1 = __r("../core/errors");
+const limits_1 = __r("../core/limits");
 const clash_1 = __r("./clash");
 const singbox_1 = __r("./singbox");
 const xray_1 = __r("./xray");
+const surge_1 = __r("./surge");
+const generator_options_1 = __r("./generator-options");
 function asRules(value) {
     return Array.isArray(value) && value.every((item) => item !== null && typeof item === "object" && !Array.isArray(item))
         ? value
@@ -6594,31 +8013,97 @@ function asOutbounds(value) {
         ? value
         : undefined;
 }
+function asGeneratorOptions(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+function asStringArray(value) {
+    return Array.isArray(value) && value.every((item) => typeof item === "string") ? [...value] : undefined;
+}
+// SCAN-15: fragment profiles are validated at the adapter boundary instead
+// of unsafe casts. The HTTP layer passes per-target profiles (Xray env
+// profiles for xray, the two built-in sing-box modes for sing-box); a direct
+// caller passing the wrong shape gets a clear error, not silent garbage.
+function asXrayProfiles(value) {
+    if (!Array.isArray(value))
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment profiles must be an array");
+    for (const [i, p] of value.entries()) {
+        const ok = p !== null && typeof p === "object" && !Array.isArray(p)
+            && typeof p.id === "string"
+            && (p.packets === "1-3" || p.packets === "tlshello")
+            && Array.isArray(p.lengths) && p.lengths.every((s) => typeof s === "string")
+            && Array.isArray(p.delays) && p.delays.every((s) => typeof s === "string");
+        if (!ok)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Fragment profile ${i} is not a valid Xray fragment profile`);
+    }
+    return value;
+}
+function asSingboxProfiles(value) {
+    if (!Array.isArray(value))
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment profiles must be an array");
+    for (const [i, p] of value.entries()) {
+        const ok = p !== null && typeof p === "object" && !Array.isArray(p)
+            && typeof p.id === "string"
+            && (p.fragment === true || p.recordFragment === true);
+        if (!ok)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Fragment profile ${i} is not a valid sing-box fragment profile`);
+    }
+    return value;
+}
+// SCAN-17: the fragment expansion ceiling applies at the adapter layer too,
+// not only on the HTTP path, so a direct caller cannot bypass it.
+function checkFragmentCeiling(nodes, profiles) {
+    const tlsCount = nodes.filter((n) => n.security === "tls").length;
+    if (tlsCount * profiles.length > limits_1.CORE_LIMITS.maxFragmentExpansionCandidates) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `Fragment expansion exceeds safety ceiling ${limits_1.CORE_LIMITS.maxFragmentExpansionCandidates}`);
+    }
+}
+// SCAN-15: `node` kind is explicit — exactly one node, rendered as a
+// single-node manual/select config — instead of silently falling through to
+// the bundle builders.
+function requireSingleNode(nodes) {
+    if (nodes.length !== 1)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Node output requires exactly one node");
+}
 function xrayOptions(options) {
     const routingRules = asRules(options?.routingRules);
     const customOutbounds = asOutbounds(options?.xrayOutbounds);
+    const poolOutbounds = asOutbounds(options?.xrayPoolOutbounds);
+    const gen = asGeneratorOptions(options?.generatorOptions);
     return {
         ...(routingRules ? { routingRules } : {}),
         ...(customOutbounds ? { customOutbounds } : {}),
+        ...(poolOutbounds ? { poolOutbounds } : {}),
+        ...(gen ? { generatorOptions: gen } : {}),
         ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
         ...(typeof options?.probeInterval === "string" ? { probeInterval: options.probeInterval } : {}),
         ...(typeof options?.observatoryConcurrency === "boolean" ? { observatoryConcurrency: options.observatoryConcurrency } : {}),
         ...(typeof options?.fragmentProfile === "object" && options.fragmentProfile !== null ? { fragmentProfile: options.fragmentProfile } : {}),
         ...(options?.allowDirectFallback === true ? { allowDirectFallback: true } : {}),
+        ...(typeof options?.fallbackNode === "string" ? { fallbackNode: options.fallbackNode } : {}),
+        ...(typeof options?.fallbackTag === "string" ? { fallbackTag: options.fallbackTag } : {}),
+        ...(options?.xrayDns !== null && typeof options?.xrayDns === "object" ? { xrayDns: options.xrayDns } : {}),
+        ...(options?.xrayFakeDns !== null && typeof options?.xrayFakeDns === "object" ? { xrayFakeDns: options.xrayFakeDns } : {}),
+        ...(options?.xrayDnsInbound !== null && typeof options?.xrayDnsInbound === "object" ? { xrayDnsInbound: options.xrayDnsInbound } : {}),
     };
 }
 function singboxOptions(options) {
     const routingRules = asRules(options?.routingRules);
     const customOutbounds = asOutbounds(options?.singboxOutbounds);
+    const poolOutbounds = asOutbounds(options?.singboxPoolOutbounds);
+    const gen = asGeneratorOptions(options?.generatorOptions);
     return {
         ...(routingRules ? { routingRules } : {}),
         ...(customOutbounds ? { customOutbounds } : {}),
+        ...(poolOutbounds ? { poolOutbounds } : {}),
+        ...(gen ? { generatorOptions: gen } : {}),
         ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
         ...(typeof options?.interval === "string" ? { interval: options.interval } : {}),
         ...(typeof options?.tolerance === "number" ? { tolerance: options.tolerance } : {}),
         ...(typeof options?.fragmentProfile === "object" && options.fragmentProfile !== null ? { fragmentProfile: options.fragmentProfile } : {}),
         ...(options?.useUtls === true ? { useUtls: true } : {}),
         ...(options?.enableTun === true ? { enableTun: true } : {}),
+        ...(options?.singboxDns !== null && typeof options?.singboxDns === "object" ? { singboxDns: options.singboxDns } : {}),
+        ...(options?.singboxEch !== null && typeof options?.singboxEch === "object" ? { singboxEch: options.singboxEch } : {}),
     };
 }
 function intervalSeconds(value) {
@@ -6634,16 +8119,36 @@ function intervalSeconds(value) {
     return undefined;
 }
 function mihomoOptions(options) {
-    const interval = intervalSeconds(options?.interval);
+    const interval = intervalSeconds(options?.mihomoInterval ?? options?.interval);
+    const tolerance = typeof options?.mihomoTolerance === "number" ? options.mihomoTolerance : typeof options?.tolerance === "number" ? options.tolerance : undefined;
     const routingRules = asRules(options?.routingRules);
     const customOutbounds = asOutbounds(options?.clashProxies);
+    const poolOutbounds = asOutbounds(options?.clashPoolOutbounds);
+    const gen = asGeneratorOptions(options?.generatorOptions);
     return {
         ...(routingRules ? { routingRules } : {}),
         ...(customOutbounds ? { customOutbounds } : {}),
+        ...(poolOutbounds ? { poolOutbounds } : {}),
+        ...(gen ? { generatorOptions: gen } : {}),
         ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
         ...(interval !== undefined ? { interval } : {}),
-        ...(typeof options?.tolerance === "number" ? { tolerance: options.tolerance } : {}),
+        ...(tolerance !== undefined ? { tolerance } : {}),
         ...(options?.enableTun === true ? { enableTun: true } : {}),
+        ...(options?.clashDns !== null && typeof options?.clashDns === "object" ? { clashDns: options.clashDns } : {}),
+    };
+}
+function surgeOptions(options) {
+    const routingRules = asRules(options?.routingRules);
+    const customLines = asStringArray(options?.surgeCustomLines);
+    const poolLines = asStringArray(options?.surgePoolLines);
+    const gen = asGeneratorOptions(options?.generatorOptions);
+    return {
+        ...(routingRules ? { routingRules } : {}),
+        ...(customLines ? { customLines } : {}),
+        ...(poolLines ? { poolLines } : {}),
+        ...(gen ? { generatorOptions: gen } : {}),
+        ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
+        ...(typeof options?.interval === "string" ? { interval: options.interval } : {}),
     };
 }
 exports.outputAdapters = {
@@ -6651,12 +8156,23 @@ exports.outputAdapters = {
         format: "xray",
         render: (nodes, kind = "bundle", options) => {
             const x = xrayOptions(options);
+            (0, generator_options_1.assertEchCompatible)(x.generatorOptions, "xray");
+            if (kind === "node") {
+                requireSingleNode(nodes);
+                return JSON.stringify((0, xray_1.buildXrayConfig)(nodes, { ...x, strategy: "manual" }), null, 2);
+            }
             if (kind === "best-ping")
                 return JSON.stringify((0, xray_1.buildXrayBestPingConfig)(nodes, x), null, 2);
-            if (kind === "best-fragment")
-                return JSON.stringify((0, xray_1.buildXrayBestFragmentConfig)(nodes, options?.fragmentProfiles ?? [], x), null, 2);
-            if (kind === "best-ping-fragment")
-                return JSON.stringify((0, xray_1.buildXrayBestPingFragmentConfig)(nodes, options?.fragmentProfiles ?? [], x), null, 2);
+            if (kind === "best-fragment") {
+                const profiles = asXrayProfiles(options?.fragmentProfiles);
+                checkFragmentCeiling(nodes, profiles);
+                return JSON.stringify((0, xray_1.buildXrayBestFragmentConfig)(nodes, profiles, x), null, 2);
+            }
+            if (kind === "best-ping-fragment") {
+                const profiles = asXrayProfiles(options?.fragmentProfiles);
+                checkFragmentCeiling(nodes, profiles);
+                return JSON.stringify((0, xray_1.buildXrayBestPingFragmentConfig)(nodes, profiles, x), null, 2);
+            }
             return JSON.stringify((0, xray_1.buildXrayConfig)(nodes, { ...x, strategy: "roundRobin" }), null, 2);
         },
     },
@@ -6664,250 +8180,1790 @@ exports.outputAdapters = {
         format: "sing-box",
         render: (nodes, kind = "bundle", options) => {
             const s = singboxOptions(options);
+            if (kind === "node") {
+                requireSingleNode(nodes);
+                return JSON.stringify((0, singbox_1.buildSingboxConfig)(nodes, { ...s, strategy: "manual" }), null, 2);
+            }
             if (kind === "best-ping")
                 return JSON.stringify((0, singbox_1.buildSingboxBestPingConfig)(nodes, s), null, 2);
-            if (kind === "best-fragment")
-                return JSON.stringify((0, singbox_1.buildSingboxBestFragmentConfig)(nodes, options?.fragmentProfiles ?? [], s), null, 2);
-            if (kind === "best-ping-fragment")
-                return JSON.stringify((0, singbox_1.buildSingboxBestPingFragmentConfig)(nodes, options?.fragmentProfiles ?? [], s), null, 2);
+            if (kind === "best-fragment") {
+                const profiles = asSingboxProfiles(options?.fragmentProfiles);
+                checkFragmentCeiling(nodes, profiles);
+                return JSON.stringify((0, singbox_1.buildSingboxBestFragmentConfig)(nodes, profiles, s), null, 2);
+            }
+            if (kind === "best-ping-fragment") {
+                const profiles = asSingboxProfiles(options?.fragmentProfiles);
+                checkFragmentCeiling(nodes, profiles);
+                return JSON.stringify((0, singbox_1.buildSingboxBestPingFragmentConfig)(nodes, profiles, s), null, 2);
+            }
             return JSON.stringify((0, singbox_1.buildSingboxConfig)(nodes, s), null, 2);
         },
     },
     clash: {
         format: "clash",
         render: (nodes, kind = "bundle", options) => {
+            const m = mihomoOptions(options);
+            (0, generator_options_1.assertEchCompatible)(m.generatorOptions, "clash");
             // DS-I15: match the artifacts.ts HTTP guard instead of silently
             // degrading a fragment kind to a plain bundle for direct callers.
             if (kind === "best-fragment" || kind === "best-ping-fragment") {
                 throw new errors_1.CoreError("UNSUPPORTED_TRANSPORT", "Mihomo/Clash does not expose the Worker fragment profiles in this output model");
             }
-            const m = mihomoOptions(options);
+            if (kind === "node") {
+                requireSingleNode(nodes);
+                return (0, clash_1.buildClashConfig)(nodes, { ...m, groupStrategy: "select" });
+            }
             return kind === "best-ping" ? (0, clash_1.buildClashBestPingConfig)(nodes, m) : (0, clash_1.buildClashConfig)(nodes, m);
+        },
+    },
+    surge: {
+        format: "surge",
+        render: (nodes, kind = "bundle", options) => {
+            const s = surgeOptions(options);
+            (0, generator_options_1.assertEchCompatible)(s.generatorOptions, "surge");
+            if (kind === "best-fragment" || kind === "best-ping-fragment") {
+                throw new errors_1.CoreError("UNSUPPORTED_TRANSPORT", "Surge does not expose the Worker fragment profiles in this output model");
+            }
+            if (kind === "node") {
+                requireSingleNode(nodes);
+                return (0, surge_1.buildSurgeConfig)(nodes, { ...s, groupStrategy: "select" });
+            }
+            return (0, surge_1.buildSurgeConfig)(nodes, { ...s, groupStrategy: kind === "best-ping" ? "url-test" : "select" });
         },
     },
 };
 
 };
 
-__m["output/xray/index"] = function(module, exports, __r) {
+__m["output/generator-options"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.buildXrayConfig = buildXrayConfig;
-exports.buildXrayBestPingConfig = buildXrayBestPingConfig;
-exports.buildXrayBestFragmentConfig = buildXrayBestFragmentConfig;
-exports.buildXrayBestPingFragmentConfig = buildXrayBestPingFragmentConfig;
+exports.parseChainEntries = parseChainEntries;
+exports.parseGeneratorOptions = parseGeneratorOptions;
+exports.collectGeneratorOptionIssues = collectGeneratorOptionIssues;
+exports.applySniCase = applySniCase;
+exports.effectiveSni = effectiveSni;
+exports.xrayLogLevel = xrayLogLevel;
+exports.singboxLogLevel = singboxLogLevel;
+exports.clashLogLevel = clashLogLevel;
+exports.resolveXrayFallbackTag = resolveXrayFallbackTag;
+exports.workerDohResolvers = workerDohResolvers;
+exports.buildXrayDns = buildXrayDns;
+exports.buildXrayFakeDns = buildXrayFakeDns;
+exports.buildSingboxDns = buildSingboxDns;
+exports.buildClashDns = buildClashDns;
+exports.buildSingboxEch = buildSingboxEch;
+exports.assertEchCompatible = assertEchCompatible;
+exports.buildXraySockopt = buildXraySockopt;
+exports.buildXrayInboundSockopt = buildXrayInboundSockopt;
+exports.buildSingboxDial = buildSingboxDial;
+exports.buildWarpXray = buildWarpXray;
+exports.buildWarpSingbox = buildWarpSingbox;
+exports.buildWarpClash = buildWarpClash;
+exports.translateChainToXray = translateChainToXray;
+exports.translateChainToSingbox = translateChainToSingbox;
+exports.translateChainToClash = translateChainToClash;
+exports.translateChainToSurgeLine = translateChainToSurgeLine;
+exports.fetchPreferredIpEntries = fetchPreferredIpEntries;
+exports.buildXrayFreedomSockopt = buildXrayFreedomSockopt;
+exports.buildXrayDnsInbound = buildXrayDnsInbound;
+const errors_1 = __r("../core/errors");
+const hostname_1 = __r("../util/hostname");
+const binary_1 = __r("../util/binary");
+const config_1 = __r("../dns/config");
+const bounded_cache_1 = __r("../util/bounded-cache");
+const endpoints_1 = __r("./endpoints");
+const rules_1 = __r("./rules");
+const aggregation_1 = __r("./aggregation");
+const TRUE_VALUES = new Set(["1", "true", "yes", "on"]);
+const FALSE_VALUES = new Set(["0", "false", "no", "off"]);
+function fieldError(field, message) {
+    return new errors_1.CoreError("CONFIGURATION_ERROR", `${field}: ${message}`);
+}
+function parseBoolOpt(raw, field) {
+    const value = raw?.trim();
+    if (!value)
+        return null;
+    const normalized = value.toLowerCase();
+    if (TRUE_VALUES.has(normalized))
+        return true;
+    if (FALSE_VALUES.has(normalized))
+        return false;
+    throw fieldError(field, "must be a boolean (true, false, 1, 0, yes, no, on, off)");
+}
+function parseBool(raw, fallback, field) {
+    return parseBoolOpt(raw, field) ?? fallback;
+}
+function parseIntOpt(raw, field, min, max) {
+    const value = raw?.trim();
+    if (!value)
+        return null;
+    if (!/^\d+$/.test(value))
+        throw fieldError(field, `must be an integer from ${min} to ${max}`);
+    const parsed = Number(value);
+    if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max)
+        throw fieldError(field, `must be an integer from ${min} to ${max}`);
+    return parsed;
+}
+function parseDurationOpt(raw, field, fallback) {
+    const value = raw?.trim();
+    if (!value)
+        return fallback;
+    // sing-box/Go-style durations: compound parts allowed ("1m30s", "500ms").
+    if (!/^(\d+(?:\.\d+)?(ns|us|µs|μs|ms|s|m|h))+$/i.test(value)) {
+        throw fieldError(field, "must be a duration such as 30s, 1m30s or 500ms");
+    }
+    return value;
+}
+function parseEnumOpt(raw, field, allowed, fallback) {
+    const value = raw?.trim();
+    if (!value)
+        return fallback;
+    const normalized = value.toLowerCase();
+    const found = allowed.find((item) => item.toLowerCase() === normalized);
+    if (!found)
+        throw fieldError(field, `must be one of ${allowed.join(", ")}`);
+    return found;
+}
+function parseHostnameOpt(raw, field) {
+    const value = raw?.trim();
+    if (!value)
+        return null;
+    const ascii = (0, hostname_1.toAsciiHostname)(value);
+    if (!ascii || (0, endpoints_1.isIpAddress)(ascii))
+        throw fieldError(field, "must be a valid hostname (not an IP literal)");
+    return ascii;
+}
+function validCidr(value) {
+    const index = value.lastIndexOf("/");
+    if (index <= 0 || index === value.length - 1)
+        return false;
+    const address = value.slice(0, index);
+    const prefixText = value.slice(index + 1);
+    if (!/^\d+$/.test(prefixText))
+        return false;
+    const prefix = Number(prefixText);
+    if (address.includes(":")) {
+        const pieces = address.split("::");
+        if (pieces.length > 2)
+            return false;
+        return prefix <= 128;
+    }
+    const parts = address.split(".");
+    return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255) && prefix <= 32;
+}
+function isIpv4Literal(value) {
+    const parts = value.trim().split(".");
+    return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+function isIpv6Literal(value) {
+    let input = value.trim();
+    if (input.startsWith("[") && input.endsWith("]"))
+        input = input.slice(1, -1);
+    if (!input.includes(":"))
+        return false;
+    const pieces = input.split("::");
+    if (pieces.length > 2)
+        return false;
+    const parseSide = (side) => {
+        if (!side)
+            return 0;
+        let count = 0;
+        for (const token of side.split(":")) {
+            if (token.includes(".")) {
+                if (!isIpv4Literal(token))
+                    return null;
+                count += 2;
+                continue;
+            }
+            if (!/^[0-9a-fA-F]{1,4}$/.test(token))
+                return null;
+            count += 1;
+        }
+        return count;
+    };
+    const left = parseSide(pieces[0]);
+    const right = parseSide(pieces[1] ?? "");
+    if (left === null || right === null)
+        return false;
+    return pieces.length === 2 ? left + right < 8 : left === 8;
+}
+function parseWireguardKey(raw, field, fallback) {
+    const value = raw?.trim();
+    if (!value)
+        return fallback;
+    if (!/^[A-Za-z0-9+/]{43}=$/.test(value))
+        throw fieldError(field, "must be a base64 WireGuard key (44 characters ending with =)");
+    return value;
+}
+function parseHostPortOpt(raw, field, fallbackHost, fallbackPort) {
+    const value = raw?.trim();
+    if (!value)
+        return { host: fallbackHost, port: fallbackPort };
+    let host;
+    let portText;
+    if (value.startsWith("[")) {
+        const close = value.indexOf("]");
+        if (close < 0 || value[close + 1] !== ":")
+            throw fieldError(field, "must use host:port or [ipv6]:port format");
+        host = value.slice(1, close);
+        portText = value.slice(close + 2);
+        if (!isIpv6Literal(host))
+            throw fieldError(field, "must use host:port or [ipv6]:port format");
+    }
+    else {
+        const index = value.lastIndexOf(":");
+        if (index <= 0 || value.indexOf(":") !== index)
+            throw fieldError(field, "must use host:port format");
+        host = value.slice(0, index);
+        portText = value.slice(index + 1);
+        // toAsciiHostname covers hostnames and canonical IP literals; anything
+        // else (including exotic IPv4 spellings) fails closed here.
+        const ascii = (0, hostname_1.toAsciiHostname)(host);
+        if (!ascii)
+            throw fieldError(field, "must use host:port format with a valid host");
+        host = ascii;
+    }
+    if (!/^\d+$/.test(portText))
+        throw fieldError(field, "must use host:port format with a port from 1 to 65535");
+    const port = Number(portText);
+    if (!Number.isSafeInteger(port) || port < 1 || port > 65535)
+        throw fieldError(field, "must use host:port format with a port from 1 to 65535");
+    return { host, port };
+}
+const WARP_PEER_PUBLIC_KEY_DEFAULT = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=";
+function parseWarp(env) {
+    if (!parseBool(env.CORE_OUTPUT_WARP_ENABLED, false, "CORE_OUTPUT_WARP_ENABLED"))
+        return null;
+    const privateKey = parseWireguardKey(env.CORE_OUTPUT_WARP_PRIVATE_KEY, "CORE_OUTPUT_WARP_PRIVATE_KEY", null);
+    if (!privateKey)
+        throw fieldError("CORE_OUTPUT_WARP_PRIVATE_KEY", "is required when CORE_OUTPUT_WARP_ENABLED is true");
+    const peerPublicKey = parseWireguardKey(env.CORE_OUTPUT_WARP_PEER_PUBLIC_KEY, "CORE_OUTPUT_WARP_PEER_PUBLIC_KEY", WARP_PEER_PUBLIC_KEY_DEFAULT) ?? WARP_PEER_PUBLIC_KEY_DEFAULT;
+    const endpoint = parseHostPortOpt(env.CORE_OUTPUT_WARP_ENDPOINT, "CORE_OUTPUT_WARP_ENDPOINT", "engage.cloudflareclient.com", 2408);
+    const localIpv4Raw = env.CORE_OUTPUT_WARP_LOCAL_IPV4?.trim() || "172.16.0.2";
+    if (!isIpv4Literal(localIpv4Raw))
+        throw fieldError("CORE_OUTPUT_WARP_LOCAL_IPV4", "must be an IPv4 literal");
+    const localIpv6Raw = env.CORE_OUTPUT_WARP_LOCAL_IPV6?.trim() || null;
+    if (localIpv6Raw && !isIpv6Literal(localIpv6Raw))
+        throw fieldError("CORE_OUTPUT_WARP_LOCAL_IPV6", "must be an IPv6 literal");
+    const mtu = parseIntOpt(env.CORE_OUTPUT_WARP_MTU, "CORE_OUTPUT_WARP_MTU", 576, 9000) ?? 1280;
+    const reservedRaw = env.CORE_OUTPUT_WARP_RESERVED?.trim();
+    let reserved = [0, 0, 0];
+    if (reservedRaw) {
+        const parts = reservedRaw.split(",").map((item) => item.trim());
+        if (parts.length !== 3 || parts.some((part) => !/^\d+$/.test(part) || Number(part) > 255)) {
+            throw fieldError("CORE_OUTPUT_WARP_RESERVED", "must be three comma-separated integers from 0 to 255");
+        }
+        reserved = [Number(parts[0]), Number(parts[1]), Number(parts[2])];
+    }
+    return { privateKey, peerPublicKey, endpointHost: endpoint.host, endpointPort: endpoint.port, localIpv4: localIpv4Raw, localIpv6: localIpv6Raw, mtu, reserved };
+}
+const CHAIN_TYPES = ["socks", "http", "shadowsocks", "vmess", "trojan", "vless"];
+function parseChainEntries(raw) {
+    const trimmed = raw?.trim();
+    if (!trimmed)
+        return [];
+    let parsed;
+    try {
+        parsed = JSON.parse(trimmed);
+    }
+    catch {
+        throw fieldError("CORE_OUTPUT_CHAIN_OUTBOUNDS", "must be valid JSON");
+    }
+    if (!Array.isArray(parsed))
+        throw fieldError("CORE_OUTPUT_CHAIN_OUTBOUNDS", "must be a JSON array of chain entries");
+    if (parsed.length > 64)
+        throw fieldError("CORE_OUTPUT_CHAIN_OUTBOUNDS", "must contain at most 64 entries");
+    const seen = new Set();
+    return parsed.map((item, index) => {
+        const prefix = `CORE_OUTPUT_CHAIN_OUTBOUNDS[${index}]`;
+        if (!item || typeof item !== "object" || Array.isArray(item))
+            throw fieldError(prefix, "must be an object");
+        const entry = item;
+        const type = entry.type;
+        if (typeof type !== "string" || !CHAIN_TYPES.includes(type))
+            throw fieldError(prefix, `type must be one of ${CHAIN_TYPES.join(", ")}`);
+        const tag = typeof entry.tag === "string" ? entry.tag.trim() : "";
+        if (!tag || tag.length > 64 || /[\u0000-\u001f\u007f,]/.test(tag))
+            throw fieldError(prefix, "tag must be 1..64 characters without commas or controls");
+        if (seen.has(tag))
+            throw fieldError(prefix, `tag '${tag}' is duplicated`);
+        seen.add(tag);
+        const serverRaw = typeof entry.server === "string" ? entry.server.trim() : "";
+        const serverAscii = serverRaw ? (0, hostname_1.toAsciiHostname)(serverRaw) : "";
+        if (!serverAscii && !isIpv4Literal(serverRaw) && !isIpv6Literal(serverRaw))
+            throw fieldError(prefix, "server must be a valid hostname or IP literal");
+        const server = serverAscii || serverRaw;
+        const port = entry.port;
+        if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)
+            throw fieldError(prefix, "port must be an integer from 1 to 65535");
+        const username = typeof entry.username === "string" && entry.username ? entry.username : null;
+        const password = typeof entry.password === "string" && entry.password ? entry.password : null;
+        if ((username !== null || password !== null) && (password !== null && /[\u0000-\u001f\u007f,]/.test(password)))
+            throw fieldError(prefix, "password must not contain commas or controls");
+        const uuid = typeof entry.uuid === "string" && entry.uuid ? entry.uuid : null;
+        if ((type === "vmess" || type === "vless") && !uuid)
+            throw fieldError(prefix, "uuid is required for vmess/vless chain entries");
+        if (uuid) {
+            try {
+                (0, binary_1.uuidToBytes)(uuid);
+            }
+            catch {
+                throw fieldError(prefix, "uuid must be a valid UUID");
+            }
+        }
+        const method = typeof entry.method === "string" && entry.method ? entry.method : null;
+        if (type === "shadowsocks" && !method)
+            throw fieldError(prefix, "method is required for shadowsocks chain entries");
+        if (type === "shadowsocks" && !password)
+            throw fieldError(prefix, "password is required for shadowsocks chain entries");
+        if (type === "trojan" && !password)
+            throw fieldError(prefix, "password is required for trojan chain entries");
+        const tlsRaw = entry.tls;
+        if (tlsRaw !== undefined && typeof tlsRaw !== "boolean")
+            throw fieldError(prefix, "tls must be a boolean");
+        const tls = tlsRaw ?? (type === "trojan" || type === "vless");
+        const wsPath = typeof entry.wsPath === "string" && entry.wsPath ? entry.wsPath : null;
+        if (wsPath !== null && !wsPath.startsWith("/"))
+            throw fieldError(prefix, "wsPath must start with /");
+        const wsHost = typeof entry.wsHost === "string" && entry.wsHost ? entry.wsHost : null;
+        if (wsHost !== null && !(0, hostname_1.toAsciiHostname)(wsHost))
+            throw fieldError(prefix, "wsHost must be a valid hostname");
+        const sni = typeof entry.sni === "string" && entry.sni ? entry.sni : null;
+        if (sni !== null && !(0, hostname_1.toAsciiHostname)(sni))
+            throw fieldError(prefix, "sni must be a valid hostname");
+        return { type: type, tag, server, port, username, password, uuid, method, tls, wsPath, wsHost, sni };
+    });
+}
+// ---------------------------------------------------------------------------
+// Whole-option parsing (render path: throws the first error) and startup
+// issue collection (same parsers, one issue per failing field).
+// ---------------------------------------------------------------------------
+function normalizeRoutingDomainStrategy(raw) {
+    const value = raw?.trim();
+    if (!value)
+        return "AsIs";
+    const lower = value.toLowerCase();
+    if (lower === "asis")
+        return "AsIs";
+    if (lower === "ipifnonmatch")
+        return "IPIfNonMatch";
+    if (lower === "ipondemand")
+        return "IPOnDemand";
+    throw fieldError("CORE_OUTPUT_ROUTING_DOMAIN_STRATEGY", "must be one of AsIs, IPIfNonMatch, IPOnDemand");
+}
+const XRAY_DOMAIN_STRATEGIES = new Set(["AsIs", "IPIfNonMatch", "IPOnDemand", "UseIP"]);
+const SINGBOX_DOMAIN_STRATEGIES = new Set(["prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only"]);
+const XRAY_QUERY_STRATEGIES = new Set(["UseIP", "UseIPv4", "UseIPv6"]);
+function normalizeUnionStrategy(raw, field) {
+    const value = raw?.trim();
+    if (!value)
+        return null;
+    const lower = value.toLowerCase();
+    const xrayMap = { asis: "AsIs", ipifnonmatch: "IPIfNonMatch", ipondemand: "IPOnDemand", useip: "UseIP", useipv4: "UseIPv4", useipv6: "UseIPv6" };
+    if (xrayMap[lower])
+        return xrayMap[lower];
+    if (SINGBOX_DOMAIN_STRATEGIES.has(lower))
+        return lower;
+    throw fieldError(field, "must be one of AsIs, IPIfNonMatch, IPOnDemand, UseIP, UseIPv4, UseIPv6, prefer_ipv4, prefer_ipv6, ipv4_only, ipv6_only");
+}
+// Parses the ECH config list (shared by the render parser and the startup
+// issue collector so both agree on what is valid).
+function parseEchConfigList(raw) {
+    const trimmed = raw?.trim();
+    if (!trimmed)
+        return [];
+    const out = [];
+    for (const value of trimmed.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean)) {
+        // DNS HTTPS ech= values are base64; normalize base64url spellings to
+        // standard base64 (what sing-box expects) and re-pad.
+        const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+        if (!/^[A-Za-z0-9+/]+={0,2}$/.test(normalized) || normalized.replace(/=/g, "").length % 4 === 1) {
+            throw fieldError("CORE_OUTPUT_ECH_CONFIG", "entries must be base64 ECH config blobs");
+        }
+        out.push(normalized + "=".repeat((4 - (normalized.length % 4)) % 4));
+    }
+    return out;
+}
+function parseGeneratorOptions(env) {
+    const routingPacksRaw = env.CORE_OUTPUT_ROUTING_PACK?.trim();
+    const routingPacks = routingPacksRaw ? routingPacksRaw.split(/[\r\n,]+/).map((value) => value.trim().toLowerCase()).filter(Boolean) : [];
+    // Validate pack names eagerly (render-time defense in depth; startup
+    // validation reports the same through collectGeneratorOptionIssues).
+    (0, rules_1.parseRoutingPacks)(env.CORE_OUTPUT_ROUTING_PACK);
+    const tproxyRaw = env.CORE_OUTPUT_SOCKOPT_TPROXY?.trim().toLowerCase() || null;
+    if (tproxyRaw !== null && tproxyRaw !== "off" && tproxyRaw !== "redirect" && tproxyRaw !== "tproxy") {
+        throw fieldError("CORE_OUTPUT_SOCKOPT_TPROXY", "must be one of off, redirect, tproxy");
+    }
+    const fakeIpRangeRaw = env.CORE_OUTPUT_FAKE_IP_RANGE?.trim() || null;
+    if (fakeIpRangeRaw && !validCidr(fakeIpRangeRaw))
+        throw fieldError("CORE_OUTPUT_FAKE_IP_RANGE", "must be a CIDR such as 198.18.0.0/15");
+    const fakeIpRangeV6Raw = env.CORE_OUTPUT_FAKE_IP_RANGE_V6?.trim() || null;
+    if (fakeIpRangeV6Raw && !validCidr(fakeIpRangeV6Raw))
+        throw fieldError("CORE_OUTPUT_FAKE_IP_RANGE_V6", "must be a CIDR such as fc00::/18");
+    const fakeIpFilterRaw = env.CORE_OUTPUT_FAKE_IP_FILTER?.trim();
+    const fakeIpFilter = fakeIpFilterRaw ? fakeIpFilterRaw.split(/[\r\n,]+/).map((value) => value.trim()).filter(Boolean) : [];
+    for (const value of fakeIpFilter) {
+        if (/\s/.test(value))
+            throw fieldError("CORE_OUTPUT_FAKE_IP_FILTER", "entries must not contain whitespace");
+    }
+    const echConfig = parseEchConfigList(env.CORE_OUTPUT_ECH_CONFIG);
+    const echConfigPath = env.CORE_OUTPUT_ECH_CONFIG_PATH?.trim() || null;
+    if (echConfigPath && (/[\u0000-\u001f\u007f]/.test(echConfigPath) || echConfigPath.length > 512)) {
+        throw fieldError("CORE_OUTPUT_ECH_CONFIG_PATH", "must be a path of at most 512 characters without controls");
+    }
+    const dnsListenRaw = env.CORE_OUTPUT_DNS_LISTEN?.trim() || null;
+    if (dnsListenRaw) {
+        const parsed = parseHostPortOpt(dnsListenRaw, "CORE_OUTPUT_DNS_LISTEN", "", 0);
+        if (!parsed.host)
+            throw fieldError("CORE_OUTPUT_DNS_LISTEN", "must use host:port format such as 127.0.0.1:1053");
+    }
+    return {
+        routingPacks,
+        singboxUrltestInterval: parseDurationOpt(env.CORE_OUTPUT_SINGBOX_URLTEST_INTERVAL, "CORE_OUTPUT_SINGBOX_URLTEST_INTERVAL", "30s"),
+        singboxUrltestTolerance: parseIntOpt(env.CORE_OUTPUT_SINGBOX_URLTEST_TOLERANCE, "CORE_OUTPUT_SINGBOX_URLTEST_TOLERANCE", 0, 10_000) ?? 50,
+        mihomoUrltestInterval: parseIntOpt(env.CORE_OUTPUT_MIHOMO_URLTEST_INTERVAL, "CORE_OUTPUT_MIHOMO_URLTEST_INTERVAL", 5, 3600) ?? 30,
+        mihomoUrltestTolerance: parseIntOpt(env.CORE_OUTPUT_MIHOMO_URLTEST_TOLERANCE, "CORE_OUTPUT_MIHOMO_URLTEST_TOLERANCE", 0, 10_000) ?? 50,
+        xrayFallbackNode: env.CORE_OUTPUT_XRAY_FALLBACK_NODE?.trim() || null,
+        sockopt: {
+            tcpFastOpen: parseBoolOpt(env.CORE_OUTPUT_SOCKOPT_TCP_FAST_OPEN, "CORE_OUTPUT_SOCKOPT_TCP_FAST_OPEN"),
+            mark: parseIntOpt(env.CORE_OUTPUT_SOCKOPT_MARK, "CORE_OUTPUT_SOCKOPT_MARK", 0, 4294967295),
+            tcpKeepAliveIdle: parseIntOpt(env.CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_IDLE, "CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_IDLE", 0, 86400),
+            tcpKeepAliveInterval: parseIntOpt(env.CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_INTERVAL, "CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_INTERVAL", 0, 86400),
+            tproxy: tproxyRaw,
+            acceptProxyProtocol: parseBoolOpt(env.CORE_OUTPUT_SOCKOPT_ACCEPT_PROXY_PROTOCOL, "CORE_OUTPUT_SOCKOPT_ACCEPT_PROXY_PROTOCOL"),
+            bindInterface: env.CORE_OUTPUT_SOCKOPT_BIND_INTERFACE?.trim() || null,
+            domainStrategy: normalizeUnionStrategy(env.CORE_OUTPUT_SOCKOPT_DOMAIN_STRATEGY, "CORE_OUTPUT_SOCKOPT_DOMAIN_STRATEGY"),
+        },
+        routingDomainStrategy: normalizeRoutingDomainStrategy(env.CORE_OUTPUT_ROUTING_DOMAIN_STRATEGY),
+        dnsQueryStrategy: normalizeUnionStrategy(env.CORE_OUTPUT_DNS_QUERY_STRATEGY, "CORE_OUTPUT_DNS_QUERY_STRATEGY"),
+        sniCaseMode: parseEnumOpt(env.CORE_OUTPUT_SNI_CASE_MODE, "CORE_OUTPUT_SNI_CASE_MODE", ["original", "random"], "original"),
+        sniOverride: parseHostnameOpt(env.CORE_OUTPUT_SNI, "CORE_OUTPUT_SNI"),
+        logLevel: (() => { const v = parseEnumOpt(env.CORE_OUTPUT_LOG_LEVEL, "CORE_OUTPUT_LOG_LEVEL", ["debug", "info", "warning", "error", "disable"], ""); return v === "" ? null : v; })(),
+        inboundType: parseEnumOpt(env.CORE_OUTPUT_INBOUND_TYPE, "CORE_OUTPUT_INBOUND_TYPE", ["socks", "http", "both"], "socks"),
+        dnsFollowWorker: parseBool(env.CORE_OUTPUT_DNS_FOLLOW_WORKER, false, "CORE_OUTPUT_DNS_FOLLOW_WORKER"),
+        dnsDisableFallback: parseBoolOpt(env.CORE_OUTPUT_DNS_DISABLE_FALLBACK, "CORE_OUTPUT_DNS_DISABLE_FALLBACK"),
+        fakeDnsEnabled: parseBool(env.CORE_OUTPUT_FAKE_DNS_ENABLED, false, "CORE_OUTPUT_FAKE_DNS_ENABLED"),
+        fakeIpRange: fakeIpRangeRaw,
+        fakeIpRangeV6: fakeIpRangeV6Raw,
+        fakeIpFilter,
+        xrayFakeDnsPoolSize: parseIntOpt(env.CORE_OUTPUT_XRAY_FAKE_DNS_POOL_SIZE, "CORE_OUTPUT_XRAY_FAKE_DNS_POOL_SIZE", 1, 1_000_000),
+        echEnabled: parseBool(env.CORE_OUTPUT_ECH_ENABLED, false, "CORE_OUTPUT_ECH_ENABLED"),
+        echConfig,
+        echConfigPath,
+        echQueryServerName: parseHostnameOpt(env.CORE_OUTPUT_ECH_QUERY_SERVER_NAME, "CORE_OUTPUT_ECH_QUERY_SERVER_NAME"),
+        xrayBlackholeResponse: parseEnumOpt(env.CORE_OUTPUT_XRAY_BLACKHOLE_RESPONSE, "CORE_OUTPUT_XRAY_BLACKHOLE_RESPONSE", ["none", "http"], "none"),
+        tlsOnly: parseBool(env.CORE_OUTPUT_TLS_ONLY, false, "CORE_OUTPUT_TLS_ONLY"),
+        fingerprintMode: parseEnumOpt(env.CORE_OUTPUT_FINGERPRINT_MODE, "CORE_OUTPUT_FINGERPRINT_MODE", ["keep", "random"], "keep"),
+        ipv4Wrap: parseBool(env.CORE_OUTPUT_IPV4_WRAP, false, "CORE_OUTPUT_IPV4_WRAP"),
+        warpEnabled: parseBool(env.CORE_OUTPUT_WARP_ENABLED, false, "CORE_OUTPUT_WARP_ENABLED"),
+        warp: parseWarp(env),
+        chainOutbounds: parseChainEntries(env.CORE_OUTPUT_CHAIN_OUTBOUNDS),
+        dnsListen: dnsListenRaw,
+        xrayDnsInbound: parseBool(env.CORE_OUTPUT_XRAY_DNS_INBOUND, false, "CORE_OUTPUT_XRAY_DNS_INBOUND"),
+    };
+}
+function collectGeneratorOptionIssues(env) {
+    const issues = [];
+    // Attribute to the field named in the error when present (every parser
+    // prefixes its field); otherwise fall back to the check's own field.
+    const check = (fallbackField, fn) => {
+        try {
+            fn();
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError) {
+                const match = error.message.match(/^([A-Z][A-Z0-9_]{2,}):\s*(.*)$/);
+                if (match) {
+                    issues.push({ field: match[1], message: match[2] });
+                    return;
+                }
+            }
+            issues.push({ field: fallbackField, message: "contains an invalid value" });
+        }
+    };
+    const checks = [
+        ["CORE_OUTPUT_ROUTING_PACK", () => (0, rules_1.parseRoutingPacks)(env.CORE_OUTPUT_ROUTING_PACK)],
+        ["CORE_OUTPUT_SINGBOX_URLTEST_INTERVAL", () => parseDurationOpt(env.CORE_OUTPUT_SINGBOX_URLTEST_INTERVAL, "CORE_OUTPUT_SINGBOX_URLTEST_INTERVAL", "30s")],
+        ["CORE_OUTPUT_SINGBOX_URLTEST_TOLERANCE", () => parseIntOpt(env.CORE_OUTPUT_SINGBOX_URLTEST_TOLERANCE, "CORE_OUTPUT_SINGBOX_URLTEST_TOLERANCE", 0, 10_000)],
+        ["CORE_OUTPUT_MIHOMO_URLTEST_INTERVAL", () => parseIntOpt(env.CORE_OUTPUT_MIHOMO_URLTEST_INTERVAL, "CORE_OUTPUT_MIHOMO_URLTEST_INTERVAL", 5, 3600)],
+        ["CORE_OUTPUT_MIHOMO_URLTEST_TOLERANCE", () => parseIntOpt(env.CORE_OUTPUT_MIHOMO_URLTEST_TOLERANCE, "CORE_OUTPUT_MIHOMO_URLTEST_TOLERANCE", 0, 10_000)],
+        ["CORE_OUTPUT_SOCKOPT_TCP_FAST_OPEN", () => parseBoolOpt(env.CORE_OUTPUT_SOCKOPT_TCP_FAST_OPEN, "CORE_OUTPUT_SOCKOPT_TCP_FAST_OPEN")],
+        ["CORE_OUTPUT_SOCKOPT_MARK", () => parseIntOpt(env.CORE_OUTPUT_SOCKOPT_MARK, "CORE_OUTPUT_SOCKOPT_MARK", 0, 4294967295)],
+        ["CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_IDLE", () => parseIntOpt(env.CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_IDLE, "CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_IDLE", 0, 86400)],
+        ["CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_INTERVAL", () => parseIntOpt(env.CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_INTERVAL, "CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_INTERVAL", 0, 86400)],
+        ["CORE_OUTPUT_SOCKOPT_TPROXY", () => { const v = env.CORE_OUTPUT_SOCKOPT_TPROXY?.trim().toLowerCase(); if (v && v !== "off" && v !== "redirect" && v !== "tproxy")
+                throw fieldError("CORE_OUTPUT_SOCKOPT_TPROXY", "must be one of off, redirect, tproxy"); }],
+        ["CORE_OUTPUT_SOCKOPT_ACCEPT_PROXY_PROTOCOL", () => parseBoolOpt(env.CORE_OUTPUT_SOCKOPT_ACCEPT_PROXY_PROTOCOL, "CORE_OUTPUT_SOCKOPT_ACCEPT_PROXY_PROTOCOL")],
+        ["CORE_OUTPUT_SOCKOPT_DOMAIN_STRATEGY", () => normalizeUnionStrategy(env.CORE_OUTPUT_SOCKOPT_DOMAIN_STRATEGY, "CORE_OUTPUT_SOCKOPT_DOMAIN_STRATEGY")],
+        ["CORE_OUTPUT_ROUTING_DOMAIN_STRATEGY", () => normalizeRoutingDomainStrategy(env.CORE_OUTPUT_ROUTING_DOMAIN_STRATEGY)],
+        ["CORE_OUTPUT_DNS_QUERY_STRATEGY", () => normalizeUnionStrategy(env.CORE_OUTPUT_DNS_QUERY_STRATEGY, "CORE_OUTPUT_DNS_QUERY_STRATEGY")],
+        ["CORE_OUTPUT_SNI_CASE_MODE", () => parseEnumOpt(env.CORE_OUTPUT_SNI_CASE_MODE, "CORE_OUTPUT_SNI_CASE_MODE", ["original", "random"], "original")],
+        ["CORE_OUTPUT_SNI", () => parseHostnameOpt(env.CORE_OUTPUT_SNI, "CORE_OUTPUT_SNI")],
+        ["CORE_OUTPUT_LOG_LEVEL", () => parseEnumOpt(env.CORE_OUTPUT_LOG_LEVEL, "CORE_OUTPUT_LOG_LEVEL", ["debug", "info", "warning", "error", "disable"], "")],
+        ["CORE_OUTPUT_INBOUND_TYPE", () => parseEnumOpt(env.CORE_OUTPUT_INBOUND_TYPE, "CORE_OUTPUT_INBOUND_TYPE", ["socks", "http", "both"], "socks")],
+        ["CORE_OUTPUT_DNS_FOLLOW_WORKER", () => parseBoolOpt(env.CORE_OUTPUT_DNS_FOLLOW_WORKER, "CORE_OUTPUT_DNS_FOLLOW_WORKER")],
+        ["CORE_OUTPUT_DNS_DISABLE_FALLBACK", () => parseBoolOpt(env.CORE_OUTPUT_DNS_DISABLE_FALLBACK, "CORE_OUTPUT_DNS_DISABLE_FALLBACK")],
+        ["CORE_OUTPUT_FAKE_DNS_ENABLED", () => parseBoolOpt(env.CORE_OUTPUT_FAKE_DNS_ENABLED, "CORE_OUTPUT_FAKE_DNS_ENABLED")],
+        ["CORE_OUTPUT_FAKE_IP_RANGE", () => { const v = env.CORE_OUTPUT_FAKE_IP_RANGE?.trim(); if (v && !validCidr(v))
+                throw fieldError("CORE_OUTPUT_FAKE_IP_RANGE", "must be a CIDR such as 198.18.0.0/15"); }],
+        ["CORE_OUTPUT_FAKE_IP_RANGE_V6", () => { const v = env.CORE_OUTPUT_FAKE_IP_RANGE_V6?.trim(); if (v && !validCidr(v))
+                throw fieldError("CORE_OUTPUT_FAKE_IP_RANGE_V6", "must be a CIDR such as fc00::/18"); }],
+        ["CORE_OUTPUT_FAKE_IP_FILTER", () => { const v = env.CORE_OUTPUT_FAKE_IP_FILTER?.trim(); if (v)
+                for (const item of v.split(/[\r\n,]+/).map((x) => x.trim()).filter(Boolean))
+                    if (/\s/.test(item))
+                        throw fieldError("CORE_OUTPUT_FAKE_IP_FILTER", "entries must not contain whitespace"); }],
+        ["CORE_OUTPUT_XRAY_FAKE_DNS_POOL_SIZE", () => parseIntOpt(env.CORE_OUTPUT_XRAY_FAKE_DNS_POOL_SIZE, "CORE_OUTPUT_XRAY_FAKE_DNS_POOL_SIZE", 1, 1_000_000)],
+        ["CORE_OUTPUT_ECH_ENABLED", () => parseBoolOpt(env.CORE_OUTPUT_ECH_ENABLED, "CORE_OUTPUT_ECH_ENABLED")],
+        ["CORE_OUTPUT_ECH_CONFIG", () => parseEchConfigList(env.CORE_OUTPUT_ECH_CONFIG)],
+        ["CORE_OUTPUT_ECH_CONFIG_PATH", () => { const v = env.CORE_OUTPUT_ECH_CONFIG_PATH?.trim(); if (v && (/[\u0000-\u001f\u007f]/.test(v) || v.length > 512))
+                throw fieldError("CORE_OUTPUT_ECH_CONFIG_PATH", "must be a path of at most 512 characters without controls"); }],
+        ["CORE_OUTPUT_ECH_QUERY_SERVER_NAME", () => parseHostnameOpt(env.CORE_OUTPUT_ECH_QUERY_SERVER_NAME, "CORE_OUTPUT_ECH_QUERY_SERVER_NAME")],
+        ["CORE_OUTPUT_XRAY_BLACKHOLE_RESPONSE", () => parseEnumOpt(env.CORE_OUTPUT_XRAY_BLACKHOLE_RESPONSE, "CORE_OUTPUT_XRAY_BLACKHOLE_RESPONSE", ["none", "http"], "none")],
+        ["CORE_OUTPUT_TLS_ONLY", () => parseBoolOpt(env.CORE_OUTPUT_TLS_ONLY, "CORE_OUTPUT_TLS_ONLY")],
+        ["CORE_OUTPUT_FINGERPRINT_MODE", () => parseEnumOpt(env.CORE_OUTPUT_FINGERPRINT_MODE, "CORE_OUTPUT_FINGERPRINT_MODE", ["keep", "random"], "keep")],
+        ["CORE_OUTPUT_IPV4_WRAP", () => parseBoolOpt(env.CORE_OUTPUT_IPV4_WRAP, "CORE_OUTPUT_IPV4_WRAP")],
+        ["CORE_OUTPUT_WARP_ENABLED", () => parseWarp(env)],
+        ["CORE_OUTPUT_CHAIN_OUTBOUNDS", () => parseChainEntries(env.CORE_OUTPUT_CHAIN_OUTBOUNDS)],
+        ["CORE_OUTPUT_DNS_LISTEN", () => { const v = env.CORE_OUTPUT_DNS_LISTEN?.trim(); if (v)
+                parseHostPortOpt(v, "CORE_OUTPUT_DNS_LISTEN", "", 0); }],
+        ["CORE_OUTPUT_XRAY_DNS_INBOUND", () => parseBoolOpt(env.CORE_OUTPUT_XRAY_DNS_INBOUND, "CORE_OUTPUT_XRAY_DNS_INBOUND")],
+        ["CORE_OUTPUT_PROTOCOLS", () => { const v = env.CORE_OUTPUT_PROTOCOLS?.trim().toLowerCase(); if (v && v !== "all" && v !== "vless" && v !== "trojan")
+                throw fieldError("CORE_OUTPUT_PROTOCOLS", "must be one of all, vless, trojan"); }],
+        ["CORE_OUTPUT_PORT_FILTER", () => { const v = env.CORE_OUTPUT_PORT_FILTER?.trim(); if (v)
+                for (const item of v.split(/[\r\n,]+/).map((x) => x.trim()).filter(Boolean)) {
+                    if (!/^\d+$/.test(item) || Number(item) < 1 || Number(item) > 65535)
+                        throw fieldError("CORE_OUTPUT_PORT_FILTER", "entries must be ports from 1 to 65535");
+                } }],
+        ["CORE_OUTPUT_PREFERRED_IPS", () => (0, endpoints_1.parsePreferredIpEntries)(env.CORE_OUTPUT_PREFERRED_IPS)],
+        ["CORE_OUTPUT_PREFERRED_IP_URL", () => { const v = env.CORE_OUTPUT_PREFERRED_IP_URL?.trim(); if (v) {
+                let url;
+                try {
+                    url = new URL(v);
+                }
+                catch {
+                    throw fieldError("CORE_OUTPUT_PREFERRED_IP_URL", "must be an absolute URL");
+                }
+                if (url.protocol !== "https:" && url.protocol !== "http:")
+                    throw fieldError("CORE_OUTPUT_PREFERRED_IP_URL", "must be an http(s) URL");
+                if (url.username || url.password || url.hash)
+                    throw fieldError("CORE_OUTPUT_PREFERRED_IP_URL", "must not contain credentials or fragments");
+            } }],
+    ];
+    for (const [field, fn] of checks)
+        check(field, fn);
+    return issues;
+}
+// ---------------------------------------------------------------------------
+// Per-target application helpers (used by the builders via adapters).
+// ---------------------------------------------------------------------------
+function applySniCase(serverName, mode, seed) {
+    if (mode !== "random")
+        return serverName;
+    let out = "";
+    for (let i = 0; i < serverName.length; i++) {
+        const ch = serverName[i];
+        if (!/[A-Za-z]/.test(ch)) {
+            out += ch;
+            continue;
+        }
+        let hash = 0x811c9dc5;
+        const key = `${seed}:${i}`;
+        for (let j = 0; j < key.length; j++) {
+            hash ^= key.charCodeAt(j);
+            hash = Math.imul(hash, 0x01000193) >>> 0;
+        }
+        out += hash & 1 ? ch.toUpperCase() : ch.toLowerCase();
+    }
+    return out;
+}
+/** Effective SNI for a node: explicit override wins, then the node's SNI, then case mode. */
+function effectiveSni(nodeServerName, nodeServer, nodeName, opts) {
+    const base = opts.sniOverride ?? nodeServerName ?? nodeServer;
+    return applySniCase(base, opts.sniCaseMode, nodeName);
+}
+function xrayLogLevel(level) {
+    if (!level)
+        return undefined;
+    return level === "disable" ? "none" : level;
+}
+function singboxLogLevel(level) {
+    if (!level)
+        return undefined;
+    if (level === "warning")
+        return "warn";
+    if (level === "disable")
+        return "fatal"; // sing-box has no off; fatal is the lowest level.
+    return level;
+}
+function clashLogLevel(level) {
+    if (!level)
+        return undefined;
+    return level === "disable" ? "silent" : level;
+}
+// F1: resolves the balancer fallback tag. Precedence: explicit fallbackTag
+// option > CORE_OUTPUT_XRAY_FALLBACK_NODE (first/last/index/exact tag) >
+// allowDirectFallback ("direct"). An unresolvable node value OMITS the
+// fallback (with a worker-log warning) — it never degrades to direct.
+function resolveXrayFallbackTag(options, proxyTags) {
+    if (options.fallbackTag) {
+        if (proxyTags.includes(options.fallbackTag) || (options.fallbackTag === "direct" && options.allowDirectFallback))
+            return options.fallbackTag;
+        console.warn(`Xray fallbackTag '${options.fallbackTag}' is not a balancer member; omitting fallback (never falling back to direct)`);
+        return undefined;
+    }
+    if (options.fallbackNode) {
+        const raw = options.fallbackNode;
+        let tag;
+        if (raw === "first")
+            tag = proxyTags[0];
+        else if (raw === "last")
+            tag = proxyTags[proxyTags.length - 1];
+        else if (/^\d+$/.test(raw))
+            tag = proxyTags[Number(raw)];
+        else if (proxyTags.includes(raw))
+            tag = raw;
+        if (tag)
+            return tag;
+        console.warn(`Xray fallback node '${raw}' did not resolve to a balancer member; omitting fallback (never falling back to direct)`);
+        return undefined;
+    }
+    if (options.allowDirectFallback)
+        return "direct";
+    return undefined;
+}
+function workerFallbackBool(env) {
+    const value = env.DNS_FALLBACK?.trim().toLowerCase();
+    if (!value)
+        return true;
+    if (TRUE_VALUES.has(value))
+        return true;
+    if (FALSE_VALUES.has(value))
+        return false;
+    return true;
+}
+function workerDohResolvers(env) {
+    return (0, config_1.parseDohResolverEndpoints)(env.DNS_RESOLVERS);
+}
+const DEFAULT_DOH_URLS = ["https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"];
+function buildXrayDns(env, opts) {
+    const resolvers = opts.dnsFollowWorker ? workerDohResolvers(env) : [...DEFAULT_DOH_URLS];
+    const servers = opts.fakeDnsEnabled ? ["fakedns", ...resolvers] : resolvers;
+    // Precedence: explicit var > follow-worker mapping (disableFallback is the
+    // inverse of the worker's DNS_FALLBACK flag) > previous default true.
+    const disableFallback = opts.dnsDisableFallback ?? (opts.dnsFollowWorker ? !workerFallbackBool(env) : true);
+    const queryStrategy = opts.dnsQueryStrategy && XRAY_QUERY_STRATEGIES.has(opts.dnsQueryStrategy) ? opts.dnsQueryStrategy : undefined;
+    return { servers, disableFallback, ...(queryStrategy ? { queryStrategy } : {}) };
+}
+function buildXrayFakeDns(opts) {
+    if (!opts.fakeDnsEnabled)
+        return undefined;
+    return { fakedns: [{ ipPool: opts.fakeIpRange ?? "198.18.0.0/15", poolSize: opts.xrayFakeDnsPoolSize ?? 65535 }] };
+}
+function buildSingboxDns(env, opts) {
+    let servers;
+    if (opts.dnsFollowWorker) {
+        servers = workerDohResolvers(env).map((url, index) => {
+            const parsed = new URL(url);
+            return {
+                type: "https",
+                tag: `doh-${index + 1}`,
+                server: parsed.hostname,
+                server_port: parsed.port ? Number(parsed.port) : 443,
+                path: parsed.pathname || "/dns-query",
+                tls: { enabled: true, server_name: parsed.hostname },
+            };
+        });
+    }
+    else {
+        servers = [
+            { type: "https", tag: "doh-cf", server: "1.1.1.1", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "cloudflare-dns.com" } },
+            { type: "https", tag: "doh-google", server: "8.8.8.8", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "dns.google" } },
+        ];
+    }
+    const out = [...servers];
+    if (opts.fakeDnsEnabled) {
+        out.push({ type: "fakeip", tag: "fakeip", inet4_range: opts.fakeIpRange ?? "198.18.0.0/15", inet6_range: opts.fakeIpRangeV6 ?? "fc00::/18" });
+    }
+    // R-4, honestly: sing-box serves unmatched queries from `final` only; the
+    // other servers are rule/domain_resolver targets, not a fallback chain.
+    // Follow-worker therefore orders the list (first = final) instead of
+    // pretending every server is consulted.
+    const rules = opts.fakeDnsEnabled ? [{ query_type: ["A", "AAAA"], server: "fakeip" }] : undefined;
+    const strategy = opts.dnsQueryStrategy && SINGBOX_DOMAIN_STRATEGIES.has(opts.dnsQueryStrategy) ? opts.dnsQueryStrategy : undefined;
+    return { servers: out, final: String(servers[0].tag), ...(rules ? { rules } : {}), ...(strategy ? { strategy } : {}) };
+}
+function buildClashDns(env, opts) {
+    const resolvers = opts.dnsFollowWorker ? workerDohResolvers(env) : [...DEFAULT_DOH_URLS];
+    // R-8, corrected rationale: default-nameserver is NOT system DNS — it
+    // resolves the DoH/DoT server domains themselves at startup, so it must be
+    // plain IPs (built-in IP defaults when no resolver hostname is an IP).
+    const defaultIps = [];
+    for (const url of resolvers) {
+        try {
+            const host = new URL(url).hostname;
+            if ((0, endpoints_1.isIpAddress)(host))
+                defaultIps.push(host);
+        }
+        catch { /* unparseable resolver: startup validation already failed it */ }
+    }
+    return {
+        nameserver: resolvers,
+        fallback: opts.dnsFollowWorker ? resolvers : ["tls://1.1.1.1:853", "tls://8.8.8.8:853"],
+        defaultNameserver: defaultIps.length ? defaultIps : ["1.1.1.1", "8.8.8.8"],
+        proxyServerNameserver: resolvers,
+        ...(opts.fakeDnsEnabled
+            ? { fakeIpRange: opts.fakeIpRange ?? "198.18.0.1/16", ...(opts.fakeIpFilter.length ? { fakeIpFilter: [...opts.fakeIpFilter] } : {}) }
+            : {}),
+    };
+}
+function buildSingboxEch(env, opts) {
+    if (!opts.echEnabled)
+        return undefined;
+    const ech = { enabled: true };
+    if (opts.echConfig.length)
+        ech.config = [...opts.echConfig];
+    if (opts.echConfigPath)
+        ech.config_path = opts.echConfigPath;
+    if (opts.echQueryServerName)
+        ech.query_server_name = opts.echQueryServerName;
+    else if (!opts.echConfig.length && !opts.echConfigPath) {
+        // Default source: the worker host itself, which publishes the shared
+        // Cloudflare ECH config (verified for workers.dev; a Cloudflare-proxied
+        // custom domain publishes the same shared blob). The source qualifies
+        // only if it publishes a config whose key the serving edge holds.
+        const host = env.OUTPUT_HOST?.trim() || env.WS_HOST?.trim();
+        if (host)
+            ech.query_server_name = host;
+    }
+    return ech;
+}
+// ECH is a client-config field ONLY (never a worker-side handshake change).
+// Targets without an ECH field fail closed instead of emitting a config that
+// silently lacks ECH.
+function assertEchCompatible(opts, target) {
+    if (opts?.echEnabled && target !== "sing-box") {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `ECH is only supported for sing-box client configs in v1; ${target} has no ECH field, so the render fails closed instead of emitting a config without ECH`);
+    }
+}
+function buildXraySockopt(opts) {
+    const s = opts.sockopt;
+    const out = {};
+    if (s.mark !== null)
+        out.mark = s.mark;
+    if (s.tcpFastOpen !== null)
+        out.tcpFastOpen = s.tcpFastOpen;
+    if (s.tproxy !== null)
+        out.tproxy = s.tproxy;
+    if (s.domainStrategy !== null && XRAY_DOMAIN_STRATEGIES.has(s.domainStrategy))
+        out.domainStrategy = s.domainStrategy;
+    if (s.tcpKeepAliveIdle !== null)
+        out.tcpKeepAliveIdle = s.tcpKeepAliveIdle;
+    if (s.tcpKeepAliveInterval !== null)
+        out.tcpKeepAliveInterval = s.tcpKeepAliveInterval;
+    return Object.keys(out).length ? out : undefined;
+}
+// acceptProxyProtocol is inbound-side in Xray (it controls whether an
+// inbound accepts PROXY protocol headers); it is therefore applied to
+// inbound streamSettings.sockopt, never to outbound sockopt.
+function buildXrayInboundSockopt(opts) {
+    if (opts.sockopt.acceptProxyProtocol === null)
+        return undefined;
+    return { acceptProxyProtocol: opts.sockopt.acceptProxyProtocol };
+}
+function buildSingboxDial(opts) {
+    const s = opts.sockopt;
+    const out = {};
+    if (s.tcpFastOpen !== null)
+        out.tcp_fast_open = s.tcpFastOpen;
+    if (s.mark !== null)
+        out.routing_mark = s.mark;
+    if (s.domainStrategy !== null && SINGBOX_DOMAIN_STRATEGIES.has(s.domainStrategy))
+        out.domain_strategy = s.domainStrategy;
+    if (s.bindInterface !== null)
+        out.bind_interface = s.bindInterface;
+    return Object.keys(out).length ? out : undefined;
+}
+// ---------------------------------------------------------------------------
+// Warp/WoW generated outbounds. The worker NEVER terminates WireGuard: these
+// are client-side outbounds only, keyed by the operator's own Warp account
+// key (e.g. from wgcf). Tags/names are fixed so routing rules can target them.
+// ---------------------------------------------------------------------------
+function buildWarpXray(warp) {
+    return {
+        tag: "proxy-warp",
+        protocol: "wireguard",
+        settings: {
+            secretKey: warp.privateKey,
+            address: warp.localIpv6 ? [warp.localIpv4, warp.localIpv6] : [warp.localIpv4],
+            peers: [{ endpoint: `${warp.endpointHost}:${warp.endpointPort}`, publicKey: warp.peerPublicKey, allowedIPs: ["0.0.0.0/0", "::/0"] }],
+            mtu: warp.mtu,
+            reserved: [...warp.reserved],
+        },
+    };
+}
+function buildWarpSingbox(warp) {
+    return {
+        type: "wireguard",
+        tag: "proxy-warp",
+        server: warp.endpointHost,
+        server_port: warp.endpointPort,
+        local_address: warp.localIpv6 ? [`${warp.localIpv4}/32`, `${warp.localIpv6}/128`] : [`${warp.localIpv4}/32`],
+        private_key: warp.privateKey,
+        peer: {
+            server: warp.endpointHost,
+            server_port: warp.endpointPort,
+            public_key: warp.peerPublicKey,
+            allowed_ips: ["0.0.0.0/0", "::/0"],
+            reserved: [...warp.reserved],
+        },
+        mtu: warp.mtu,
+    };
+}
+function buildWarpClash(warp) {
+    return {
+        name: "Warp",
+        type: "wireguard",
+        server: warp.endpointHost,
+        port: warp.endpointPort,
+        ip: warp.localIpv4,
+        ...(warp.localIpv6 ? { ipv6: warp.localIpv6 } : {}),
+        "private-key": warp.privateKey,
+        "public-key": warp.peerPublicKey,
+        "allowed-ips": ["0.0.0.0/0", "::/0"],
+        udp: true,
+        mtu: warp.mtu,
+        reserved: [...warp.reserved],
+    };
+}
+// ---------------------------------------------------------------------------
+// Chain translation: one neutral entry -> one native outbound per target.
+// Chain outbounds join the custom-outbound set, so existing render-time tag
+// validation and action:outbound rules apply to them unchanged.
+// ---------------------------------------------------------------------------
+function chainTlsWsXray(entry) {
+    if (!entry.tls && !entry.wsPath)
+        return undefined;
+    const out = {};
+    if (entry.wsPath)
+        out.network = "ws";
+    if (entry.tls) {
+        out.security = "tls";
+        out.tlsSettings = { serverName: entry.sni ?? entry.server };
+    }
+    if (entry.wsPath)
+        out.wsSettings = { path: entry.wsPath, ...(entry.wsHost ? { host: entry.wsHost } : {}) };
+    return out;
+}
+function chainTlsWsSingbox(entry) {
+    const out = {};
+    if (entry.tls)
+        out.tls = { enabled: true, server_name: entry.sni ?? entry.server };
+    if (entry.wsPath)
+        out.transport = { type: "ws", path: entry.wsPath, headers: entry.wsHost ? { Host: entry.wsHost } : {} };
+    return out;
+}
+function translateChainToXray(entry) {
+    const stream = chainTlsWsXray(entry);
+    const withStream = (base) => stream ? { ...base, streamSettings: stream } : base;
+    switch (entry.type) {
+        case "socks":
+            return { tag: entry.tag, protocol: "socks", settings: { servers: [{ address: entry.server, port: entry.port, ...(entry.username || entry.password ? { users: [{ user: entry.username ?? "", pass: entry.password ?? "" }] } : {}) }] } };
+        case "http":
+            return { tag: entry.tag, protocol: "http", settings: { servers: [{ address: entry.server, port: entry.port, ...(entry.username || entry.password ? { users: [{ user: entry.username ?? "", pass: entry.password ?? "" }] } : {}) }] } };
+        case "shadowsocks":
+            return { tag: entry.tag, protocol: "shadowsocks", settings: { servers: [{ address: entry.server, port: entry.port, method: entry.method, password: entry.password }] } };
+        case "vmess":
+            return withStream({ tag: entry.tag, protocol: "vmess", settings: { vnext: [{ address: entry.server, port: entry.port, users: [{ id: entry.uuid, alterId: 0, security: "auto" }] }] } });
+        case "trojan":
+            return withStream({ tag: entry.tag, protocol: "trojan", settings: { servers: [{ address: entry.server, port: entry.port, password: entry.password }] } });
+        case "vless":
+            return withStream({ tag: entry.tag, protocol: "vless", settings: { vnext: [{ address: entry.server, port: entry.port, users: [{ id: entry.uuid, encryption: "none" }] }] } });
+    }
+}
+function translateChainToSingbox(entry) {
+    const { tls, transport } = chainTlsWsSingbox(entry);
+    switch (entry.type) {
+        case "socks":
+            return { type: "socks", tag: entry.tag, server: entry.server, server_port: entry.port, ...(entry.username ? { username: entry.username } : {}), ...(entry.password ? { password: entry.password } : {}) };
+        case "http":
+            return { type: "http", tag: entry.tag, server: entry.server, server_port: entry.port, ...(entry.username ? { username: entry.username } : {}), ...(entry.password ? { password: entry.password } : {}) };
+        case "shadowsocks":
+            return { type: "shadowsocks", tag: entry.tag, server: entry.server, server_port: entry.port, method: entry.method, password: entry.password };
+        case "vmess":
+            return { type: "vmess", tag: entry.tag, server: entry.server, server_port: entry.port, uuid: entry.uuid, alter_id: 0, security: "auto", ...(tls ? { tls } : {}), ...(transport ? { transport } : {}) };
+        case "trojan":
+            return { type: "trojan", tag: entry.tag, server: entry.server, server_port: entry.port, password: entry.password, ...(tls ? { tls } : {}), ...(transport ? { transport } : {}) };
+        case "vless":
+            return { type: "vless", tag: entry.tag, server: entry.server, server_port: entry.port, uuid: entry.uuid, ...(tls ? { tls } : {}), ...(transport ? { transport } : {}) };
+    }
+}
+function translateChainToClash(entry) {
+    const base = { name: entry.tag, server: entry.server, port: entry.port, udp: true };
+    switch (entry.type) {
+        case "socks":
+            return { ...base, type: "socks5", ...(entry.username ? { username: entry.username } : {}), ...(entry.password ? { password: entry.password } : {}) };
+        case "http":
+            return { ...base, type: "http", ...(entry.username ? { username: entry.username } : {}), ...(entry.password ? { password: entry.password } : {}) };
+        case "shadowsocks":
+            return { ...base, type: "ss", cipher: entry.method, password: entry.password };
+        case "vmess":
+            return { ...base, type: "vmess", uuid: entry.uuid, alterId: 0, cipher: "auto", ...(entry.tls ? { tls: true, ...(entry.sni ? { servername: entry.sni } : {}) } : {}), ...(entry.wsPath ? { network: "ws", "ws-opts": { path: entry.wsPath, ...(entry.wsHost ? { headers: { Host: entry.wsHost } } : {}) } } : {}) };
+        case "trojan":
+            return { ...base, type: "trojan", password: entry.password, ...(entry.tls ? { tls: true, ...(entry.sni ? { sni: entry.sni } : {}) } : {}), ...(entry.wsPath ? { network: "ws", "ws-opts": { path: entry.wsPath, ...(entry.wsHost ? { headers: { Host: entry.wsHost } } : {}) } } : {}) };
+        case "vless":
+            return { ...base, type: "vless", uuid: entry.uuid, ...(entry.tls ? { tls: true, ...(entry.sni ? { servername: entry.sni } : {}) } : {}), ...(entry.wsPath ? { network: "ws", "ws-opts": { path: entry.wsPath, ...(entry.wsHost ? { headers: { Host: entry.wsHost } } : {}) } } : {}) };
+    }
+}
+// Surge has no JSON proxy schema: chain entries become Surge [Proxy] lines.
+// Tags/passwords are already validated comma-free, so line construction cannot
+// split a field.
+function translateChainToSurgeLine(entry) {
+    const head = `${entry.tag} = `;
+    const tlsPart = entry.tls ? ", tls=true" : "";
+    const wsPart = entry.wsPath ? `, ws=true, ws-path=${entry.wsPath}` : "";
+    const hostPart = entry.wsHost ? `, ws-headers=Host:${entry.wsHost}` : "";
+    const sniPart = entry.sni ? `, sni=${entry.sni}` : "";
+    switch (entry.type) {
+        case "socks":
+            return `${head}socks5, ${entry.server}, ${entry.port}${entry.username ? `, username=${entry.username}` : ""}${entry.password ? `, password=${entry.password}` : ""}`;
+        case "http":
+            return `${head}http, ${entry.server}, ${entry.port}${entry.username ? `, username=${entry.username}` : ""}${entry.password ? `, password=${entry.password}` : ""}`;
+        case "shadowsocks":
+            return `${head}ss, ${entry.server}, ${entry.port}, encrypt-method=${entry.method}, password=${entry.password}, udp-relay=true`;
+        case "vmess":
+            return `${head}vmess, ${entry.server}, ${entry.port}, username=${entry.uuid}${tlsPart}${wsPart}${hostPart}${sniPart}, udp-relay=true`;
+        case "trojan":
+            return `${head}trojan, ${entry.server}, ${entry.port}, password=${entry.password}${tlsPart}${wsPart}${hostPart}${sniPart}, udp-relay=true`;
+        case "vless":
+            return `${head}vless, ${entry.server}, ${entry.port}, username=${entry.uuid}${tlsPart}${wsPart}${hostPart}${sniPart}, udp-relay=true`;
+    }
+}
+const preferredIpCache = new bounded_cache_1.BoundedTtlLru(32, 10_000);
+async function fetchPreferredIpEntries(env, signal, deps = {}) {
+    const raw = env.CORE_OUTPUT_PREFERRED_IP_URL?.trim();
+    if (!raw)
+        return [];
+    const url = (0, aggregation_1.validateSubscriptionUrl)(raw, env);
+    await (0, aggregation_1.assertPublicSubscriptionHost)(url, signal, deps.resolver);
+    const cached = preferredIpCache.get(url.toString());
+    if (cached)
+        return [...cached];
+    const fetchImpl = deps.fetchImpl ?? fetch;
+    const response = await fetchImpl(url, {
+        headers: { accept: "text/plain" },
+        redirect: "manual",
+        signal,
+        cache: "no-store",
+    });
+    if (!response.ok)
+        throw new errors_1.CoreError("EGRESS_FAILED", `Preferred-IP list returned HTTP ${response.status}`, true);
+    const maxBytes = 64 * 1024;
+    const contentLength = Number(response.headers.get("content-length") ?? "0");
+    if (contentLength > maxBytes)
+        throw new errors_1.CoreError("MESSAGE_TOO_LARGE", `Preferred-IP list exceeds ${maxBytes} bytes (${(0, aggregation_1.subscriptionSourceLogLabel)(raw)})`);
+    const reader = response.body?.getReader();
+    if (!reader)
+        return [];
+    const chunks = [];
+    let total = 0;
+    try {
+        while (true) {
+            const item = await reader.read();
+            if (item.done)
+                break;
+            total += item.value.byteLength;
+            if (total > maxBytes)
+                throw new errors_1.CoreError("MESSAGE_TOO_LARGE", `Preferred-IP list exceeds ${maxBytes} bytes (${(0, aggregation_1.subscriptionSourceLogLabel)(raw)})`);
+            chunks.push(item.value);
+        }
+    }
+    catch (error) {
+        await reader.cancel(error).catch(() => { });
+        throw error;
+    }
+    finally {
+        reader.releaseLock();
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+    }
+    let body;
+    try {
+        body = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    }
+    catch {
+        throw new errors_1.CoreError("BAD_REQUEST", "Preferred-IP list is not valid UTF-8");
+    }
+    const entries = (0, endpoints_1.parsePreferredIpEntries)(body);
+    preferredIpCache.set(url.toString(), entries);
+    return entries;
+}
+// F11: the freedom/direct outbound carries only the sockopt fields that are
+// meaningful for a direct dialer (mark + domainStrategy). Keepalive/tproxy/
+// fast-open are node-outbound fields and are not applied here.
+function buildXrayFreedomSockopt(opts) {
+    const s = opts.sockopt;
+    const out = {};
+    if (s.mark !== null)
+        out.mark = s.mark;
+    if (s.domainStrategy !== null && XRAY_DOMAIN_STRATEGIES.has(s.domainStrategy))
+        out.domainStrategy = s.domainStrategy;
+    return Object.keys(out).length ? out : undefined;
+}
+// F8 dns-in/dns-out (opt-in): a dokodemo-door inbound on the configured DNS
+// listen address forwards raw DNS to a plain-DNS IP (the first IP among the
+// worker resolvers, else 1.1.1.1 — never a DoH endpoint, which does not serve
+// UDP/53), and a dns outbound + routing rule tie them together. The listen
+// port defaults to 1053; the target port is always 53.
+function buildXrayDnsInbound(env, opts) {
+    if (!opts.xrayDnsInbound)
+        return undefined;
+    let listenHost = "127.0.0.1";
+    let listenPort = 1053;
+    if (opts.dnsListen) {
+        const parsed = parseHostPortOpt(opts.dnsListen, "CORE_OUTPUT_DNS_LISTEN", "127.0.0.1", 1053);
+        listenHost = parsed.host;
+        listenPort = parsed.port;
+    }
+    let target = "1.1.1.1";
+    try {
+        for (const url of workerDohResolvers(env)) {
+            const host = new URL(url).hostname;
+            if ((0, endpoints_1.isIpAddress)(host)) {
+                target = host;
+                break;
+            }
+        }
+    }
+    catch { /* startup validation already failed unparseable resolvers */ }
+    return {
+        inbound: {
+            tag: "dns-in",
+            listen: listenHost,
+            port: listenPort,
+            protocol: "dokodemo-door",
+            settings: { address: target, port: 53, network: "udp" },
+        },
+        outbound: { tag: "dns-out", protocol: "dns" },
+        rule: { type: "field", inboundTag: ["dns-in"], outboundTag: "dns-out" },
+    };
+}
+
+};
+
+__m["output/endpoints"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.parsePreferredIpEntries = parsePreferredIpEntries;
+exports.canonicalizeIpLiteral = canonicalizeIpLiteral;
+exports.getOutputHost = getOutputHost;
+exports.getOutputPorts = getOutputPorts;
+exports.getOutputPort = getOutputPort;
+exports.buildOutputEndpoints = buildOutputEndpoints;
+exports.isIpAddress = isIpAddress;
+const errors_1 = __r("../core/errors");
+const binary_1 = __r("../util/binary");
+const hostname_1 = __r("../util/hostname");
+const security_1 = __r("./security");
+// P2 benchmark: curated multi-source preferred-IP pool (cfnew + yonggekkk merged
+// into one scheme). Format per entry: IP[:PORT][#NAME], separated by commas or
+// newlines. NAME is the {endpoint} remark value and defaults to the IP. A NAME
+// must not contain a comma, CR/LF or control characters.
+function parsePreferredIpEntries(raw) {
+    const out = [];
+    for (const entry of (raw ?? "").split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean)) {
+        const hash = entry.indexOf("#");
+        const hostPort = (hash < 0 ? entry : entry.slice(0, hash)).trim();
+        const label = hash < 0 ? null : entry.slice(hash + 1).trim();
+        if (label !== null && (!label || label.length > 128 || /[\u0000-\u001f\u007f]/.test(label) || label.includes(","))) {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_OUTPUT_PREFERRED_IPS entry '${entry}' has an invalid #NAME (1..128 characters, no commas or controls)`);
+        }
+        let host;
+        let port = null;
+        try {
+            const parsed = (0, binary_1.parseHostPort)(hostPort, 0);
+            host = parsed.host;
+            port = parsed.port && parsed.port !== 0 ? parsed.port : null;
+        }
+        catch {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_OUTPUT_PREFERRED_IPS entry '${entry}' is not a valid IP[:PORT]`);
+        }
+        if (!isIpLiteral(host))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_OUTPUT_PREFERRED_IPS entry '${entry}' is not an IP literal`);
+        if (port !== null) {
+            try {
+                (0, binary_1.validatePort)(port);
+            }
+            catch {
+                throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_OUTPUT_PREFERRED_IPS entry '${entry}' has an invalid port`);
+            }
+        }
+        out.push({ address: canonicalizeIpLiteral(host), port, label: label || null });
+    }
+    return out;
+}
+function isIpv4Literal(value) {
+    const parts = value.trim().split(".");
+    if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part)))
+        return false;
+    const numbers = parts.map(Number);
+    return numbers.every((part) => part >= 0 && part <= 255);
+}
+function isIpv6Literal(value) {
+    let input = value.trim();
+    if (input.startsWith("[") && input.endsWith("]"))
+        input = input.slice(1, -1);
+    if (!input.includes(":"))
+        return false;
+    const pieces = input.split("::");
+    if (pieces.length > 2)
+        return false;
+    const parseSide = (side) => {
+        if (!side)
+            return 0;
+        const tokens = side.split(":");
+        let count = 0;
+        for (const token of tokens) {
+            if (token.includes(".")) {
+                if (!isIpv4Literal(token))
+                    return null;
+                count += 2;
+                continue;
+            }
+            if (!/^[0-9a-fA-F]{1,4}$/.test(token))
+                return null;
+            count += 1;
+        }
+        return count;
+    };
+    const left = parseSide(pieces[0]);
+    const right = parseSide(pieces[1] ?? "");
+    if (left === null || right === null)
+        return false;
+    if (pieces.length === 2)
+        return left + right < 8;
+    return left === 8;
+}
+function isIpLiteral(value) {
+    return isIpv4Literal(value) || isIpv6Literal(value);
+}
+function normalizeOutputHost(value) {
+    const raw = value.trim();
+    if (!raw)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST cannot be empty");
+    // Strip an optional scheme (and trailing slashes) BEFORE the delimiter checks: the raw
+    // value was previously rejected for containing "/" first, which made the scheme strip
+    // unreachable dead code (audit F11).
+    const candidate = raw.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    if (!candidate || /[/\\\s?#@]/.test(candidate) || candidate.includes(":") || candidate.includes("[") || candidate.includes("]")) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST must be a hostname without credentials, port, path, query or fragment");
+    }
+    if (isIpLiteral(candidate)) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST must be a hostname, not an IP literal");
+    }
+    // Enforce real LDH label rules (the previous URL round-trip accepted e.g. "exa_mple.com").
+    const hostname = (0, hostname_1.toAsciiHostname)(candidate);
+    if (!hostname || isIpLiteral(hostname)) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST is not a valid hostname");
+    }
+    return hostname;
+}
+// SCAN-08: canonicalize IP literals before they are used as dedup keys or dial
+// addresses, so "2001:0DB8::1", "2001:db8:0:0:0:0:0:1" and "2001:db8::1" are one
+// endpoint, not three. IPv4: drop leading zeros. IPv6 (RFC 5952): lowercase,
+// strip leading zeros per group, compress the longest run of zero groups
+// (length >= 2; ties go to the first run; a single zero group is not
+// compressed), and keep the dotted tail of IPv4-mapped addresses.
+function canonicalizeIpLiteral(value) {
+    const host = value.trim();
+    if (isIpv4Literal(host))
+        return host.split(".").map((part) => String(Number(part))).join(".");
+    // RFC 5952 §4.3: hex digits are lowercase. Lowercasing here (not just on
+    // the early-exit paths) keeps expanded forms like 2001:0DB8::/128 from
+    // surviving canonicalization with uppercase groups.
+    let input = (host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host).toLowerCase();
+    if (!isIpv6Literal(input))
+        return host.toLowerCase();
+    const mapped = input.match(/^(.+):((?:\d{1,3}\.){3}\d{1,3})$/);
+    let ipv4Tail = null;
+    if (mapped && isIpv4Literal(mapped[2])) {
+        ipv4Tail = mapped[2].split(".").map((part) => String(Number(part))).join(".");
+        input = mapped[1];
+    }
+    const pieces = input.split("::");
+    const parseSide = (side) => side ? side.split(":").map((group) => group.replace(/^0+/, "") || "0") : [];
+    const left = parseSide(pieces[0]);
+    const right = pieces.length === 2 ? parseSide(pieces[1]) : [];
+    const total = ipv4Tail ? 6 : 8;
+    const missing = pieces.length === 2 ? total - left.length - right.length : 0;
+    const groups = pieces.length === 2 ? [...left, ...new Array(Math.max(0, missing)).fill("0"), ...right] : left;
+    if (groups.length !== total)
+        return host.toLowerCase();
+    // Find the longest zero run (length >= 2); ties keep the first run.
+    let bestStart = -1;
+    let bestLen = 0;
+    let runStart = -1;
+    for (let i = 0; i <= groups.length; i++) {
+        if (i < groups.length && groups[i] === "0") {
+            if (runStart < 0)
+                runStart = i;
+        }
+        else {
+            const len = runStart < 0 ? 0 : i - runStart;
+            if (len > bestLen) {
+                bestLen = len;
+                bestStart = runStart;
+            }
+            runStart = -1;
+        }
+    }
+    if (bestLen < 2) {
+        const body = groups.join(":");
+        return ipv4Tail ? `${body}:${ipv4Tail}` : body;
+    }
+    const head = groups.slice(0, bestStart).join(":");
+    const tail = groups.slice(bestStart + bestLen).join(":");
+    const compressed = `${head}::${tail}`;
+    return ipv4Tail ? `${compressed}:${ipv4Tail}` : compressed;
+}
+function normalizeIp(value) {
+    const trimmed = value.trim();
+    const host = trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
+    if (!isIpLiteral(host))
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CLEAN_IPS entry is not an IP literal: ${value}`);
+    return canonicalizeIpLiteral(host);
+}
+function hasExplicitPort(value) {
+    const raw = value.trim();
+    if (raw.startsWith("[")) {
+        const close = raw.indexOf("]");
+        if (close < 0)
+            return false;
+        return raw.slice(close + 1).startsWith(":");
+    }
+    const colonCount = (raw.match(/:/g) ?? []).length;
+    if (colonCount !== 1)
+        return false;
+    const index = raw.lastIndexOf(":");
+    return /^\d+$/.test(raw.slice(index + 1));
+}
+function getWebSocketHost(env, outputHost) {
+    const configured = env.WS_HOST?.trim();
+    return configured ? normalizeOutputHost(configured) : outputHost;
+}
+function makeEndpoint(id, kind, address, port, httpHost, tlsServerName, securityConfig) {
+    const profile = (0, security_1.portProfileFor)(port, securityConfig);
+    return {
+        id,
+        kind,
+        address,
+        port,
+        scheme: profile.scheme,
+        security: profile.security,
+        httpHost,
+        tlsServerName: profile.security === "tls" ? tlsServerName : null,
+        edgePortClass: profile.edgePortClass,
+    };
+}
+function parseCleanIpEntries(raw, outputPorts, securityConfig, httpHost, tlsServerName) {
+    const values = (raw ?? "").split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean);
+    const endpoints = [];
+    const seen = new Set();
+    for (const value of values) {
+        let host;
+        let parsedPort;
+        try {
+            const parsed = (0, binary_1.parseHostPort)(value, outputPorts[0]);
+            host = normalizeIp(parsed.host);
+            parsedPort = parsed.port ?? outputPorts[0];
+            (0, binary_1.validatePort)(parsedPort);
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError)
+                throw error;
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid CLEAN_IPS entry: ${value}`, false, { cause: error });
+        }
+        const ports = hasExplicitPort(value) ? [parsedPort] : outputPorts;
+        if (hasExplicitPort(value) && !outputPorts.includes(parsedPort)) {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CLEAN_IPS entry ${value} uses port ${parsedPort}, which is not present in OUTPUT_PORT`);
+        }
+        for (const port of ports) {
+            try {
+                (0, binary_1.validatePort)(port);
+            }
+            catch (error) {
+                throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid port for CLEAN_IPS entry: ${value}`, false, { cause: error });
+            }
+            const key = `${host}\0${port}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            endpoints.push(makeEndpoint(`clean-ip-${endpoints.length + 1}`, "clean-ip", host, port, httpHost, tlsServerName, securityConfig));
+        }
+    }
+    return endpoints;
+}
+function getOutputHost(env, requestHost) {
+    const configured = env.OUTPUT_HOST?.trim();
+    if (configured)
+        return normalizeOutputHost(configured);
+    const wsHost = env.WS_HOST?.trim();
+    if (wsHost)
+        return normalizeOutputHost(wsHost);
+    if (!requestHost)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST is required when no request hostname is available");
+    return normalizeOutputHost(requestHost);
+}
+function getOutputPorts(env) {
+    const raw = env.OUTPUT_PORT?.trim();
+    if (!raw)
+        return [443];
+    const values = raw.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean);
+    if (values.length === 0)
+        return [443];
+    const ports = [];
+    const seen = new Set();
+    for (const value of values) {
+        if (!/^\d+$/.test(value)) {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid OUTPUT_PORT entry: ${value}. Expected an integer from 1 to 65535`);
+        }
+        const port = Number(value);
+        try {
+            (0, binary_1.validatePort)(port);
+        }
+        catch (error) {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid OUTPUT_PORT entry: ${value}. Expected an integer from 1 to 65535`, false, { cause: error });
+        }
+        if (!seen.has(port)) {
+            seen.add(port);
+            ports.push(port);
+        }
+    }
+    return ports.length > 0 ? ports : [443];
+}
+function getOutputPort(env) {
+    return getOutputPorts(env)[0];
+}
+function buildOutputEndpoints(env, options = {}) {
+    const host = getOutputHost(env, options.requestHost);
+    const outputPorts = getOutputPorts(env);
+    const securityConfig = (0, security_1.normalizeOutputSecurityConfig)(env);
+    const httpHost = getWebSocketHost(env, host);
+    const tlsServerName = host;
+    const endpoints = [];
+    for (const port of outputPorts) {
+        endpoints.push({
+            id: `domain-${port}`,
+            kind: "domain",
+            address: host,
+            port,
+            scheme: (0, security_1.portProfileFor)(port, securityConfig).scheme,
+            security: (0, security_1.portProfileFor)(port, securityConfig).security,
+            httpHost,
+            tlsServerName: (0, security_1.portProfileFor)(port, securityConfig).security === "tls" ? tlsServerName : null,
+            edgePortClass: (0, security_1.portProfileFor)(port, securityConfig).edgePortClass,
+        });
+    }
+    // Preferred IPs sit between domain endpoints and clean IPs: they are the
+    // operator's curated pool (region-ordered by list order) and win dedup
+    // against an identical clean-IP entry, so one IP never appears twice.
+    const seenKeys = new Set();
+    const preferredEntries = [...parsePreferredIpEntries(env.CORE_OUTPUT_PREFERRED_IPS), ...(options.extraPreferred ?? [])];
+    for (const entry of preferredEntries) {
+        const ports = entry.port === null ? outputPorts : [entry.port];
+        if (entry.port !== null && !outputPorts.includes(entry.port)) {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_OUTPUT_PREFERRED_IPS entry ${entry.address}:${entry.port} uses a port which is not present in OUTPUT_PORT`);
+        }
+        for (const port of ports) {
+            const key = `${entry.address}\0${port}`;
+            if (seenKeys.has(key))
+                continue;
+            seenKeys.add(key);
+            const endpoint = makeEndpoint(`preferred-${endpoints.length + 1}`, "clean-ip", entry.address, port, httpHost, tlsServerName, securityConfig);
+            endpoints.push(entry.label ? { ...endpoint, label: entry.label } : endpoint);
+        }
+    }
+    const cleanEndpoints = parseCleanIpEntries(env.CLEAN_IPS, outputPorts, securityConfig, httpHost, tlsServerName);
+    for (const endpoint of cleanEndpoints) {
+        const key = `${endpoint.address}\0${endpoint.port}`;
+        if (seenKeys.has(key))
+            continue;
+        seenKeys.add(key);
+        endpoints.push(endpoint);
+    }
+    return {
+        host,
+        defaultPort: outputPorts[0],
+        outputPorts,
+        endpoints,
+    };
+}
+function isIpAddress(value) {
+    return isIpLiteral(value);
+}
+
+};
+
+__m["output/security"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.normalizeOutputSecurityConfig = normalizeOutputSecurityConfig;
+exports.portProfileFor = portProfileFor;
+exports.securityForPort = securityForPort;
+exports.schemeForPort = schemeForPort;
+const errors_1 = __r("../core/errors");
+const binary_1 = __r("../util/binary");
+const cloudflare_1 = __r("./edge/cloudflare");
+function parsePortList(raw, field) {
+    if (!raw?.trim())
+        return [];
+    const out = [];
+    const seen = new Set();
+    for (const value of raw.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean)) {
+        if (!/^\d+$/.test(value))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} contains invalid port '${value}'`);
+        const port = Number(value);
+        (0, binary_1.validatePort)(port);
+        if (!seen.has(port)) {
+            seen.add(port);
+            out.push(port);
+        }
+    }
+    return out;
+}
+function normalizeOutputSecurityConfig(env) {
+    const explicitTlsPorts = parsePortList(env.OUTPUT_TLS_PORTS, "OUTPUT_TLS_PORTS");
+    const explicitHttpPorts = parsePortList(env.OUTPUT_HTTP_PORTS, "OUTPUT_HTTP_PORTS");
+    const tlsSet = new Set(explicitTlsPorts);
+    if (explicitHttpPorts.some((port) => tlsSet.has(port))) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_TLS_PORTS and OUTPUT_HTTP_PORTS must not overlap");
+    }
+    const httpSet = new Set(cloudflare_1.CLOUDFLARE_HTTP_PORTS);
+    const httpsSet = new Set(cloudflare_1.CLOUDFLARE_HTTPS_PORTS);
+    const invalidTls = explicitTlsPorts.filter((port) => !httpsSet.has(port));
+    const invalidHttp = explicitHttpPorts.filter((port) => !httpSet.has(port));
+    if (invalidTls.length) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `OUTPUT_TLS_PORTS contains non-HTTPS Cloudflare ports: ${invalidTls.join(", ")}`);
+    }
+    if (invalidHttp.length) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `OUTPUT_HTTP_PORTS contains non-HTTP Cloudflare ports: ${invalidHttp.join(", ")}`);
+    }
+    return {
+        tlsPorts: [...cloudflare_1.CLOUDFLARE_HTTPS_PORTS],
+        httpPorts: [...cloudflare_1.CLOUDFLARE_HTTP_PORTS],
+        explicitTlsPorts,
+        explicitHttpPorts,
+    };
+}
+function portProfileFor(port, envOrConfig) {
+    // A configured list is an assertion/compatibility layer only. It never overrides Cloudflare's canonical classification.
+    if (!("tlsPorts" in envOrConfig))
+        normalizeOutputSecurityConfig(envOrConfig);
+    return (0, cloudflare_1.cloudflarePortProfile)(port);
+}
+function securityForPort(port, envOrConfig) {
+    return portProfileFor(port, envOrConfig).security;
+}
+function schemeForPort(port, envOrConfig) {
+    return portProfileFor(port, envOrConfig).scheme;
+}
+
+};
+
+__m["output/edge/cloudflare"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.CLOUDFLARE_HTTPS_PORTS = exports.CLOUDFLARE_HTTP_PORTS = void 0;
+exports.cloudflarePortProfile = cloudflarePortProfile;
+exports.isCloudflareHttpPort = isCloudflareHttpPort;
+exports.isCloudflareHttpsPort = isCloudflareHttpsPort;
+exports.allCloudflarePortProfiles = allCloudflarePortProfiles;
+const errors_1 = __r("../../core/errors");
+const binary_1 = __r("../../util/binary");
+exports.CLOUDFLARE_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+exports.CLOUDFLARE_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
+const profiles = new Map();
+for (const port of exports.CLOUDFLARE_HTTP_PORTS) {
+    profiles.set(port, { port, scheme: "http", security: "none", websocket: true, edgePortClass: "cloudflare-http" });
+}
+for (const port of exports.CLOUDFLARE_HTTPS_PORTS) {
+    profiles.set(port, { port, scheme: "https", security: "tls", websocket: true, edgePortClass: "cloudflare-https" });
+}
+function cloudflarePortProfile(port) {
+    (0, binary_1.validatePort)(port);
+    const profile = profiles.get(port);
+    if (!profile) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", 
+        // Edge Info note: the list below is Cloudflare's proxied-domain
+        // port list, not a workers.dev list — a workers.dev host may not
+        // serve every port here. The wording says so explicitly now.
+        `Output port ${port} is not one of Cloudflare's default HTTP/HTTPS proxy-compatible ports for proxied domains`);
+    }
+    return profile;
+}
+function isCloudflareHttpPort(port) {
+    return profiles.get(port)?.scheme === "http";
+}
+function isCloudflareHttpsPort(port) {
+    return profiles.get(port)?.scheme === "https";
+}
+function allCloudflarePortProfiles() {
+    return [...profiles.values()];
+}
+
+};
+
+__m["util/binary"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.concatBytes = concatBytes;
+exports.equalBytes = equalBytes;
+exports.bytesToHex = bytesToHex;
+exports.hexToBytes = hexToBytes;
+exports.uuidToBytes = uuidToBytes;
+exports.bytesToUuid = bytesToUuid;
+exports.isValidIpv6Literal = isValidIpv6Literal;
+exports.parseHostPort = parseHostPort;
+exports.validatePort = validatePort;
+exports.encodeUtf8 = encodeUtf8;
+exports.decodeUtf8 = decodeUtf8;
+function concatBytes(...parts) {
+    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+        out.set(part, offset);
+        offset += part.byteLength;
+    }
+    return out;
+}
+function equalBytes(a, b) {
+    if (a.byteLength !== b.byteLength)
+        return false;
+    let diff = 0;
+    for (let i = 0; i < a.byteLength; i++)
+        diff |= a[i] ^ b[i];
+    return diff === 0;
+}
+function bytesToHex(bytes) {
+    let out = "";
+    for (const byte of bytes)
+        out += byte.toString(16).padStart(2, "0");
+    return out;
+}
+function hexToBytes(hex) {
+    if (!/^[0-9a-fA-F]*$/.test(hex) || hex.length % 2 !== 0)
+        throw new Error("Invalid hex string");
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++)
+        out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return out;
+}
+function uuidToBytes(uuid) {
+    const normalized = uuid.trim().toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized))
+        throw new Error("Invalid UUID");
+    return hexToBytes(normalized.replaceAll("-", ""));
+}
+function bytesToUuid(bytes) {
+    if (bytes.byteLength !== 16)
+        throw new Error("UUID must contain 16 bytes");
+    const hex = bytesToHex(bytes);
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+// DS-L12: a multi-colon host is only meaningful as an IPv6 literal, so it
+// is validated here instead of failing later in a SOCKS address encoder.
+// Mirrors the sibling IPv6 parsers (proxyip/nat64): "::" must compress at
+// least one group, a dotted-quad tail counts as two groups and is only
+// legal as the final token, and every other group is 1-4 hex digits.
+function isValidIpv6Literal(input) {
+    if (!input.includes(":"))
+        return false;
+    const sides = input.split("::");
+    if (sides.length > 2)
+        return false;
+    const countSide = (side, isFinalSide) => {
+        if (!side)
+            return 0;
+        const tokens = side.split(":");
+        let count = 0;
+        for (const [index, token] of tokens.entries()) {
+            if (token.includes(".")) {
+                if (!isFinalSide || index !== tokens.length - 1)
+                    return null;
+                const octets = token.split(".");
+                if (octets.length !== 4 || octets.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255))
+                    return null;
+                count += 2;
+                continue;
+            }
+            if (!/^[0-9a-fA-F]{1,4}$/.test(token))
+                return null;
+            count += 1;
+        }
+        return count;
+    };
+    const left = countSide(sides[0], sides.length === 1);
+    const right = sides.length === 2 ? countSide(sides[1], true) : null;
+    if (left === null || right === null)
+        return false;
+    return sides.length === 2 ? left + right < 8 : left === 8;
+}
+function parseHostPort(value, defaultPort) {
+    const raw = value.trim();
+    if (!raw)
+        throw new Error("Empty endpoint");
+    // DS-M4: a host:port value is never a URL. Characters that only make
+    // sense as URL syntax (scheme slashes, userinfo "@", query/fragment)
+    // mean a credential-bearing or otherwise non-host string was passed in;
+    // rejecting it here guarantees such a string can never be retained as a
+    // hostname (and later echoed into an error message) by any caller.
+    if (/[\s/?#@]/.test(raw))
+        throw new Error("Invalid endpoint");
+    if (raw.startsWith("[")) {
+        const close = raw.indexOf("]");
+        if (close < 0)
+            throw new Error("Invalid bracketed endpoint");
+        const host = raw.slice(1, close);
+        if (!host)
+            throw new Error("Empty host");
+        if (!isValidIpv6Literal(host))
+            throw new Error("Invalid IPv6 literal");
+        const rest = raw.slice(close + 1);
+        if (!rest)
+            return { host, port: defaultPort };
+        if (!rest.startsWith(":"))
+            throw new Error("Invalid endpoint");
+        const portText = rest.slice(1);
+        if (!/^\d+$/.test(portText))
+            throw new Error("Invalid port");
+        const port = Number(portText);
+        validatePort(port);
+        return { host, port };
+    }
+    const colonCount = (raw.match(/:/g) ?? []).length;
+    if (colonCount > 1) {
+        if (!isValidIpv6Literal(raw))
+            throw new Error("Invalid IPv6 literal");
+        return { host: raw, port: defaultPort };
+    }
+    const idx = raw.lastIndexOf(":");
+    if (idx < 0)
+        return { host: raw, port: defaultPort };
+    const host = raw.slice(0, idx);
+    if (!host)
+        throw new Error("Empty host");
+    const portText = raw.slice(idx + 1);
+    if (!/^\d+$/.test(portText))
+        throw new Error("Invalid port");
+    const port = Number(portText);
+    validatePort(port);
+    return { host, port };
+}
+function validatePort(port) {
+    if (!Number.isInteger(port) || port < 1 || port > 65535)
+        throw new Error("Port must be an integer from 1 to 65535");
+}
+function encodeUtf8(value) {
+    return new TextEncoder().encode(value);
+}
+function decodeUtf8(bytes) {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+};
+
+__m["output/surge/index"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.buildSurgeConfig = buildSurgeConfig;
 const errors_1 = __r("../../core/errors");
 const share_link_1 = __r("../share-link");
+const generator_options_1 = __r("../generator-options");
 const rules_1 = __r("../rules");
-// Render-time custom-outbound check (see the sing-box builder for why startup
-// alone cannot close this gap: generated node tags are dynamic here too).
-// The "proxy-" prefix is rejected because the proxy balancer selects by that
-// prefix: a custom tag with it would be silently absorbed into the balancer,
-// breaking the v1 promise of no automatic group membership.
-function validateCustomOutbounds(items, proxyTags) {
-    const generated = new Set([...proxyTags, "proxy", "proxy-balancer", "direct", "block"]);
-    const seen = new Set();
-    for (const item of items) {
-        const tag = item.tag;
-        if (typeof tag !== "string" || !tag)
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Xray outbound requires a non-empty tag");
-        if (seen.has(tag))
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' is duplicated`);
-        seen.add(tag);
-        if (generated.has(tag))
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' collides with a generated tag`);
-        if (tag.startsWith("proxy-"))
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' must not start with 'proxy-' (the proxy balancer selector would absorb it)`);
-    }
-    return [...items];
+function surgeName(name) {
+    const clean = name.replace(/[,\n\r=\u0000-\u001f\u007f]/g, "-");
+    if (!clean)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Surge proxy requires a non-empty name");
+    return clean;
 }
-function validateNode(node) {
-    if (node.security === "none") {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray public output requires transport TLS; use the Worker/native model or another compatible target for plaintext nodes");
-    }
+function parseSurgeLineName(line) {
+    const eq = line.indexOf("=");
+    if (eq <= 0)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Surge custom proxy line requires a 'Name = ...' form");
+    return line.slice(0, eq).trim();
 }
-function stream(node, fragmentProfile) {
-    validateNode(node);
-    const streamSettings = {
-        method: "websocket",
-        network: "ws",
-        security: "tls",
-        tlsSettings: {
-            serverName: node.tls?.serverName || node.server,
-            ...(node.tls?.alpn?.length ? { alpn: node.tls.alpn } : {}),
-            ...(node.tls?.fingerprint ? { fingerprint: node.tls.fingerprint } : {}),
-        },
-        wsSettings: {
-            path: (0, share_link_1.effectiveWebSocketPath)(node.websocket.path, node.websocket.earlyData),
-            ...(node.websocket.host ? { host: node.websocket.host } : {}),
-        },
-    };
-    if (fragmentProfile) {
-        streamSettings.finalmask = {
-            tcp: [{
-                    type: "fragment",
-                    settings: {
-                        packets: fragmentProfile.packets,
-                        lengths: [...fragmentProfile.lengths],
-                        delays: [...fragmentProfile.delays],
-                        ...(fragmentProfile.lengths[0] ? { length: fragmentProfile.lengths[0] } : {}),
-                        ...(fragmentProfile.delays[0] ? { delay: fragmentProfile.delays[0] } : {}),
-                        ...(fragmentProfile.maxSplit ? { maxSplit: fragmentProfile.maxSplit } : {}),
-                    },
-                }],
-        };
-    }
-    return streamSettings;
+function nodeLine(node, gen) {
+    if (node.security !== "tls")
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Surge output requires TLS nodes");
+    const name = surgeName(node.name);
+    const sni = gen ? (0, generator_options_1.effectiveSni)(node.tls?.serverName, node.server, node.name, gen) : (node.tls?.serverName || node.server);
+    const parts = [node.protocol, node.server, String(node.port)];
+    if (node.protocol === "vless")
+        parts.push(`username=${node.credential}`);
+    else
+        parts.push(`password=${node.credential}`);
+    parts.push("tls=true", "ws=true", `ws-path=${(0, share_link_1.webSocketPathWithoutEarlyData)(node.websocket.path)}`);
+    if (node.websocket.host)
+        parts.push(`ws-headers=Host:${node.websocket.host}`);
+    parts.push(`sni=${sni}`, "udp-relay=true");
+    return `${name} = ${parts.join(", ")}`;
 }
-function outbound(node, index, fragmentProfile) {
-    validateNode(node);
-    const tag = `proxy-${index}`;
-    if (node.protocol === "vless") {
-        return {
-            tag,
-            protocol: "vless",
-            settings: {
-                vnext: [{
-                        address: node.server,
-                        port: node.port,
-                        users: [{ id: node.credential, encryption: "none" }],
-                    }],
-                packetEncoding: "packetaddr",
-            },
-            streamSettings: stream(node, fragmentProfile),
-        };
-    }
-    return {
-        tag,
-        protocol: "trojan",
-        settings: {
-            servers: [{ address: node.server, port: node.port, password: node.credential }],
-        },
-        streamSettings: stream(node, fragmentProfile),
-    };
+function intervalSeconds(value) {
+    if (!value)
+        return 300;
+    const match = value.trim().match(/^(\d+)s?$/);
+    return match ? Number(match[1]) : 300;
 }
-function configWithOutbounds(nodes, options, prebuiltOutbounds) {
+function buildSurgeConfig(nodes, options = {}) {
     if (!nodes.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray output requires at least one TLS-compatible node");
-    for (const node of nodes)
-        validateNode(node);
-    const outbounds = prebuiltOutbounds ? [...prebuiltOutbounds] : nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile));
-    const proxyTags = outbounds.map((item) => String(item.tag));
-    const strategy = proxyTags.length <= 1 ? "manual" : (options.strategy ?? "roundRobin");
-    const finalTag = proxyTags[0];
-    // Observatory exists to feed leastPing/leastLoad balancers. A roundRobin balancer ignores
-    // probe results, so probing every outbound every interval was pure overhead (audit F14).
-    const observatory = proxyTags.length > 1 && strategy === "leastPing"
-        ? {
-            subjectSelector: ["proxy-"],
-            probeUrl: options.probeUrl ?? "https://www.gstatic.com/generate_204",
-            probeInterval: options.probeInterval ?? "30s",
-            enableConcurrency: options.observatoryConcurrency ?? true,
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Surge output requires at least one node");
+    const gen = options.generatorOptions;
+    const groupType = options.groupStrategy ?? "select";
+    const customLines = [...(options.customLines ?? [])];
+    const poolLines = [...(options.poolLines ?? [])];
+    const customNames = new Set();
+    for (const line of [...customLines, ...poolLines]) {
+        const name = parseSurgeLineName(line);
+        if (customNames.has(name))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Surge proxy name '${name}' is duplicated`);
+        customNames.add(name);
+        if (name === "PROXY" || name.toUpperCase() === "DIRECT" || name.toUpperCase() === "REJECT") {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Surge proxy name '${name}' collides with a generated name or a rule action`);
         }
-        : undefined;
-    // DS-M9: Xray routing `protocol` rules only match against sniffed
-    // metadata (xtls docs: "You must enable the `sniffing` option in the
-    // inbound proxy to sniff the protocol"). Enable sniffing only when a
-    // user rule actually uses `protocol`, so non-protocol rulesets keep the
-    // previous `enabled: false` inbound byte-for-byte. destOverride is the
-    // explicit, documented set ["http" | "tls" | "quic" | "fakedns"] minus
-    // fakedns (this inbound never serves fake DNS, and bittorrent has no
-    // destination to override — its protocol metadata is still populated
-    // when sniffing is enabled). routeOnly: true is the documented
-    // routing-only mode: sniffed data feeds routing decisions without
-    // resetting the connection destination, which must stay the SOCKS
-    // target the client already chose.
-    const needsSniffing = (options.routingRules ?? []).some((rule) => rule.protocol !== undefined);
-    const singleManual = strategy === "manual" && nodes.length === 1;
-    const customOutbounds = validateCustomOutbounds(options.customOutbounds ?? [], proxyTags);
-    // User rules come first; the existing catch-all stays last. The "proxy"
-    // action resolves to the balancer in multi-node configs and to the single
-    // node tag in single-node configs, exactly like the catch-all does.
-    const translated = options.routingRules?.length
-        ? (0, rules_1.translateXrayRules)(options.routingRules, { multi: !singleManual, finalTag, customTags: new Set(customOutbounds.map((item) => String(item.tag))) })
-        : { rules: [], needsDirect: false, needsBlock: false };
-    // Freedom/blackhole are created on demand by direct/block actions, but only
-    // when no outbound with that tag exists yet (e.g. the opt-in fallback
-    // already provides freedom) — never duplicated.
-    const existingTags = new Set([...proxyTags, ...(options.allowDirectFallback ? ["direct"] : [])]);
-    const onDemand = [];
-    if (translated.needsDirect && !existingTags.has("direct")) {
-        onDemand.push({ tag: "direct", protocol: "freedom" });
-        existingTags.add("direct");
     }
-    if (translated.needsBlock && !existingTags.has("block")) {
-        onDemand.push({ tag: "block", protocol: "blackhole" });
-        existingTags.add("block");
+    const nodeNames = nodes.map((node) => surgeName(node.name));
+    for (const name of nodeNames) {
+        if (customNames.has(name))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Surge proxy name '${name}' collides with a generated node name`);
     }
-    const routing = singleManual
-        ? { domainStrategy: "AsIs", rules: [...translated.rules, { type: "field", inboundTag: ["socks-in"], outboundTag: finalTag }] }
-        : {
-            domainStrategy: "AsIs",
-            rules: [...translated.rules, { type: "field", inboundTag: ["socks-in"], balancerTag: "proxy-balancer" }],
-            balancers: [{
-                    tag: "proxy-balancer",
-                    selector: ["proxy-"],
-                    strategy: { type: strategy === "leastPing" ? "leastPing" : "roundRobin" },
-                    ...(options.allowDirectFallback ? { fallbackTag: "direct" } : {}),
-                }],
-        };
-    return {
-        log: { loglevel: "warning" },
-        dns: {
-            servers: [
-                "https://cloudflare-dns.com/dns-query",
-                "https://dns.google/dns-query",
-            ],
-            disableFallback: true,
-        },
-        ...(observatory ? { observatory } : {}),
-        inbounds: [{
-                tag: "socks-in",
-                listen: options.listen ?? "127.0.0.1",
-                port: options.socksPort ?? 10808,
-                protocol: "socks",
-                // Trojan supports UDP association in Xray just as VLESS does; gating this on the
-                // presence of a VLESS node silently disabled all UDP for Trojan-only bundles (audit F2).
-                settings: { auth: "noauth", udp: true },
-                sniffing: needsSniffing
-                    ? { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
-                    : { enabled: false },
-            }],
-        outbounds: [
-            ...outbounds,
-            ...(options.allowDirectFallback ? [{ tag: "direct", protocol: "freedom" }] : []),
-            ...customOutbounds,
-            ...onDemand,
-        ],
-        routing,
-    };
-}
-function buildXrayConfig(nodes, options = {}) {
-    return configWithOutbounds(nodes, options);
-}
-function buildXrayBestPingConfig(nodes, options = {}) {
-    return configWithOutbounds(nodes, { ...options, strategy: "leastPing" });
-}
-function buildXrayFragmentConfig(nodes, profiles, strategy, options = {}) {
-    if (!profiles.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment output requires at least one fragment profile");
-    const expanded = [];
-    for (const node of nodes) {
-        if (node.security !== "tls")
-            continue;
-        for (const profile of profiles)
-            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
+    const ruleLines = (options.routingRules ?? []).length
+        ? (0, rules_1.translateSurgeRules)(options.routingRules ?? [], { customNames })
+        : [];
+    const lines = ["[Proxy]"];
+    for (const node of nodes)
+        lines.push(nodeLine(node, gen));
+    for (const line of customLines)
+        lines.push(line);
+    for (const line of poolLines)
+        lines.push(line);
+    lines.push("", "[Proxy Group]");
+    const groupMembers = [...nodeNames, ...poolLines.map(parseSurgeLineName)];
+    if (groupType === "url-test") {
+        lines.push(`PROXY = url-test, ${groupMembers.join(", ")}, url=${options.probeUrl ?? "https://www.gstatic.com/generate_204"}, interval=${intervalSeconds(options.interval)}`);
     }
-    if (!expanded.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment output requires at least one TLS-compatible node");
-    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile));
-    return configWithOutbounds(expanded.map((item) => item.node), { ...options, strategy }, outbounds);
-}
-function buildXrayBestFragmentConfig(nodes, profiles, options = {}) {
-    return buildXrayFragmentConfig(nodes, profiles, "leastPing", options);
-}
-function buildXrayBestPingFragmentConfig(nodes, profiles, options = {}) {
-    return buildXrayFragmentConfig(nodes, profiles, "leastPing", options);
+    else {
+        lines.push(`PROXY = select, ${groupMembers.join(", ")}`);
+    }
+    lines.push("", "[Rule]");
+    for (const line of ruleLines)
+        lines.push(line);
+    lines.push("FINAL,PROXY", "");
+    return lines.join("\n");
 }
 
 };
@@ -6949,26 +10005,505 @@ function generateShareLink(node, options = {}) {
 }
 /**
  * Path for cores that carry early data natively (sing-box max_early_data, Mihomo
- * ws-opts.max-early-data): remove only the `ed=<n>` query parameter and preserve any
+ * ws-opts.max-early-data): remove the `ed=` query parameter and preserve any
  * other query components the operator configured (audit F8). Xray/share-links keep the
  * full path including `ed`, per the Xray convention.
+ *
+ * SCAN-05 (v1.0.0): the strip previously matched only digit `ed=` values, so a
+ * non-digit `ed=abc` survived the strip while `effectiveWebSocketPath` then
+ * appended a second `ed=` — a duplicated parameter. Any `ed=` pair is an
+ * early-data parameter regardless of value validity, so both functions now
+ * treat any `ed=` pair as present.
  */
 function webSocketPathWithoutEarlyData(path) {
     const queryIndex = path.indexOf("?");
     if (queryIndex < 0)
         return path;
     const base = path.slice(0, queryIndex);
-    const kept = path.slice(queryIndex + 1).split("&").filter((pair) => pair && !/^ed=\d+$/.test(pair));
+    const kept = path.slice(queryIndex + 1).split("&").filter((pair) => pair && !/^ed=[^&]*$/.test(pair));
     return kept.length ? `${base}?${kept.join("&")}` : base;
 }
 function effectiveWebSocketPath(path, earlyData) {
     if (!earlyData || !Number.isInteger(earlyData) || earlyData <= 0)
         return path;
     const separator = path.includes("?") ? "&" : "?";
-    return /(?:^|[?&])ed=\d+(?:&|$)/.test(path) ? path : `${path}${separator}ed=${earlyData}`;
+    return /(?:^|[?&])ed=[^&]*(?:&|$)/.test(path) ? path : `${path}${separator}ed=${earlyData}`;
 }
 function formatServer(server) {
     return server.includes(":") && !server.startsWith("[") ? `[${server}]` : server;
+}
+
+};
+
+__m["output/xray/index"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.buildXrayConfig = buildXrayConfig;
+exports.buildXrayBestPingConfig = buildXrayBestPingConfig;
+exports.buildXrayBestFragmentConfig = buildXrayBestFragmentConfig;
+exports.buildXrayBestPingFragmentConfig = buildXrayBestPingFragmentConfig;
+const errors_1 = __r("../../core/errors");
+const profiles_1 = __r("../profiles");
+const share_link_1 = __r("../share-link");
+const rules_1 = __r("../rules");
+const generator_options_1 = __r("../generator-options");
+// Render-time custom-outbound check (see the sing-box builder for why startup
+// alone cannot close this gap: generated node tags are dynamic here too).
+// The "proxy-" prefix is rejected because the proxy balancer selects by that
+// prefix: a custom tag with it would be silently absorbed into the balancer,
+// breaking the v1 promise of no automatic group membership.
+function validateCustomOutbounds(items, proxyTags) {
+    const generated = new Set([...proxyTags, "proxy", "proxy-balancer", "direct", "block"]);
+    const seen = new Set();
+    for (const item of items) {
+        const tag = item.tag;
+        if (typeof tag !== "string" || !tag)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Xray outbound requires a non-empty tag");
+        if (seen.has(tag))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' is duplicated`);
+        seen.add(tag);
+        if (generated.has(tag))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' collides with a generated tag`);
+        if (tag.startsWith("proxy-"))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' must not start with 'proxy-' (the proxy balancer selector would absorb it)`);
+    }
+    return [...items];
+}
+function validateNode(node) {
+    if (node.security === "none") {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray public output requires transport TLS; use the Worker/native model or another compatible target for plaintext nodes");
+    }
+}
+function stream(node, fragmentProfile, gen) {
+    validateNode(node);
+    const sockopt = gen ? (0, generator_options_1.buildXraySockopt)(gen) : undefined;
+    const streamSettings = {
+        method: "websocket",
+        network: "ws",
+        security: "tls",
+        tlsSettings: {
+            serverName: gen ? (0, generator_options_1.effectiveSni)(node.tls?.serverName, node.server, node.name, gen) : (node.tls?.serverName || node.server),
+            ...(node.tls?.alpn?.length ? { alpn: node.tls.alpn } : {}),
+            ...(node.tls?.fingerprint ? { fingerprint: node.tls.fingerprint } : {}),
+        },
+        wsSettings: {
+            path: (0, share_link_1.effectiveWebSocketPath)(node.websocket.path, node.websocket.earlyData),
+            ...(node.websocket.host ? { host: node.websocket.host } : {}),
+        },
+        ...(sockopt ? { sockopt } : {}),
+    };
+    if (fragmentProfile) {
+        // R-2/F12-half: emit ONLY the canonical plural form (lengths/delays
+        // arrays) per the current Xray FinalMask doc. The old code also emitted
+        // singular length/delay from element [0], duplicating the first range.
+        streamSettings.finalmask = {
+            tcp: [{
+                    type: "fragment",
+                    settings: {
+                        packets: fragmentProfile.packets,
+                        lengths: [...fragmentProfile.lengths],
+                        delays: [...fragmentProfile.delays],
+                        ...(fragmentProfile.maxSplit ? { maxSplit: fragmentProfile.maxSplit } : {}),
+                    },
+                }],
+        };
+    }
+    return streamSettings;
+}
+function outbound(node, index, fragmentProfile, gen) {
+    validateNode(node);
+    const tag = `proxy-${index}`;
+    if (node.protocol === "vless") {
+        return {
+            tag,
+            protocol: "vless",
+            settings: {
+                vnext: [{
+                        address: node.server,
+                        port: node.port,
+                        users: [{ id: node.credential, encryption: "none" }],
+                    }],
+                packetEncoding: "packetaddr",
+            },
+            streamSettings: stream(node, fragmentProfile, gen),
+        };
+    }
+    return {
+        tag,
+        protocol: "trojan",
+        settings: {
+            servers: [{ address: node.server, port: node.port, password: node.credential }],
+        },
+        streamSettings: stream(node, fragmentProfile, gen),
+    };
+}
+// Freedom (direct) and blackhole outbounds, shared by the opt-in fallback and
+// by rule-triggered on-demand creation so both paths carry the same settings.
+function freedomOutbound(gen) {
+    const sockopt = gen ? (0, generator_options_1.buildXrayFreedomSockopt)(gen) : undefined;
+    return { tag: "direct", protocol: "freedom", ...(sockopt ? { streamSettings: { sockopt } } : {}) };
+}
+function blackholeOutbound(gen) {
+    return {
+        tag: "block",
+        protocol: "blackhole",
+        ...(gen?.xrayBlackholeResponse === "http" ? { settings: { response: { type: "http" } } } : {}),
+    };
+}
+function configWithOutbounds(nodes, options, prebuiltOutbounds) {
+    if (!nodes.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray output requires at least one TLS-compatible node");
+    for (const node of nodes)
+        validateNode(node);
+    const gen = options.generatorOptions;
+    const nodeOutbounds = prebuiltOutbounds ? [...prebuiltOutbounds] : nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, gen));
+    // Pool outbounds (Warp) join the balancer pool; custom outbounds stay peers
+    // reachable only via rules (unchanged v1 promise).
+    const poolOutbounds = [...(options.poolOutbounds ?? [])];
+    const outbounds = [...nodeOutbounds, ...poolOutbounds];
+    const proxyTags = outbounds.map((item) => String(item.tag));
+    // R-5: a manual strategy with 2+ outbounds has no Xray meaning (there is
+    // no multi-outbound manual balancer type). Fail closed instead of silently
+    // coercing to roundRobin.
+    if (options.strategy === "manual" && proxyTags.length > 1) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray manual strategy is only valid for a single outbound; use roundRobin or leastPing for multiple outbounds");
+    }
+    const strategy = proxyTags.length <= 1 ? "manual" : (options.strategy ?? "roundRobin");
+    const finalTag = proxyTags[0];
+    // Observatory exists to feed leastPing/leastLoad balancers. A roundRobin balancer ignores
+    // probe results, so probing every outbound every interval was pure overhead (audit F14).
+    const observatory = proxyTags.length > 1 && strategy === "leastPing"
+        ? {
+            subjectSelector: ["proxy-"],
+            probeUrl: options.probeUrl ?? "https://www.gstatic.com/generate_204",
+            probeInterval: options.probeInterval ?? "30s",
+            enableConcurrency: options.observatoryConcurrency ?? true,
+        }
+        : undefined;
+    // DS-M9: Xray routing `protocol` rules only match against sniffed
+    // metadata (xtls docs: "You must enable the `sniffing` option in the
+    // inbound proxy to sniff the protocol"). Enable sniffing when a user rule
+    // uses `protocol` or when fake DNS is on (fakedns recovery needs sniffing
+    // with destOverride "fakedns"); otherwise keep the previous `enabled:
+    // false` inbound byte-for-byte. destOverride is the documented set
+    // ["http" | "tls" | "quic" | "fakedns"] minus fakedns when fake DNS is off
+    // (bittorrent has no destination to override — its protocol metadata is
+    // still populated when sniffing is enabled). routeOnly: true is the
+    // documented routing-only mode: sniffed data feeds routing decisions
+    // without resetting the connection destination, which must stay the SOCKS
+    // target the client already chose.
+    const fakeDnsOn = Boolean(gen?.fakeDnsEnabled);
+    const needsSniffing = (options.routingRules ?? []).some((rule) => rule.protocol !== undefined) || fakeDnsOn;
+    const singleManual = strategy === "manual" && proxyTags.length === 1;
+    const customOutbounds = validateCustomOutbounds(options.customOutbounds ?? [], proxyTags);
+    // User rules come first; the existing catch-all stays last. The "proxy"
+    // action resolves to the balancer in multi-node configs and to the single
+    // node tag in single-node configs, exactly like the catch-all does.
+    const translated = options.routingRules?.length
+        ? (0, rules_1.translateXrayRules)(options.routingRules, { multi: !singleManual, finalTag, customTags: new Set(customOutbounds.map((item) => String(item.tag))) })
+        : { rules: [], needsDirect: false, needsBlock: false };
+    // Freedom/blackhole are created on demand by direct/block actions, but only
+    // when no outbound with that tag exists yet (e.g. the opt-in fallback
+    // already provides freedom) — never duplicated.
+    const existingTags = new Set([...proxyTags, ...(options.allowDirectFallback ? ["direct"] : [])]);
+    const onDemand = [];
+    if (translated.needsDirect && !existingTags.has("direct")) {
+        onDemand.push(freedomOutbound(gen));
+        existingTags.add("direct");
+    }
+    if (translated.needsBlock && !existingTags.has("block")) {
+        onDemand.push(blackholeOutbound(gen));
+        existingTags.add("block");
+    }
+    // F1: the balancer fallback tag resolves here, where the pool is known.
+    // Precedence: explicit fallbackTag > fallbackNode > allowDirectFallback.
+    const fallbackTag = singleManual ? undefined : (0, generator_options_1.resolveXrayFallbackTag)({ fallbackNode: options.fallbackNode ?? null, fallbackTag: options.fallbackTag, allowDirectFallback: options.allowDirectFallback }, proxyTags);
+    const dnsInbound = options.xrayDnsInbound;
+    const routingDomainStrategy = gen?.routingDomainStrategy ?? "AsIs";
+    const routing = singleManual
+        ? { domainStrategy: routingDomainStrategy, rules: [...(dnsInbound ? [dnsInbound.rule] : []), ...translated.rules, { type: "field", inboundTag: inboundTagsFor(gen), outboundTag: finalTag }] }
+        : {
+            domainStrategy: routingDomainStrategy,
+            rules: [...(dnsInbound ? [dnsInbound.rule] : []), ...translated.rules, { type: "field", inboundTag: inboundTagsFor(gen), balancerTag: "proxy-balancer" }],
+            balancers: [{
+                    tag: "proxy-balancer",
+                    selector: ["proxy-"],
+                    strategy: { type: strategy === "leastPing" ? "leastPing" : "roundRobin" },
+                    ...(fallbackTag ? { fallbackTag } : {}),
+                }],
+        };
+    const dnsSection = options.xrayDns ?? { servers: ["https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"], disableFallback: true };
+    const inboundSockopt = gen ? (0, generator_options_1.buildXrayInboundSockopt)(gen) : undefined;
+    return {
+        log: { loglevel: gen ? ((0, generator_options_1.xrayLogLevel)(gen.logLevel) ?? "warning") : "warning" },
+        dns: {
+            servers: [...dnsSection.servers],
+            disableFallback: dnsSection.disableFallback,
+            ...(dnsSection.queryStrategy ? { queryStrategy: dnsSection.queryStrategy } : {}),
+        },
+        ...(options.xrayFakeDns ? options.xrayFakeDns : {}),
+        ...(observatory ? { observatory } : {}),
+        inbounds: [
+            ...buildXrayInbounds(options, needsSniffing, fakeDnsOn, inboundSockopt),
+            ...(dnsInbound ? [dnsInbound.inbound] : []),
+        ],
+        outbounds: [
+            ...outbounds,
+            ...(options.allowDirectFallback ? [freedomOutbound(gen)] : []),
+            ...customOutbounds,
+            ...onDemand,
+            ...(dnsInbound ? [dnsInbound.outbound] : []),
+        ],
+        routing,
+    };
+}
+// (4) inbound type: socks (default) / http / both. HTTP inbound uses port
+// 10809 so it never collides with the SOCKS port; the catch-all routing rule
+// matches every configured inbound tag.
+function inboundTagsFor(gen) {
+    const type = gen?.inboundType ?? "socks";
+    if (type === "http")
+        return ["http-in"];
+    if (type === "both")
+        return ["socks-in", "http-in"];
+    return ["socks-in"];
+}
+function buildXrayInbounds(options, needsSniffing, fakeDnsOn, inboundSockopt) {
+    const gen = options.generatorOptions;
+    const type = gen?.inboundType ?? "socks";
+    const sniffing = needsSniffing
+        ? { enabled: true, destOverride: fakeDnsOn ? ["http", "tls", "quic", "fakedns"] : ["http", "tls", "quic"], routeOnly: true }
+        : { enabled: false };
+    const inbounds = [];
+    if (type === "socks" || type === "both") {
+        inbounds.push({
+            tag: "socks-in",
+            listen: options.listen ?? "127.0.0.1",
+            port: options.socksPort ?? 10808,
+            protocol: "socks",
+            // Trojan supports UDP association in Xray just as VLESS does; gating this on the
+            // presence of a VLESS node silently disabled all UDP for Trojan-only bundles (audit F2).
+            settings: { auth: "noauth", udp: true },
+            sniffing,
+            ...(inboundSockopt ? { streamSettings: { sockopt: inboundSockopt } } : {}),
+        });
+    }
+    if (type === "http" || type === "both") {
+        inbounds.push({
+            tag: "http-in",
+            listen: options.listen ?? "127.0.0.1",
+            port: 10809,
+            protocol: "http",
+            settings: { auth: "noauth" },
+            sniffing,
+            ...(inboundSockopt ? { streamSettings: { sockopt: inboundSockopt } } : {}),
+        });
+    }
+    return inbounds;
+}
+function buildXrayConfig(nodes, options = {}) {
+    return configWithOutbounds(nodes, options);
+}
+function buildXrayBestPingConfig(nodes, options = {}) {
+    return configWithOutbounds(nodes, { ...options, strategy: "leastPing" });
+}
+function buildXrayFragmentConfig(nodes, profiles, strategy, options = {}) {
+    if (!profiles.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment output requires at least one fragment profile");
+    // SCAN-16: the node x profile expansion lives in profiles.ts now —
+    // this builder used to inline a second copy of the same loop.
+    const expanded = (0, profiles_1.expandXrayFragments)(nodes, profiles);
+    if (!expanded.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment output requires at least one TLS-compatible node");
+    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.generatorOptions));
+    // Fragment artifacts are TLS-node x profile matrices by definition: pool
+    // outbounds (Warp) do not join them.
+    return configWithOutbounds(expanded.map((item) => item.node), { ...options, strategy, poolOutbounds: [] }, outbounds);
+}
+function buildXrayBestFragmentConfig(nodes, profiles, options = {}) {
+    return buildXrayFragmentConfig(nodes, profiles, "leastPing", options);
+}
+function buildXrayBestPingFragmentConfig(nodes, profiles, options = {}) {
+    return buildXrayFragmentConfig(nodes, profiles, "leastPing", options);
+}
+
+};
+
+__m["output/profiles"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getXrayFragmentProfiles = getXrayFragmentProfiles;
+exports.getSingboxFragmentProfiles = getSingboxFragmentProfiles;
+exports.isProfileSupported = isProfileSupported;
+exports.expandXrayFragments = expandXrayFragments;
+exports.expandSingboxFragments = expandSingboxFragments;
+const errors_1 = __r("../core/errors");
+const DEFAULT_XRAY_FRAGMENTS = [
+    { id: "f01", packets: "1-3", lengths: ["1-5"], delays: ["1-1"] },
+    { id: "f02", packets: "1-3", lengths: ["1-10"], delays: ["1-1"] },
+    { id: "f03", packets: "1-3", lengths: ["10-20"], delays: ["1-1"] },
+    { id: "f04", packets: "1-3", lengths: ["20-30"], delays: ["1-1"] },
+    { id: "f05", packets: "1-3", lengths: ["30-40"], delays: ["1-1"] },
+    { id: "f06", packets: "1-3", lengths: ["40-50"], delays: ["1-1"] },
+    { id: "f07", packets: "1-3", lengths: ["50-60"], delays: ["1-1"] },
+    { id: "f08", packets: "1-3", lengths: ["60-70"], delays: ["1-1"] },
+    { id: "f09", packets: "1-3", lengths: ["70-80"], delays: ["1-1"] },
+    { id: "f10", packets: "1-3", lengths: ["80-90"], delays: ["1-1"] },
+    { id: "f11", packets: "1-3", lengths: ["90-100"], delays: ["1-1"] },
+    { id: "f12", packets: "1-3", lengths: ["10-30"], delays: ["1-1"] },
+    { id: "f13", packets: "1-3", lengths: ["20-40"], delays: ["1-1"] },
+    { id: "f14", packets: "1-3", lengths: ["30-50"], delays: ["1-1"] },
+    { id: "f15", packets: "1-3", lengths: ["40-60"], delays: ["1-1"] },
+    { id: "f16", packets: "1-3", lengths: ["50-70"], delays: ["1-1"] },
+    { id: "f17", packets: "1-3", lengths: ["60-80"], delays: ["1-1"] },
+    { id: "f18", packets: "1-3", lengths: ["70-90"], delays: ["1-1"] },
+    { id: "f19", packets: "1-3", lengths: ["80-100"], delays: ["1-1"] },
+    { id: "f20", packets: "tlshello", lengths: ["100-200"], delays: ["1-1"] },
+];
+const DEFAULT_SINGBOX_FRAGMENTS = [
+    { id: "fragment", fragment: true },
+    { id: "record", recordFragment: true },
+];
+const MAX_FRAGMENT_DELAY_MS = 60_000;
+const MAX_FRAGMENT_SPLITS = 64;
+function rangeBounds(value) {
+    const match = value.match(/^(\d+)(?:-(\d+))?$/);
+    if (!match)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Internal fragment range parsing failure");
+    const first = Number(match[1]);
+    const second = match[2] === undefined ? first : Number(match[2]);
+    return [first, second];
+}
+function parseRange(value, field, bounds = {}) {
+    if (typeof value !== "string" || !value.trim())
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must be a non-empty range`);
+    const normalized = value.trim();
+    if (!/^(\d+)(?:-(\d+))?$/.test(normalized))
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must be an integer or integer range`);
+    const [first, second] = rangeBounds(normalized);
+    const min = bounds.min ?? 0;
+    const max = bounds.max ?? 2_147_483_647;
+    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(second) || first < min || second < first || second > max) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must be within the supported range ${min}..${max}`);
+    }
+    return normalized;
+}
+function parseRangeList(value, field, bounds = {}, maxItems = 16) {
+    const list = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[|,]+/) : [];
+    if (!list.length || list.length > maxItems)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must contain 1..${maxItems} ranges`);
+    return list.map((item) => parseRange(item, field, bounds));
+}
+function normalizeXrayProfile(value, index) {
+    if (!value || typeof value !== "object")
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES[${index}] must be an object`);
+    const raw = value;
+    const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) : `f${index + 1}`;
+    const packets = raw.packets === "tlshello" ? "tlshello" : raw.packets === "1-3" ? "1-3" : null;
+    if (!packets)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES[${index}].packets must be 1-3 or tlshello`);
+    const field = `CORE_FRAGMENT_PROFILES[${index}]`;
+    // CORRECTED (was DS-M11, contradicted by the current FinalMask doc):
+    // the current Xray FinalMask doc shows the PLURAL array form
+    // (lengths/delays arrays) as canonical, and the builder emits exactly
+    // that (see src/output/xray/index.ts). The old singular-only claim is
+    // superseded. Multi-range profiles are still rejected here (maxItems 1)
+    // as a generator policy — one range per profile keeps the node x profile
+    // matrix predictable — not because the core cannot parse more.
+    const lengths = parseRangeList(raw.lengths, `${field}.lengths`, packets === "tlshello" ? { min: 1 } : {}, 1);
+    if (packets === "1-3" && rangeBounds(lengths[lengths.length - 1])[0] === 0) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field}.lengths: the final range must be positive; a final zero can idle indefinitely`);
+    }
+    return {
+        id,
+        packets,
+        lengths,
+        // A zero delay is valid in FinalMask; cap the upper bound to avoid pathological stalls.
+        delays: parseRangeList(raw.delays, `${field}.delays`, { min: 0, max: MAX_FRAGMENT_DELAY_MS }, 1),
+        // FinalMask defines maxSplit=0 as unlimited. This generator intentionally requires a finite
+        // positive bound so custom profiles cannot opt into unbounded splitting by mistake.
+        ...(raw.maxSplit === undefined || raw.maxSplit === null || raw.maxSplit === "" ? {} : { maxSplit: parseRange(raw.maxSplit, `${field}.maxSplit`, { min: 1, max: MAX_FRAGMENT_SPLITS }) }),
+    };
+}
+function parseProfileJson(raw) {
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed))
+            throw new Error("must be an array");
+        return parsed.map(normalizeXrayProfile);
+    }
+    catch (error) {
+        if (error instanceof errors_1.CoreError)
+            throw error;
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES contains invalid JSON: ${error instanceof Error ? error.message : "invalid JSON"}`);
+    }
+}
+function getXrayFragmentProfiles(env) {
+    const raw = env.CORE_FRAGMENT_PROFILES?.trim();
+    if (!raw)
+        return DEFAULT_XRAY_FRAGMENTS;
+    if (raw.startsWith("[")) {
+        const profiles = parseProfileJson(raw) ?? [];
+        if (!profiles.length)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_FRAGMENT_PROFILES must contain at least one profile");
+        if (profiles.length > 32)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_FRAGMENT_PROFILES supports at most 32 profiles");
+        ensureUniqueProfileIds(profiles);
+        return profiles;
+    }
+    // Compact text form:
+    // id|packets|lengths|delays|[maxSplit];id|packets|lengths|delays|[maxSplit]
+    const profiles = raw.split(";").map((chunk, index) => {
+        const parts = chunk.split("|").map((item) => item.trim());
+        if (parts.length < 4 || parts.length > 5)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES entry ${index + 1} must be id|packets|lengths|delays|[maxSplit]`);
+        return normalizeXrayProfile({ id: parts[0], packets: parts[1], lengths: parts[2], delays: parts[3], ...(parts[4] ? { maxSplit: parts[4] } : {}) }, index);
+    }).filter(Boolean);
+    if (!profiles.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_FRAGMENT_PROFILES must contain at least one profile");
+    if (profiles.length > 32)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_FRAGMENT_PROFILES supports at most 32 profiles");
+    ensureUniqueProfileIds(profiles);
+    return profiles;
+}
+function ensureUniqueProfileIds(profiles) {
+    const seen = new Set();
+    for (const profile of profiles) {
+        if (seen.has(profile.id))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Duplicate fragment profile id after normalization: ${profile.id}`);
+        seen.add(profile.id);
+    }
+}
+function getSingboxFragmentProfiles() {
+    return DEFAULT_SINGBOX_FRAGMENTS;
+}
+function isProfileSupported(target, kind) {
+    if (kind === "best-ping")
+        return true;
+    if (target === "clash" || target === "surge")
+        return false;
+    return kind === "best-fragment" || kind === "best-ping-fragment";
+}
+function expandXrayFragments(nodes, profiles) {
+    const out = [];
+    for (const node of nodes) {
+        if (node.security !== "tls")
+            continue;
+        for (const profile of profiles) {
+            out.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
+        }
+    }
+    return out;
+}
+function expandSingboxFragments(nodes, profiles) {
+    const out = [];
+    for (const node of nodes) {
+        if (node.security !== "tls")
+            continue;
+        for (const profile of profiles)
+            out.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
+    }
+    return out;
 }
 
 };
@@ -6981,8 +10516,10 @@ exports.buildSingboxBestPingConfig = buildSingboxBestPingConfig;
 exports.buildSingboxBestFragmentConfig = buildSingboxBestFragmentConfig;
 exports.buildSingboxBestPingFragmentConfig = buildSingboxBestPingFragmentConfig;
 const errors_1 = __r("../../core/errors");
+const profiles_1 = __r("../profiles");
 const share_link_1 = __r("../share-link");
 const rules_1 = __r("../rules");
+const generator_options_1 = __r("../generator-options");
 // Custom outbounds are validated here as well as at startup: startup cannot
 // know the generated node tags (proxy-N), so the render-time check closes the
 // collision gap. Order is preserved: custom outbounds follow node outbounds.
@@ -7001,15 +10538,17 @@ function validateCustomOutbounds(items, proxyTags) {
     }
     return [...items];
 }
-function outbound(node, index, fragmentProfile, _useUtls = false) {
+function outbound(node, index, fragmentProfile, _useUtls = false, gen, ech) {
     // _useUtls is retained for call-site compatibility only. The selected TLS fingerprint is
     // a first-class output selection: sing-box previously emitted uTLS only when a separate
     // opt-in flag was set, silently dropping the fingerprint Xray/Mihomo always emit (audit F3).
+    const dial = gen ? (0, generator_options_1.buildSingboxDial)(gen) : undefined;
     const base = {
         type: node.protocol,
         tag: `proxy-${index}`,
         server: node.server,
         server_port: node.port,
+        ...(dial ? dial : {}),
     };
     if (node.protocol === "vless")
         base.uuid = node.credential;
@@ -7020,11 +10559,12 @@ function outbound(node, index, fragmentProfile, _useUtls = false) {
     if (node.security === "tls") {
         base.tls = {
             enabled: true,
-            server_name: node.tls?.serverName || node.server,
+            server_name: gen ? (0, generator_options_1.effectiveSni)(node.tls?.serverName, node.server, node.name, gen) : (node.tls?.serverName || node.server),
             ...(node.tls?.alpn?.length ? { alpn: node.tls.alpn } : {}),
             ...(node.tls?.fingerprint ? { utls: { enabled: true, fingerprint: node.tls.fingerprint === "randomized" ? "random" : node.tls.fingerprint } } : {}),
             ...(fragmentProfile?.fragment ? { fragment: true } : {}),
             ...(fragmentProfile?.recordFragment ? { record_fragment: true } : {}),
+            ...(ech ? { ech } : {}),
         };
     }
     base.transport = {
@@ -7038,8 +10578,10 @@ function outbound(node, index, fragmentProfile, _useUtls = false) {
 function baseConfig(outbounds, proxyTags, options) {
     if (!proxyTags.length)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "Sing-box output requires at least one node");
-    const strategy = options.strategy ?? (proxyTags.length === 1 ? "manual" : "manual");
-    const routing = strategy === "manual" && proxyTags.length === 1
+    const gen = options.generatorOptions;
+    const strategy = options.strategy ?? "manual";
+    const singleManual = strategy === "manual" && proxyTags.length === 1;
+    const routing = singleManual
         ? { final: proxyTags[0] }
         : { final: "proxy" };
     const customOutbounds = validateCustomOutbounds(options.customOutbounds ?? [], proxyTags);
@@ -7064,12 +10606,14 @@ function baseConfig(outbounds, proxyTags, options) {
             outbounds: [...proxyTags],
             default: proxyTags[0],
         };
-    // sing-box has no `udp` toggle on the SOCKS inbound (UDP association is inherent to its
-    // SOCKS5 implementation); the field is not in the sing-box schema and risks rejection by
-    // strict validation (audit F12).
+    // (4) inbound type: socks (default) / http / both (mixed). sing-box has no
+    // `udp` toggle on the SOCKS inbound (UDP association is inherent to its
+    // SOCKS5 implementation); the field is not in the sing-box schema and risks
+    // rejection by strict validation (audit F12).
+    const inboundType = gen?.inboundType ?? "socks";
     const inbounds = [{
-            type: "socks",
-            tag: "socks-in",
+            type: inboundType === "both" ? "mixed" : inboundType,
+            tag: inboundType === "both" ? "mixed-in" : inboundType === "http" ? "http-in" : "socks-in",
             listen: "127.0.0.1",
             listen_port: options.socksPort ?? 2080,
         }];
@@ -7082,21 +10626,30 @@ function baseConfig(outbounds, proxyTags, options) {
             auto_detect_interface: true,
         });
     }
+    const dnsSection = options.singboxDns ?? {
+        servers: [
+            { type: "https", tag: "doh-cf", server: "1.1.1.1", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "cloudflare-dns.com" } },
+            { type: "https", tag: "doh-google", server: "8.8.8.8", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "dns.google" } },
+        ],
+        final: "doh-cf",
+    };
+    const dial = gen ? (0, generator_options_1.buildSingboxDial)(gen) : undefined;
     return {
-        log: { level: "warn" },
+        log: { level: gen ? ((0, generator_options_1.singboxLogLevel)(gen.logLevel) ?? "warn") : "warn" },
         dns: {
-            servers: [
-                { type: "https", tag: "doh-cf", server: "1.1.1.1", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "cloudflare-dns.com" } },
-                { type: "https", tag: "doh-google", server: "8.8.8.8", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "dns.google" } },
-            ],
-            final: "doh-cf",
+            servers: dnsSection.servers,
+            ...(dnsSection.rules ? { rules: dnsSection.rules } : {}),
+            ...(dnsSection.strategy ? { strategy: dnsSection.strategy } : {}),
+            final: dnsSection.final,
         },
         inbounds,
         outbounds: [
             ...outbounds,
             ...customOutbounds,
-            group,
-            { type: "direct", tag: "direct" },
+            // R-6: a single-node manual config used to emit an orphaned `proxy`
+            // selector group that nothing referenced. Omit it in exactly that case.
+            ...(singleManual ? [] : [group]),
+            { type: "direct", tag: "direct", ...(dial ? dial : {}) },
         ],
         route: {
             ...(userRules.length ? { rules: userRules } : {}),
@@ -7107,48 +10660,45 @@ function baseConfig(outbounds, proxyTags, options) {
             // sing-box core) and the legacy behavior is removed in sing-box 1.14.
             // Point the route default at this config's own final DNS server so
             // every outbound resolves through it; a per-outbound `domain_resolver`
-            // can still override this default.
-            default_domain_resolver: "doh-cf",
+            // can still override this default. (The tag form is used here; the
+            // migration doc shows the object form as canonical for the route
+            // default, but the tag form was not disproven for outbound resolvers
+            // and is what this config's own DNS section defines.)
+            default_domain_resolver: dnsSection.final,
             auto_detect_interface: true,
         },
     };
 }
 function buildSingboxConfig(nodes, socksPortOrOptions = 2080) {
     const options = typeof socksPortOrOptions === "number" ? { socksPort: socksPortOrOptions } : socksPortOrOptions;
-    const outbounds = nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, options.useUtls));
-    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), options);
+    const gen = options.generatorOptions;
+    const outbounds = nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, options.useUtls, gen, options.singboxEch));
+    const pool = [...(options.poolOutbounds ?? [])];
+    return baseConfig([...outbounds, ...pool], [...outbounds.map((item) => String(item.tag)), ...pool.map((item) => String(item.tag))], options);
 }
 function buildSingboxBestPingConfig(nodes, options = {}) {
-    const outbounds = nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, options.useUtls));
-    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
+    const gen = options.generatorOptions;
+    const outbounds = nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, options.useUtls, gen, options.singboxEch));
+    const pool = [...(options.poolOutbounds ?? [])];
+    return baseConfig([...outbounds, ...pool], [...outbounds.map((item) => String(item.tag)), ...pool.map((item) => String(item.tag))], { ...options, strategy: "urltest" });
 }
 function buildSingboxBestFragmentConfig(nodes, profiles, options = {}) {
-    const expanded = [];
-    for (const node of nodes) {
-        if (node.security !== "tls")
-            continue;
-        for (const profile of profiles)
-            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
-    }
+    // SCAN-16: shared expander from profiles.ts (see the Xray builder).
+    const expanded = (0, profiles_1.expandSingboxFragments)(nodes, profiles);
     if (!expanded.length)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "Best Fragment requires at least one TLS-compatible node");
-    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.useUtls));
+    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.useUtls, options.generatorOptions, options.singboxEch));
     // "Best Fragment" must actually select: a manual selector never tests the fragment
     // variants, diverging from the Xray leastPing semantics of the same artifact (audit F4).
     // urltest over the expanded variants mirrors Best Ping Fragment, as in Xray's alias pair.
     return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
 }
 function buildSingboxBestPingFragmentConfig(nodes, profiles, options = {}) {
-    const expanded = [];
-    for (const node of nodes) {
-        if (node.security !== "tls")
-            continue;
-        for (const profile of profiles)
-            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
-    }
+    // SCAN-16: shared expander from profiles.ts (see the Xray builder).
+    const expanded = (0, profiles_1.expandSingboxFragments)(nodes, profiles);
     if (!expanded.length)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "Best Ping Fragment requires at least one TLS-compatible node");
-    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.useUtls));
+    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.useUtls, options.generatorOptions, options.singboxEch));
     return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
 }
 
@@ -7162,6 +10712,7 @@ exports.buildClashBestPingConfig = buildClashBestPingConfig;
 const share_link_1 = __r("../share-link");
 const errors_1 = __r("../../core/errors");
 const rules_1 = __r("../rules");
+const generator_options_1 = __r("../generator-options");
 function yamlString(value) {
     // JSON double-quoted strings are valid YAML double-quoted scalars and correctly escape control characters.
     return JSON.stringify(value);
@@ -7258,6 +10809,10 @@ function validateCustomProxies(items, nodeNames) {
         const name = item.name;
         if (typeof name !== "string" || !name)
             throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Clash proxy requires a non-empty name");
+        // SCAN-12 (cleared as an injection: the emitter quotes every string):
+        // a modest length cap remains as hygiene for operator-supplied names.
+        if (name.length > 128)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Clash proxy name '${name.slice(0, 32)}…' exceeds 128 characters`);
         if (seen.has(name))
             throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Clash proxy name '${name}' is duplicated`);
         seen.add(name);
@@ -7269,7 +10824,7 @@ function validateCustomProxies(items, nodeNames) {
     }
     return [...items];
 }
-function nodeYaml(node) {
+function nodeYaml(node, gen) {
     const lines = [
         `  - name: ${yamlString(node.name)}`,
         `    type: ${node.protocol}`,
@@ -7289,7 +10844,7 @@ function nodeYaml(node) {
     lines.push("    udp: true");
     if (node.security === "tls") {
         lines.push("    tls: true");
-        const tlsServerName = yamlString(node.tls?.serverName || node.server);
+        const tlsServerName = yamlString(gen ? (0, generator_options_1.effectiveSni)(node.tls?.serverName, node.server, node.name, gen) : (node.tls?.serverName || node.server));
         lines.push(`    ${node.protocol === "trojan" ? "sni" : "servername"}: ${tlsServerName}`);
         if (node.tls?.alpn?.length) {
             lines.push("    alpn:");
@@ -7309,16 +10864,19 @@ function nodeYaml(node) {
         lines.push("      headers:", `        Host: ${yamlString(node.websocket.host)}`);
     return lines;
 }
-function baseYaml(nodes, groupType, groupUrl, interval, tolerance, mixedPort = 7890, optionsEnableTunPlaceholder = false, routingRules = [], customProxies = []) {
+function baseYaml(nodes, groupType, opts) {
     if (!nodes.length)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "Mihomo output requires at least one node");
-    const custom = validateCustomProxies(customProxies, nodes.map((node) => node.name));
+    const gen = opts.generatorOptions;
+    const custom = validateCustomProxies(opts.customOutbounds ?? [], nodes.map((node) => node.name));
+    const pool = validateCustomProxies(opts.poolOutbounds ?? [], nodes.map((node) => node.name));
     // User rules come first; MATCH,PROXY stays last. Custom proxies are peers
     // of node proxies and are deliberately NOT added to the PROXY group (v1:
-    // reachable only via rules). GEOSITE/AND lines mean this output targets
-    // Mihomo, not original Clash Premium (documented in OUTPUTS.md).
-    const ruleLines = routingRules.length
-        ? (0, rules_1.translateClashRules)(routingRules, { proxyGroup: "PROXY", customNames: new Set(custom.map((item) => String(item.name))) })
+    // reachable only via rules). Pool proxies (Warp) ARE group members.
+    // GEOSITE/AND lines mean this output targets Mihomo, not original Clash
+    // Premium (documented in OUTPUTS.md).
+    const ruleLines = (opts.routingRules ?? []).length
+        ? (0, rules_1.translateClashRules)(opts.routingRules ?? [], { proxyGroup: "PROXY", customNames: new Set([...custom, ...pool].map((item) => String(item.name))) })
         : [];
     // DS-L24: GEOSITE lines and AND(...) multi-matcher lines are Mihomo-only
     // (original Clash Premium has neither). Flag the file in-band so an
@@ -7326,27 +10884,47 @@ function baseYaml(nodes, groupType, groupUrl, interval, tolerance, mixedPort = 7
     // of silently unsupported rules; the matching manifest entry is added
     // in artifacts.ts.
     const needsMihomo = ruleLines.some((line) => line.startsWith("GEOSITE,") || line.startsWith("AND,"));
+    const port = opts.mixedPort ?? 7890;
+    // (4) inbound type: socks-port / port (http) / mixed-port (both, current).
+    const inboundType = gen?.inboundType ?? "both";
+    const inboundLine = inboundType === "socks" ? `socks-port: ${port}` : inboundType === "http" ? `port: ${port}` : `mixed-port: ${port}`;
+    const logLevel = gen ? (0, generator_options_1.clashLogLevel)(gen.logLevel) : undefined;
     const lines = [
         ...(needsMihomo ? ["# Requires Mihomo (not original Clash Premium)"] : []),
-        `mixed-port: ${mixedPort}`,
+        ...(logLevel ? [`log-level: ${logLevel}`] : []),
+        inboundLine,
         "allow-lan: false",
         "mode: rule",
         "proxies:",
     ];
     for (const node of nodes)
-        lines.push(...nodeYaml(node));
+        lines.push(...nodeYaml(node, gen));
     for (const proxy of custom)
+        lines.push(...proxyYamlLines(proxy));
+    for (const proxy of pool)
         lines.push(...proxyYamlLines(proxy));
     lines.push("proxy-groups:", "  - name: PROXY", `    type: ${groupType}`, "    proxies:");
     for (const node of nodes)
         lines.push(`      - ${yamlString(node.name)}`);
+    for (const proxy of pool)
+        lines.push(`      - ${yamlString(String(proxy.name))}`);
     if (groupType === "url-test") {
-        lines.push(`    url: ${yamlString(groupUrl ?? "https://www.gstatic.com/generate_204")}`);
-        lines.push(`    interval: ${interval ?? 30}`);
-        lines.push(`    tolerance: ${tolerance ?? 50}`);
+        lines.push(`    url: ${yamlString(opts.probeUrl ?? "https://www.gstatic.com/generate_204")}`);
+        lines.push(`    interval: ${opts.interval ?? 30}`);
+        lines.push(`    tolerance: ${opts.tolerance ?? 50}`);
     }
-    lines.push("dns:", "  enable: true", "  ipv6: true", "  enhanced-mode: fake-ip", "  nameserver:", "    - https://cloudflare-dns.com/dns-query", "    - https://dns.google/dns-query", "  fallback:", "    - tls://1.1.1.1:853", "    - tls://8.8.8.8:853", "  respect-rules: true");
-    if (optionsEnableTunPlaceholder) {
+    // R-8: default-nameserver / proxy-server-nameserver are now emitted (with
+    // the CORRECTED rationale: default-nameserver must be plain IPs that
+    // resolve the DoH/DoT server domains at startup — it is NOT system DNS).
+    // fake-ip-range / fake-ip-filter appear only when fake DNS is enabled.
+    const dns = opts.clashDns ?? {
+        nameserver: ["https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"],
+        fallback: ["tls://1.1.1.1:853", "tls://8.8.8.8:853"],
+        defaultNameserver: ["1.1.1.1", "8.8.8.8"],
+        proxyServerNameserver: ["1.1.1.1", "8.8.8.8"],
+    };
+    lines.push("dns:", "  enable: true", "  ipv6: true", "  enhanced-mode: fake-ip", ...(dns.defaultNameserver.length ? ["  default-nameserver:", ...dns.defaultNameserver.map((s) => `    - ${s}`)] : []), ...(dns.proxyServerNameserver.length ? ["  proxy-server-nameserver:", ...dns.proxyServerNameserver.map((s) => `    - ${s}`)] : []), "  nameserver:", ...dns.nameserver.map((s) => `    - ${s}`), "  fallback:", ...dns.fallback.map((s) => `    - ${s}`), ...(dns.fakeIpRange ? [`  fake-ip-range: ${dns.fakeIpRange}`] : []), ...(dns.fakeIpFilter?.length ? ["  fake-ip-filter:", ...dns.fakeIpFilter.map((s) => `    - ${s}`)] : []), "  respect-rules: true");
+    if (opts.enableTun) {
         lines.push("tun:", "  enable: true", "  stack: system", "  auto-route: true", "  auto-detect-interface: true", "  dns-hijack:", "    - any:53");
     }
     lines.push("rules:");
@@ -7357,10 +10935,10 @@ function baseYaml(nodes, groupType, groupUrl, interval, tolerance, mixedPort = 7
 }
 function buildClashConfig(nodes, options = 7890) {
     const config = typeof options === "number" ? { mixedPort: options } : options;
-    return baseYaml(nodes, config.groupStrategy ?? "select", config.probeUrl, config.interval, config.tolerance, config.mixedPort ?? 7890, config.enableTun ?? false, config.routingRules ?? [], config.customOutbounds ?? []);
+    return baseYaml(nodes, config.groupStrategy ?? "select", config);
 }
 function buildClashBestPingConfig(nodes, options = {}) {
-    return baseYaml(nodes, "url-test", options.probeUrl, options.interval, options.tolerance, options.mixedPort ?? 7890, options.enableTun ?? false, options.routingRules ?? [], options.customOutbounds ?? []);
+    return baseYaml(nodes, "url-test", options);
 }
 
 };
@@ -7422,8 +11000,12 @@ function runtimeFor(env) {
     // regardless of EGRESS_MODE: previously EGRESS_MODE=direct with a
     // proxyip/nat64 rule passed startup validation and reported ready, yet
     // every matching session failed with ROUTE_FAILED because no dialer was
-    // registered. Providers that are genuinely unconfigured still yield
-    // ROUTE_FAILED (the registry simply has no such dialer), and the router's
+    // registered. PR-5 correction: the "genuinely unconfigured yields
+    // ROUTE_FAILED" claim holds only for relay (not registered when
+    // endpoints are absent). For proxyip the pool constructor throws
+    // CONFIGURATION_ERROR on zero endpoints, so a proxyip rule with no
+    // ProxyIP configured fails at runtime construction (startup), not
+    // per-session — safer than the comment previously claimed. The router's
     // mode switch is untouched, so non-rule traffic keeps its mode behavior.
     // The NAT64 default (WKP) counts as available prefixes here, matching the
     // previous nat64/smart defaulting; startup validation still rejects a
@@ -7467,7 +11049,14 @@ exports.EgressRegistry = void 0;
 const errors_1 = __r("../core/errors");
 class EgressRegistry {
     items = new Map();
-    register(dialer) { this.items.set(dialer.type, dialer); }
+    // EG-13c: a duplicate registration used to silently replace a dialer.
+    // Fail closed instead — the runtime registers each type once, so a
+    // duplicate is always a wiring bug, never intentional.
+    register(dialer) {
+        if (this.items.has(dialer.type))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Egress type '${dialer.type}' is already registered`);
+        this.items.set(dialer.type, dialer);
+    }
     get(type) { return this.items.get(type); }
     require(type) {
         const dialer = this.get(type);
@@ -7677,6 +11266,9 @@ class EnvironmentCredentialProvider {
             }
             catch { /* Ignore malformed configuration entries. */ }
         }
+        // CFG-3: same comma/newline split + trim as validation (see
+        // validateUsers) — commas and surrounding whitespace are list
+        // syntax, not password content, in both layers identically.
         for (const item of (env.TROJAN_USERS ?? "").split(/[,\r\n]+/)) {
             const value = item.trim();
             if (!value)
@@ -7742,6 +11334,13 @@ class CredentialRepository {
         catch (error) {
             if (this.mode === "d1" || !this.fallback)
                 throw error;
+            // SEC-7: never spend a fallback auth attempt on an already-aborted
+            // request — an abort is not a D1 outage. (A genuine D1 outage still
+            // falls back: hybrid is a union, and env members are legitimate
+            // hybrid members; the outage itself surfaces via diagnostics and
+            // the D1 provider's own failure counters.)
+            if (signal.aborted)
+                throw signal.reason;
             return this.fallback.authenticate(protocol, credential, signal);
         }
     }
@@ -7752,11 +11351,17 @@ class CredentialRepository {
             return this.primary.list?.(protocol, signal) ?? [];
         // Legacy full-list API is retained for callers that explicitly request it.
         // Pagination itself never needs to materialize this combined list.
+        // SEC-3: one shared primary-key scan per walk, not one per page.
+        // Freshness is preserved across calls (each list() recomputes); only
+        // within one walk are keys reused, so a D1 mutation mid-walk is
+        // visible on the next walk, not the current one — the accepted trade
+        // for dropping the O(N^2/256) re-scan.
+        const sharedKeys = this.mode === "hybrid" && this.fallback ? this.getPrimaryKeys(protocol, signal) : undefined;
         const output = [];
         const pageSize = 256;
         let offset = 0;
         while (true) {
-            const page = await this.listPage(protocol, offset, pageSize, signal);
+            const page = await this.listPage(protocol, offset, pageSize, signal, sharedKeys);
             output.push(...page);
             if (page.length < pageSize)
                 return output;
@@ -7794,7 +11399,10 @@ class CredentialRepository {
         }
         return primaryCount + uniqueFallback;
     }
-    async listPage(protocol, offset, limit, signal) {
+    // The 5th parameter is internal (not part of CredentialProvider):
+    // list() passes one shared key-scan promise per walk (SEC-3). Direct
+    // callers omit it and get the previous per-call scan.
+    async listPage(protocol, offset, limit, signal, sharedKeys) {
         if (offset < 0 || limit <= 0)
             return [];
         if (this.mode === "env")
@@ -7815,9 +11423,23 @@ class CredentialRepository {
             // returned only the 100 D1 records) while count() reported 150.
             // A full primary page needs no fallback records, and a window that
             // does not reach the primary end cannot be filled yet.
-            if (primaryPage.length >= limit || offset + primaryPage.length < primaryCount)
+            if (primaryPage.length >= limit)
                 return primaryPage;
-            const primaryKeys = await this.getPrimaryKeys(protocol, signal);
+            if (offset + primaryPage.length < primaryCount) {
+                // SEC-2: count() and listPage() are separate calls, so a
+                // concurrent D1 delete between them leaves primaryCount
+                // stale-high and a genuinely-terminal short page looking
+                // mid-list — returning it would drop the fallback tail (list()
+                // stops at a short page). Re-read the count once on the short
+                // path only (full pages never pay for it); if the fresh count
+                // still says mid-list, return the page. Residual window: a
+                // delete between the re-count and the fill below — vanishingly
+                // narrow, and each list() page re-checks.
+                const freshCount = await this.primary.count?.(protocol, signal) ?? primaryCount;
+                if (offset + primaryPage.length < freshCount)
+                    return primaryPage;
+            }
+            const primaryKeys = await (sharedKeys ?? this.getPrimaryKeys(protocol, signal));
             const out = [...primaryPage];
             const pageSize = Math.max(256, Math.min(1024, limit * 4));
             for (let sourceOffset = 0; out.length < limit; sourceOffset += pageSize) {
@@ -7839,7 +11461,7 @@ class CredentialRepository {
             }
             return out;
         }
-        const primaryKeys = await this.getPrimaryKeys(protocol, signal);
+        const primaryKeys = await (sharedKeys ?? this.getPrimaryKeys(protocol, signal));
         let logicalOffset = offset - primaryCount;
         const out = [];
         const pageSize = Math.max(256, Math.min(1024, limit * 4));
@@ -7914,14 +11536,18 @@ class KVJsonStore {
 exports.KVJsonStore = KVJsonStore;
 function credentialMode(env) {
     const mode = env.CORE_CREDENTIAL_MODE?.trim().toLowerCase();
-    // Resolve the mode with the same semantics validateEnvironment enforces (C13): previously
-    // the no-DB early return silently reinterpreted even an explicit or invalid mode as "env",
-    // so any entry point that skipped validation got different credential semantics.
+    // Resolve the mode with the same semantics validateEnvironment enforces (C13).
     if (mode && !["d1", "env", "hybrid"].includes(mode))
         throw new Error(`Unsupported CORE_CREDENTIAL_MODE: ${mode}`);
     if (!env.DB) {
-        if (mode && mode !== "env")
-            throw new Error(`CORE_CREDENTIAL_MODE=${mode} requires the DB binding`);
+        // SEC-1: hybrid-without-DB is env-only BY DESIGN (validation allows
+        // it when env credentials exist) — only an explicit d1-without-DB
+        // throws. The mode is resolved by createCredentialProvider BEFORE
+        // the !db early return below, so the d1 throw is reachable even for
+        // callers that skip validation (previously the early return made it
+        // dead and silently reinterpreted d1 as env).
+        if (mode === "d1")
+            throw new Error(`CORE_CREDENTIAL_MODE=d1 requires the DB binding`);
         return "env";
     }
     if (!mode || mode === "d1")
@@ -7931,6 +11557,9 @@ function credentialMode(env) {
     throw new Error(`Unsupported CORE_CREDENTIAL_MODE: ${mode}`);
 }
 function createCredentialProvider(env) {
+    // SEC-1: resolve the mode first so d1-without-DB fails closed here,
+    // not silently as env-only, for callers that skip validateEnvironment.
+    const mode = credentialMode(env);
     const fallback = new EnvironmentCredentialProvider(env);
     const db = env.DB;
     if (!db)
@@ -7939,167 +11568,7 @@ function createCredentialProvider(env) {
     // non-D1 value into the provider.
     if (typeof db.prepare !== "function")
         throw new Error("DB binding is not a D1 database (missing prepare())");
-    const mode = credentialMode(env);
     return new CredentialRepository(new D1CredentialProvider(db), mode === "d1" ? null : fallback, mode);
-}
-
-};
-
-__m["util/binary"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.concatBytes = concatBytes;
-exports.equalBytes = equalBytes;
-exports.bytesToHex = bytesToHex;
-exports.hexToBytes = hexToBytes;
-exports.uuidToBytes = uuidToBytes;
-exports.bytesToUuid = bytesToUuid;
-exports.parseHostPort = parseHostPort;
-exports.validatePort = validatePort;
-exports.encodeUtf8 = encodeUtf8;
-exports.decodeUtf8 = decodeUtf8;
-function concatBytes(...parts) {
-    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const part of parts) {
-        out.set(part, offset);
-        offset += part.byteLength;
-    }
-    return out;
-}
-function equalBytes(a, b) {
-    if (a.byteLength !== b.byteLength)
-        return false;
-    let diff = 0;
-    for (let i = 0; i < a.byteLength; i++)
-        diff |= a[i] ^ b[i];
-    return diff === 0;
-}
-function bytesToHex(bytes) {
-    let out = "";
-    for (const byte of bytes)
-        out += byte.toString(16).padStart(2, "0");
-    return out;
-}
-function hexToBytes(hex) {
-    if (!/^[0-9a-fA-F]*$/.test(hex) || hex.length % 2 !== 0)
-        throw new Error("Invalid hex string");
-    const out = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < out.length; i++)
-        out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-    return out;
-}
-function uuidToBytes(uuid) {
-    const normalized = uuid.trim().toLowerCase();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized))
-        throw new Error("Invalid UUID");
-    return hexToBytes(normalized.replaceAll("-", ""));
-}
-function bytesToUuid(bytes) {
-    if (bytes.byteLength !== 16)
-        throw new Error("UUID must contain 16 bytes");
-    const hex = bytesToHex(bytes);
-    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-// DS-L12: a multi-colon host is only meaningful as an IPv6 literal, so it
-// is validated here instead of failing later in a SOCKS address encoder.
-// Mirrors the sibling IPv6 parsers (proxyip/nat64): "::" must compress at
-// least one group, a dotted-quad tail counts as two groups and is only
-// legal as the final token, and every other group is 1-4 hex digits.
-function isValidIpv6Literal(input) {
-    if (!input.includes(":"))
-        return false;
-    const sides = input.split("::");
-    if (sides.length > 2)
-        return false;
-    const countSide = (side, isFinalSide) => {
-        if (!side)
-            return 0;
-        const tokens = side.split(":");
-        let count = 0;
-        for (const [index, token] of tokens.entries()) {
-            if (token.includes(".")) {
-                if (!isFinalSide || index !== tokens.length - 1)
-                    return null;
-                const octets = token.split(".");
-                if (octets.length !== 4 || octets.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255))
-                    return null;
-                count += 2;
-                continue;
-            }
-            if (!/^[0-9a-fA-F]{1,4}$/.test(token))
-                return null;
-            count += 1;
-        }
-        return count;
-    };
-    const left = countSide(sides[0], sides.length === 1);
-    const right = sides.length === 2 ? countSide(sides[1], true) : null;
-    if (left === null || right === null)
-        return false;
-    return sides.length === 2 ? left + right < 8 : left === 8;
-}
-function parseHostPort(value, defaultPort) {
-    const raw = value.trim();
-    if (!raw)
-        throw new Error("Empty endpoint");
-    // DS-M4: a host:port value is never a URL. Characters that only make
-    // sense as URL syntax (scheme slashes, userinfo "@", query/fragment)
-    // mean a credential-bearing or otherwise non-host string was passed in;
-    // rejecting it here guarantees such a string can never be retained as a
-    // hostname (and later echoed into an error message) by any caller.
-    if (/[\s/?#@]/.test(raw))
-        throw new Error("Invalid endpoint");
-    if (raw.startsWith("[")) {
-        const close = raw.indexOf("]");
-        if (close < 0)
-            throw new Error("Invalid bracketed endpoint");
-        const host = raw.slice(1, close);
-        if (!host)
-            throw new Error("Empty host");
-        if (!isValidIpv6Literal(host))
-            throw new Error("Invalid IPv6 literal");
-        const rest = raw.slice(close + 1);
-        if (!rest)
-            return { host, port: defaultPort };
-        if (!rest.startsWith(":"))
-            throw new Error("Invalid endpoint");
-        const portText = rest.slice(1);
-        if (!/^\d+$/.test(portText))
-            throw new Error("Invalid port");
-        const port = Number(portText);
-        validatePort(port);
-        return { host, port };
-    }
-    const colonCount = (raw.match(/:/g) ?? []).length;
-    if (colonCount > 1) {
-        if (!isValidIpv6Literal(raw))
-            throw new Error("Invalid IPv6 literal");
-        return { host: raw, port: defaultPort };
-    }
-    const idx = raw.lastIndexOf(":");
-    if (idx < 0)
-        return { host: raw, port: defaultPort };
-    const host = raw.slice(0, idx);
-    if (!host)
-        throw new Error("Empty host");
-    const portText = raw.slice(idx + 1);
-    if (!/^\d+$/.test(portText))
-        throw new Error("Invalid port");
-    const port = Number(portText);
-    validatePort(port);
-    return { host, port };
-}
-function validatePort(port) {
-    if (!Number.isInteger(port) || port < 1 || port > 65535)
-        throw new Error("Port must be an integer from 1 to 65535");
-}
-function encodeUtf8(value) {
-    return new TextEncoder().encode(value);
-}
-function decodeUtf8(bytes) {
-    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 }
 
 };
@@ -8112,6 +11581,7 @@ exports.expandIpv6Literal = expandIpv6Literal;
 exports.canonicalRouteHost = canonicalRouteHost;
 exports.parseCoreRule = parseCoreRule;
 exports.parseCoreRules = parseCoreRules;
+exports.findShadowedCoreRules = findShadowedCoreRules;
 const errors_1 = __r("../core/errors");
 const hostname_1 = __r("../util/hostname");
 const VALID_EGRESS = new Set(["direct", "proxyip", "relay", "nat64"]);
@@ -8264,6 +11734,47 @@ function parseCoreRules(raw) {
     return (raw ?? "").split(/[\r\n,]+/).map((value) => value.trim()).filter(Boolean).map(parseCoreRule);
 }
 exports.CORE_RULE_EGRESS_TYPES = Object.freeze(["direct", "proxyip", "relay", "nat64"]);
+function matcherCovers(earlier, later) {
+    if (earlier.suffix !== undefined) {
+        const bare = earlier.suffix.slice(1);
+        if (later.suffix !== undefined)
+            return later.suffix === earlier.suffix || later.suffix.endsWith(earlier.suffix);
+        if (later.host !== undefined)
+            return later.host === bare || later.host.endsWith(earlier.suffix);
+        return false;
+    }
+    if (earlier.host !== undefined)
+        return later.host !== undefined && later.host === earlier.host;
+    if (earlier.port !== undefined)
+        return later.port !== undefined && later.port === earlier.port;
+    if (earlier.protocol !== undefined)
+        return later.protocol !== undefined && later.protocol === earlier.protocol;
+    return false;
+}
+function findShadowedCoreRules(entries) {
+    const parsed = entries.map((entry) => {
+        try {
+            return parseCoreRule(entry);
+        }
+        catch {
+            return null;
+        }
+    });
+    const out = [];
+    for (let i = 0; i < parsed.length; i++) {
+        const later = parsed[i];
+        if (!later)
+            continue;
+        for (let j = 0; j < i; j++) {
+            const earlier = parsed[j];
+            if (earlier && matcherCovers(earlier, later)) {
+                out.push({ index: i, shadowedBy: j });
+                break;
+            }
+        }
+    }
+    return out;
+}
 
 };
 
@@ -8304,9 +11815,17 @@ class DefaultRouter {
     constructor(mode = "smart", rawRules, availability = {}) {
         this.mode = mode;
         this.rules = (0, rules_1.parseCoreRules)(rawRules);
+        // EG-01: relay is deliberately NOT in the smart chain. A raw relay dials
+        // a single fixed service port and never transmits the requested
+        // destination, so a relay "success" would pipe the client stream to the
+        // wrong service and preempt a correct NAT64 attempt. Relay stays
+        // reachable only via an explicit rule egress or fallbackEgress, where
+        // the operator has chosen that fixed service knowingly. The
+        // availability.relay field is retained for API compatibility but no
+        // longer feeds the smart chain.
+        void availability.relay;
         this.smartFallbacks = [
             availability.proxyip ? "proxyip" : null,
-            availability.relay ? "relay" : null,
             availability.nat64 ? "nat64" : null,
         ].filter((item) => Boolean(item));
     }
@@ -8356,6 +11875,7 @@ const errors_1 = __r("../core/errors");
 const direct_1 = __r("./direct");
 const limits_1 = __r("../core/limits");
 const lifecycle_1 = __r("../util/lifecycle");
+const hostname_1 = __r("../util/hostname");
 const RFC6052_PREFIX_LENGTHS = [32, 40, 48, 56, 64, 96];
 function parseIpv4(value) {
     const parts = value.trim().split(".");
@@ -8511,7 +12031,35 @@ function parseNat64Prefixes(raw) {
             out.push(normalized);
         }
     }
+    // EG-13a: cap the parsed list like proxyip/relay (64), instead of
+    // letting unbounded operator input grow the array (the 32-attempt cap
+    // only bounded dial attempts, not the list itself).
+    if (out.length > limits_1.CORE_LIMITS.maxProxyIpEndpoints) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `Too many NAT64 prefixes; maximum is ${limits_1.CORE_LIMITS.maxProxyIpEndpoints}`);
+    }
     return out;
+}
+// EG-13g: extract the IPv4 from an IPv4-mapped IPv6 destination
+// (::ffff:a.b.c.d) so it translates instead of failing closed with
+// DNS_FAILED. Returns null for non-mapped destinations.
+function extractMappedIpv4(host) {
+    let value = host.trim();
+    if (value.startsWith("[") && value.endsWith("]"))
+        value = value.slice(1, -1);
+    if (!value.includes(":") || !value.includes("."))
+        return null;
+    let bytes;
+    try {
+        bytes = parseIpv6Bytes(value);
+    }
+    catch {
+        return null;
+    }
+    if (bytes.length !== 16)
+        return null;
+    if (!bytes.subarray(0, 10).every((b) => b === 0) || bytes[10] !== 0xff || bytes[11] !== 0xff)
+        return null;
+    return [...bytes.subarray(12)].join(".");
 }
 function ipv4ToNat64(ipv4, prefix) {
     const bytes = parseIpv4(ipv4);
@@ -8557,47 +12105,70 @@ class Nat64Egress {
         if (!Number.isInteger(destination.port) || destination.port < 1 || destination.port > 65535) {
             throw new errors_1.CoreError("INVALID_DESTINATION", `Destination port must be an integer from 1 to 65535, got ${destination.port}`);
         }
-        const ipv4 = parseIpv4(destination.host) ? [destination.host] : await this.dns.resolveIpv4(destination.host, signal);
+        // EG-13g: a mapped destination translates directly; EG-02: private
+        // IPv4 literals are never synthesized (the translator would dial them
+        // on the worker's behalf), and private addresses from DNS resolution
+        // are dropped (rebinding guard, same as direct.ts).
+        const mapped = extractMappedIpv4(destination.host);
+        const literal = parseIpv4(destination.host) ? destination.host : null;
+        if (literal && (0, hostname_1.isPrivateIpLiteral)(literal)) {
+            throw new errors_1.CoreError("INVALID_DESTINATION", "Private, loopback, or link-local destinations are not dialed via nat64");
+        }
+        const resolved = mapped ? [mapped] : literal ? [literal] : await this.dns.resolveIpv4(destination.host, signal);
+        const ipv4 = resolved.filter((address) => !(0, hostname_1.isPrivateIpLiteral)(address));
         if (!ipv4.length)
-            throw new errors_1.CoreError("DNS_FAILED", `NAT64 requires an IPv4 address for ${destination.host}`, true);
+            throw new errors_1.CoreError("DNS_FAILED", `NAT64 requires an IPv4 address for ${(0, hostname_1.sanitizeHostForMessage)(destination.host)}`, true);
         // Audit fix E5: aggregate decision budget across all candidate attempts
         // (previously up to maxNat64Candidates × connectTimeoutMs with no cap).
         const deadlineAt = Date.now() + this.decisionTimeoutMs;
         let lastError;
+        // EG-08: diagonal interleave over (address, prefix) pairs. The old
+        // address-outer/prefix-inner loop let the first address consume all 32
+        // attempts across 32 prefixes, starving later addresses (and their
+        // working prefixes) entirely. Diagonals visit every address and every
+        // prefix early: pair order is (a0,p0), (a0,p1),(a1,p0), (a0,p2),
+        // (a1,p1),(a2,p0), … — no dimension starves before the cap.
+        const pairs = [];
+        for (let s = 0; s < ipv4.length + this.prefixes.length - 1; s++) {
+            for (let a = 0; a < ipv4.length; a++) {
+                const p = s - a;
+                if (p >= 0 && p < this.prefixes.length)
+                    pairs.push({ address: ipv4[a], prefix: this.prefixes[p] });
+            }
+        }
         let attempts = 0;
-        outer: for (const address of ipv4) {
-            for (const prefix of this.prefixes) {
-                if (attempts++ >= limits_1.CORE_LIMITS.maxNat64Candidates)
-                    break;
+        for (const { address, prefix } of pairs) {
+            if (attempts++ >= limits_1.CORE_LIMITS.maxNat64Candidates)
+                break;
+            if (signal.aborted)
+                throw signal.reason;
+            if (Date.now() >= deadlineAt)
+                break;
+            // EG-09: no usable budget left is deadline exhaustion, not failure.
+            if ((0, lifecycle_1.remainingMs)(deadlineAt, this.connectTimeoutMs) < 50)
+                break;
+            const synthesized = ipv4ToNat64(address, prefix.prefix);
+            try {
+                const socket = await (0, direct_1.connectTcp)({ host: synthesized, port: destination.port }, signal, (0, lifecycle_1.remainingMs)(deadlineAt, this.connectTimeoutMs));
+                return {
+                    type: "nat64",
+                    readable: socket.readable,
+                    writable: socket.writable,
+                    // Audit fix E7: full teardown — also cancel the readable side of
+                    // the allowHalfOpen socket instead of only closing writable.
+                    close: async () => {
+                        await socket.readable.cancel().catch(() => { });
+                        await socket.close().catch(() => { });
+                    },
+                };
+            }
+            catch (error) {
+                lastError = error;
                 if (signal.aborted)
                     throw signal.reason;
-                if (Date.now() >= deadlineAt)
-                    break outer;
-                const synthesized = ipv4ToNat64(address, prefix.prefix);
-                try {
-                    const socket = await (0, direct_1.connectTcp)({ host: synthesized, port: destination.port }, signal, (0, lifecycle_1.remainingMs)(deadlineAt, this.connectTimeoutMs));
-                    return {
-                        type: "nat64",
-                        readable: socket.readable,
-                        writable: socket.writable,
-                        // Audit fix E7: full teardown — also cancel the readable side of
-                        // the allowHalfOpen socket instead of only closing writable.
-                        close: async () => {
-                            await socket.readable.cancel().catch(() => { });
-                            await socket.close().catch(() => { });
-                        },
-                    };
-                }
-                catch (error) {
-                    lastError = error;
-                    if (signal.aborted)
-                        throw signal.reason;
-                }
             }
-            if (attempts >= limits_1.CORE_LIMITS.maxNat64Candidates)
-                break;
         }
-        throw new errors_1.CoreError("EGRESS_FAILED", `NAT64 connection failed for ${destination.host}:${destination.port}`, true, { cause: lastError });
+        throw new errors_1.CoreError("EGRESS_FAILED", `NAT64 connection failed for ${(0, hostname_1.sanitizeHostForMessage)(destination.host)}:${destination.port}`, true, { cause: lastError });
     }
 }
 exports.Nat64Egress = Nat64Egress;
@@ -8612,6 +12183,7 @@ exports.connectTcp = connectTcp;
 const cloudflare_sockets_1 = __r("cloudflare:sockets");
 const limits_1 = __r("../core/limits");
 const errors_1 = __r("../core/errors");
+const hostname_1 = __r("../util/hostname");
 async function connectTcp(destination, signal, timeoutMs, secureTransport = "off") {
     // Audit fix E6: validate the client-influenced destination port at the
     // single choke point every egress dial passes through, instead of
@@ -8803,12 +12375,22 @@ class DirectEgress {
         };
     }
     async open(destination, signal) {
+        // EG-02: DNS-disabled direct dials pass the hostname to connect(), where
+        // the Cloudflare platform itself refuses localhost/private dials
+        // (documented platform backstop — no worker-side check is possible
+        // there, since no resolution happens in the worker). When worker DNS
+        // IS enabled, the worker resolves and therefore CAN check: drop
+        // private/loopback/link-local answers (DNS-rebinding guard) before
+        // racing, and fail closed when nothing public remains.
         if (!this.dns || !this.dns.enabled)
             return connectTcp(destination, signal, this.connectTimeoutMs);
         const resolved = await this.dns.resolve(destination.host, undefined, signal);
         if (!resolved.length)
-            throw new errors_1.CoreError("DNS_FAILED", `DNS returned no address for ${destination.host}`, true);
-        return raceResolvedAddresses(resolved.map((item) => item.address), destination.port, signal, this.connectTimeoutMs, this.addressRace);
+            throw new errors_1.CoreError("DNS_FAILED", `DNS returned no address for ${(0, hostname_1.sanitizeHostForMessage)(destination.host)}`, true);
+        const publicAddresses = resolved.map((item) => item.address).filter((address) => !(0, hostname_1.isPrivateIpLiteral)(address));
+        if (!publicAddresses.length)
+            throw new errors_1.CoreError("DNS_FAILED", `DNS returned no public address for ${(0, hostname_1.sanitizeHostForMessage)(destination.host)}`, true);
+        return raceResolvedAddresses(publicAddresses, destination.port, signal, this.connectTimeoutMs, this.addressRace);
     }
 }
 exports.DirectEgress = DirectEgress;
@@ -8840,6 +12422,7 @@ const binary_1 = __r("../util/binary");
 const direct_1 = __r("./direct");
 const lifecycle_1 = __r("../util/lifecycle");
 const sha224_1 = __r("../util/sha224");
+const hostname_1 = __r("../util/hostname");
 const SOCKS_VERSION = 0x05;
 const METHOD_NO_AUTH = 0x00;
 const METHOD_USERPASS = 0x02;
@@ -8860,6 +12443,26 @@ const cloudflareSocketConnector = {
 function endpointIdentityKey(host, port, tls, username, password) {
     const passwordDigest = password ? (0, sha224_1.sha224Hex)((0, binary_1.encodeUtf8)(password)) : "";
     return JSON.stringify([host.toLowerCase(), port, tls, username ?? "", passwordDigest]);
+}
+// EG-05: sort by health score descending, then shuffle within equal-score
+// runs (Fisher-Yates). Fresh endpoints all score identically, and a stable
+// sort alone always served insertion order — 100% of traffic to the first
+// endpoint until it failed or accumulated latency.
+function sortByHealthWithTieBreak(items, score) {
+    const scored = items.map((item) => ({ item, score: score(item) }));
+    scored.sort((a, b) => b.score - a.score);
+    let start = 0;
+    while (start < scored.length) {
+        let end = start + 1;
+        while (end < scored.length && scored[end].score === scored[start].score)
+            end++;
+        for (let i = end - 1; i > start; i--) {
+            const j = start + Math.floor(Math.random() * (i - start + 1));
+            [scored[i], scored[j]] = [scored[j], scored[i]];
+        }
+        start = end;
+    }
+    return scored.map((entry) => entry.item);
 }
 // Audit fix E6: the client-influenced destination port is validated before it
 // is encoded or dialed anywhere in this layer. SOCKS5 DST.PORT is a 16-bit
@@ -8973,21 +12576,20 @@ class ProxyIpEgress {
     }
     async connect(destination, signal) {
         assertValidDestinationPort(destination.port);
+        // EG-02: a client-requested private/loopback/link-local IP literal is
+        // never handed to a SOCKS proxy (the proxy would dial it on the
+        // worker's behalf). Hostnames are NOT checked here: the worker never
+        // resolves them on this path, so a rebound hostname can only be caught
+        // by the proxy operator's resolver — documented as the residual.
+        if ((0, hostname_1.isPrivateIpLiteral)(destination.host)) {
+            throw new errors_1.CoreError("INVALID_DESTINATION", "Private, loopback, or link-local destinations are not dialed via proxyip");
+        }
         let lastError = null;
-        const now = Date.now();
         // Audit fix E5: the failover loop gets an aggregate decision budget in
         // addition to the caller's AbortSignal and the per-attempt timeouts, so a
         // black-holed candidate set cannot burn candidates × (connect + handshake)
         // of wall time when a caller supplies a deadline-less signal.
-        const deadlineAt = now + this.decisionTimeoutMs;
-        const closed = this.endpoints.filter((endpoint) => this.stateFor(this.endpointKey(endpoint)).state === "closed");
-        const halfOpenCandidates = this.endpoints
-            .filter((endpoint) => this.stateFor(this.endpointKey(endpoint)).state === "open")
-            .filter((endpoint) => this.stateFor(this.endpointKey(endpoint)).cooldownUntil <= now && !this.stateFor(this.endpointKey(endpoint)).probeInFlight)
-            .sort((a, b) => this.stateFor(this.endpointKey(a)).cooldownUntil - this.stateFor(this.endpointKey(b)).cooldownUntil);
-        const probeCandidate = halfOpenCandidates[0] ?? null;
-        const candidates = [...closed, ...(probeCandidate ? [probeCandidate] : [])].filter((endpoint) => this.isAvailable(endpoint, now));
-        const ordered = [...candidates].sort((a, b) => this.healthScore(b, now) - this.healthScore(a, now));
+        const deadlineAt = Date.now() + this.decisionTimeoutMs;
         // Audit fixes E1/E2: the single half-open probe slot is claimed only when
         // the probe attempt actually starts (claimProbe, synchronously inside the
         // loop, so concurrent connect() calls cannot both claim it) and is
@@ -8996,6 +12598,15 @@ class ProxyIpEgress {
         // fast-throw, aborts, and deadline exhaustion included. Previously the
         // slot was claimed during candidate filtering and leaked whenever the
         // probed endpoint was not the one attempted, permanently draining the pool.
+        // EG-10: candidates, availability and scores are sampled FRESH per
+        // attempt (the old code snapshotted `now` once, so an endpoint whose
+        // cooldown expired mid-loop stayed excluded until the next call). Each
+        // iteration picks the single best untried endpoint; tried endpoints are
+        // never re-attempted within one call, and at most one half-open probe
+        // is attempted per call (probeAttempted).
+        const tried = new Set();
+        let probeAttempted = false;
+        let probeCandidate = null;
         let probeClaimed = false;
         let probeAborted = false;
         const releaseProbe = () => {
@@ -9012,12 +12623,26 @@ class ProxyIpEgress {
             }
         };
         try {
-            for (const endpoint of ordered) {
+            for (;;) {
                 if (signal.aborted)
                     throw signal.reason;
                 if (Date.now() >= deadlineAt)
                     break;
+                const now = Date.now();
+                const closed = this.endpoints.filter((endpoint) => this.stateFor(this.endpointKey(endpoint)).state === "closed");
+                const halfOpenCandidates = probeAttempted ? [] : this.endpoints
+                    .filter((endpoint) => this.stateFor(this.endpointKey(endpoint)).state === "open")
+                    .filter((endpoint) => this.stateFor(this.endpointKey(endpoint)).cooldownUntil <= now && !this.stateFor(this.endpointKey(endpoint)).probeInFlight)
+                    .sort((a, b) => this.stateFor(this.endpointKey(a)).cooldownUntil - this.stateFor(this.endpointKey(b)).cooldownUntil);
+                probeCandidate = halfOpenCandidates[0] ?? null;
+                const candidates = [...closed, ...(probeCandidate ? [probeCandidate] : [])]
+                    .filter((endpoint) => this.isAvailable(endpoint, now) && !tried.has(this.endpointKey(endpoint)));
+                const ordered = sortByHealthWithTieBreak(candidates, (endpoint) => this.healthScore(endpoint, now));
+                const endpoint = ordered[0];
+                if (!endpoint)
+                    break;
                 const key = this.endpointKey(endpoint);
+                tried.add(key);
                 const isProbe = probeCandidate !== null && endpoint === probeCandidate;
                 if (isProbe) {
                     // Claim the slot only now. There is no await between the re-check
@@ -9028,7 +12653,12 @@ class ProxyIpEgress {
                         continue;
                     state.probeInFlight = true;
                     probeClaimed = true;
+                    probeAttempted = true;
                 }
+                // EG-09: an attempt with no usable budget left is deadline
+                // exhaustion, not an endpoint failure — stop without counting it.
+                if ((0, lifecycle_1.remainingMs)(deadlineAt, this.connectTimeoutMs) < 50)
+                    break;
                 const started = performance.now();
                 let socket = null;
                 try {
@@ -9060,6 +12690,12 @@ class ProxyIpEgress {
                     }
                     if (error instanceof errors_1.CoreError && (error.code === "INVALID_DESTINATION" || error.code === "CONFIGURATION_ERROR"))
                         throw error;
+                    // EG-12: a non-retryable SOCKS reply (ruleset/refused/address-type
+                    // — EGRESS_FAILED with retryable=false, the only such error in
+                    // this path) is destination-specific and will not change per
+                    // endpoint — fail fast instead of burning the whole pool.
+                    if (error instanceof errors_1.CoreError && error.code === "EGRESS_FAILED" && !error.retryable)
+                        throw error;
                     this.markFailure(key);
                     if (isProbe)
                         probeClaimed = false; // markFailure already cleared the flag
@@ -9084,11 +12720,15 @@ async function performSocks5Connect(socket, destination, credentials, signal) {
     const writer = socket.writable.getWriter();
     try {
         const wantsAuth = Boolean(credentials.username || credentials.password);
+        // EG-04: offer ONLY the configured method. Offering NO_AUTH alongside
+        // USERPASS let a misconfigured proxy (or an on-path attacker on a
+        // non-TLS hop) silently drop authentication while the operator believed
+        // credentials were enforced. The server's choice is confined to what is
+        // offered (RFC 1928 method selection).
         await writeWithAbort(writer, new Uint8Array([
             SOCKS_VERSION,
-            wantsAuth ? 2 : 1,
-            METHOD_NO_AUTH,
-            ...(wantsAuth ? [METHOD_USERPASS] : []),
+            1,
+            wantsAuth ? METHOD_USERPASS : METHOD_NO_AUTH,
         ]), signal);
         const greeting = await reader.readExact(2, signal);
         if (greeting[0] !== SOCKS_VERSION) {
@@ -9097,6 +12737,11 @@ async function performSocks5Connect(socket, destination, credentials, signal) {
         const method = greeting[1];
         if (method === METHOD_NO_ACCEPTABLE) {
             throw new errors_1.CoreError("AUTH_FAILED", "ProxyIP rejected all offered SOCKS5 authentication methods");
+        }
+        // EG-04 converse check: a server selecting NO_AUTH when credentials are
+        // configured is a downgrade even if it was never offered — fail closed.
+        if (method === METHOD_NO_AUTH && wantsAuth) {
+            throw new errors_1.CoreError("AUTH_FAILED", "ProxyIP selected no authentication while credentials are configured");
         }
         if (method === METHOD_USERPASS) {
             if (!wantsAuth)
@@ -9262,8 +12907,18 @@ class BufferedSocketReader {
             return new Uint8Array(0);
         const out = new Uint8Array(length);
         let written = 0;
+        // EG-11: a stream yielding repeated zero-length chunks used to spin
+        // without progress until the outer handshake timeout. Fail closed after
+        // a bounded run of empty chunks instead.
+        let zeroStreak = 0;
         while (written < length) {
             const chunk = await this.next(signal);
+            if (chunk.byteLength === 0) {
+                if (++zeroStreak > 100)
+                    throw new errors_1.CoreError("EGRESS_FAILED", "ProxyIP socket yielded repeated empty chunks during handshake", true);
+                continue;
+            }
+            zeroStreak = 0;
             const take = Math.min(chunk.byteLength, length - written);
             out.set(chunk.subarray(0, take), written);
             written += take;
@@ -9444,8 +13099,19 @@ function parseProxyIpEndpoints(env) {
                 throw new errors_1.CoreError("CONFIGURATION_ERROR", "Each ProxyIP endpoint must be an object");
             const item = entry;
             const host = typeof item.host === "string" ? item.host : "";
-            const port = item.port === undefined ? limits_1.CORE_LIMITS.defaultProxyIpPort : Number(item.port);
-            const tls = item.tls === undefined ? parseBoolean(env.PROXY_IP_TLS) : Boolean(item.tls);
+            // CFG-4 (mirrors validation): port must be a JSON number — the old
+            // Number() coercion turned `port: true` into port 1. Non-string
+            // credentials are a mistype, not an empty credential.
+            if (item.port !== undefined && typeof item.port !== "number")
+                throw new errors_1.CoreError("CONFIGURATION_ERROR", "Each ProxyIP endpoint port must be a number", false);
+            if ((item.username !== undefined && typeof item.username !== "string") || (item.password !== undefined && typeof item.password !== "string"))
+                throw new errors_1.CoreError("CONFIGURATION_ERROR", "Each ProxyIP endpoint username/password must be strings", false);
+            const port = item.port === undefined ? limits_1.CORE_LIMITS.defaultProxyIpPort : item.port;
+            // EG-13d: strict TLS coercion. Boolean(item.tls) turned the JSON
+            // string "false" into true, silently enabling TLS (which then failed
+            // at handshake). Strings go through the same strict parseBoolean as
+            // the legacy path; anything else is a configuration error.
+            const tls = item.tls === undefined ? parseBoolean(env.PROXY_IP_TLS) : parseStrictTls(item.tls);
             const username = typeof item.username === "string" ? item.username.trim() : "";
             const password = typeof item.password === "string" ? item.password : "";
             add(host, port, tls, username ? { username, password } : {});
@@ -9497,6 +13163,22 @@ function parseBoolean(value) {
         return false;
     throw new errors_1.CoreError("CONFIGURATION_ERROR", "PROXY_IP_TLS must be a boolean");
 }
+// EG-13d: structured-endpoint `tls` accepts a real boolean as-is, or a
+// string through strict parseBoolean. Numbers, null, objects and other
+// truthy junk are configuration errors, not `true`.
+function parseStrictTls(value) {
+    if (typeof value === "boolean")
+        return value;
+    if (typeof value === "string") {
+        try {
+            return parseBoolean(value);
+        }
+        catch {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "ProxyIP endpoint tls must be a boolean");
+        }
+    }
+    throw new errors_1.CoreError("CONFIGURATION_ERROR", "ProxyIP endpoint tls must be a boolean");
+}
 function hasProxyIp(env) {
     return Boolean(env.PROXY_IP?.trim() || env.PROXY_IPS?.trim() || env.PROXY_IP_ENDPOINTS_JSON?.trim());
 }
@@ -9534,6 +13216,8 @@ exports.parseRelayEndpoints = parseRelayEndpoints;
 const errors_1 = __r("../core/errors");
 const limits_1 = __r("../core/limits");
 const lifecycle_1 = __r("../util/lifecycle");
+const binary_1 = __r("../util/binary");
+const hostname_1 = __r("../util/hostname");
 const direct_1 = __r("./direct");
 function splitList(raw) {
     return (raw ?? "").split(/[\r\n,]+/).map((value) => value.trim()).filter(Boolean);
@@ -9547,6 +13231,11 @@ function parseEndpoint(value) {
         if (end < 0)
             throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid relay endpoint: ${value}`);
         const host = raw.slice(1, end).trim();
+        // EG-06: bracketed content is an IPv6 literal by definition — validate
+        // it as one (previously any string in brackets passed startup checks
+        // and failed opaquely at dial time).
+        if (!(0, binary_1.isValidIpv6Literal)(host))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid relay IPv6 endpoint: ${value}`);
         const rest = raw.slice(end + 1);
         if (!rest)
             return { host };
@@ -9566,8 +13255,16 @@ function parseEndpoint(value) {
 }
 function validateEndpoint(endpoint, raw) {
     const host = endpoint.host.trim();
-    if (!host || host.length > 253 || /[\u0000-\u0020\u007f\\/?#]/.test(host))
+    // EG-06: the banned set omitted '@', so userinfo-shaped hosts
+    // (user@relay.example) passed validation — matching proxyip's stricter set.
+    if (!host || host.length > 253 || /[\u0000-\u0020\u007f\\/?#@]/.test(host))
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid relay host: ${raw}`);
+    // EG-02 (relay-mediated): a private-literal relay endpoint could never be
+    // dialed anyway (the platform refuses private connect() targets), so fail
+    // closed at configuration with a clear message instead of opaquely at
+    // dial time.
+    if ((0, hostname_1.isPrivateIpLiteral)(host))
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `Relay endpoint host must not be a private, loopback, or link-local address: ${raw}`);
     if (endpoint.port !== undefined && (!Number.isInteger(endpoint.port) || endpoint.port < 1 || endpoint.port > 65535)) {
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid relay port: ${raw}`);
     }
@@ -9652,12 +13349,19 @@ class RawTcpRelayEgress {
                 throw signal.reason;
             if (Date.now() >= deadlineAt)
                 break;
+            // EG-09: an attempt with no usable budget left is deadline exhaustion,
+            // not an endpoint failure — stop without counting it.
+            if ((0, lifecycle_1.remainingMs)(deadlineAt, this.connectTimeoutMs) < 50)
+                break;
             // Audit fix E10: the breaker key is the actual dial target. Endpoint
             // ports are always explicit now (E4), so the key can no longer
             // conflate different destination ports under a ":0" bucket; the
             // cooldown timestamp is also sampled fresh per attempt instead of
             // once before a potentially long loop.
-            const key = `${endpoint.host}:${endpoint.port}`;
+            // EG-13h: the key is lowercased like the parse dedupe key, so
+            // direct-constructed endpoints differing only by case share one
+            // breaker entry instead of two.
+            const key = `${endpoint.host.toLowerCase()}:${endpoint.port}`;
             const health = this.health.get(key);
             if (health?.openUntil && health.openUntil > Date.now())
                 continue;
@@ -9938,6 +13642,9 @@ function decodeVlessFlow(addons) {
     let offset = 0;
     let flow = "";
     const invalid = () => new errors_1.CoreError("BAD_REQUEST", "Invalid VLESS addons encoding");
+    // PR-1: full protobuf skip semantics. Varints run to 10 bytes (a
+    // 64-bit value), not 5 — the old shift > 28 cutoff rejected a future
+    // addon carrying a 64-bit varint unknown field instead of skipping it.
     const readVarint = () => {
         let result = 0;
         let shift = 0;
@@ -9950,7 +13657,7 @@ function decodeVlessFlow(addons) {
                 return result;
             }
             shift += 7;
-            if (shift > 28)
+            if (shift > 63)
                 throw invalid();
         }
         throw invalid();
@@ -9959,6 +13666,68 @@ function decodeVlessFlow(addons) {
         if (count < 0 || offset + count > addons.length)
             throw invalid();
         offset += count;
+    };
+    // Varint value skips (wire type 0) do not need the value — and must
+    // not require it to be a safe integer: a 64-bit int field legitimately
+    // encodes in 10 bytes with a value above 2^53. Only tag and length
+    // varints use the checked readVarint above (field numbers cap at
+    // 2^29-1 and lengths at the message size, so a non-safe value there
+    // is malformed regardless).
+    const skipVarint = () => {
+        let bytes = 0;
+        while (offset < addons.length) {
+            bytes++;
+            if (bytes > 10)
+                throw invalid();
+            if (!(addons[offset++] & 0x80))
+                return;
+        }
+        throw invalid();
+    };
+    // PR-1: wire types 3/4 (groups, deprecated but still valid protobuf)
+    // are skipped by depth counting, not rejected. Depth is capped so a
+    // malicious nesting chain cannot recurse unboundedly; group-internal
+    // field numbers are independent of the message's field 1, so the
+    // DS-L11 flow check below does NOT apply inside a group.
+    const skipField = (wireType) => {
+        switch (wireType) {
+            case 0:
+                skipVarint();
+                return;
+            case 1:
+                skip(8);
+                return;
+            case 2: {
+                const length = readVarint();
+                skip(length);
+                return;
+            }
+            case 5:
+                skip(4);
+                return;
+            default: throw invalid();
+        }
+    };
+    const skipGroup = () => {
+        let depth = 1;
+        while (depth > 0) {
+            if (offset >= addons.length)
+                throw invalid();
+            const tag = readVarint();
+            const field = Math.floor(tag / 8);
+            const wireType = tag % 8;
+            if (field === 0)
+                throw invalid();
+            if (wireType === 3) {
+                depth++;
+                if (depth > 32)
+                    throw invalid();
+            }
+            else if (wireType === 4)
+                depth--;
+            else
+                skipField(wireType);
+        }
     };
     while (offset < addons.length) {
         const tag = readVarint();
@@ -9976,7 +13745,7 @@ function decodeVlessFlow(addons) {
             throw invalid();
         switch (wireType) {
             case 0:
-                readVarint();
+                skipVarint();
                 break;
             case 1:
                 skip(8);
@@ -9996,6 +13765,12 @@ function decodeVlessFlow(addons) {
                 offset += length;
                 break;
             }
+            case 3:
+                skipGroup();
+                break;
+            case 4:
+                // An end-group with no open group is malformed, not skippable.
+                throw invalid();
             case 5:
                 skip(4);
                 break;
@@ -10085,7 +13860,10 @@ class VlessHandler {
             destination,
             initialPayload,
             responseHeader: new Uint8Array([version, 0]),
-            ...(command === UDP_COMMAND ? { udpDns: port === 53 } : {}),
+            // PR-7: the port === 53 check above already threw for any other UDP
+            // port, so udpDns is always true here by construction — the old
+            // `port === 53` expression could never be false.
+            ...(command === UDP_COMMAND ? { udpDns: true } : {}),
         };
     }
     static principalId(uuid) {
@@ -10118,11 +13896,37 @@ class ProxyEngine {
         this.options = options;
         // Fallback defaults come from the central limits (A7) so direct engine
         // users see the same behavior as the runtime/config assembly.
-        this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? limits_1.CORE_LIMITS.defaultHandshakeTimeoutMs;
-        this.retryPolicy = options.retryPolicy ?? { maxInitialRetries: limits_1.CORE_LIMITS.maxInitialRetries, firstByteTimeoutMs: limits_1.CORE_LIMITS.defaultFirstByteTimeoutMs, retryOnEmptyResponse: true };
-        this.idleTimeoutMs = options.idleTimeoutMs ?? 0;
-        this.maxSessionDurationMs = options.maxSessionDurationMs ?? limits_1.CORE_LIMITS.maxSessionDurationMs;
-        this.maxEgressDecisionMs = options.maxEgressDecisionMs ?? limits_1.CORE_LIMITS.defaultMaxEgressDecisionMs;
+        // CORE-3: numeric options are validated here (like ByteQueue's bound),
+        // so a direct embedder passing NaN/negative/Infinity gets a loud
+        // RangeError instead of silent inconsistent behavior (immediate
+        // timeouts, NaN deadlines, disabled idle). The production runtime
+        // already clamps in config/runtime.ts, so this only bites embedders.
+        const checkPositive = (value, fallback, name) => {
+            const v = value ?? fallback;
+            if (!Number.isFinite(v) || v <= 0)
+                throw new RangeError(`${name} must be a finite number greater than 0`);
+            return v;
+        };
+        const checkNonNegative = (value, fallback, name) => {
+            const v = value ?? fallback;
+            if (!Number.isFinite(v) || v < 0)
+                throw new RangeError(`${name} must be a finite number greater than or equal to 0`);
+            return v;
+        };
+        this.handshakeTimeoutMs = checkPositive(options.handshakeTimeoutMs, limits_1.CORE_LIMITS.defaultHandshakeTimeoutMs, "handshakeTimeoutMs");
+        const retryPolicy = options.retryPolicy ?? { maxInitialRetries: limits_1.CORE_LIMITS.maxInitialRetries, firstByteTimeoutMs: limits_1.CORE_LIMITS.defaultFirstByteTimeoutMs, retryOnEmptyResponse: true };
+        if (!Number.isInteger(retryPolicy.maxInitialRetries) || retryPolicy.maxInitialRetries < 0)
+            throw new RangeError("retryPolicy.maxInitialRetries must be a non-negative integer");
+        this.retryPolicy = {
+            ...retryPolicy,
+            firstByteTimeoutMs: checkPositive(retryPolicy.firstByteTimeoutMs, limits_1.CORE_LIMITS.defaultFirstByteTimeoutMs, "retryPolicy.firstByteTimeoutMs"),
+        };
+        // CORE-4: idle timeout is bounded by default (300 s) like every other
+        // timeout; 0 still explicitly disables. The runtime/config default
+        // matches this fallback, so both paths agree.
+        this.idleTimeoutMs = checkNonNegative(options.idleTimeoutMs, limits_1.CORE_LIMITS.defaultIdleTimeoutMs, "idleTimeoutMs");
+        this.maxSessionDurationMs = checkPositive(options.maxSessionDurationMs, limits_1.CORE_LIMITS.maxSessionDurationMs, "maxSessionDurationMs");
+        this.maxEgressDecisionMs = checkPositive(options.maxEgressDecisionMs, limits_1.CORE_LIMITS.defaultMaxEgressDecisionMs, "maxEgressDecisionMs");
         this.egress = options.egress;
     }
     async handle(connection, context, protocol) {
@@ -10138,7 +13942,19 @@ class ProxyEngine {
             const handler = this.options.protocols.get(protocol);
             if (!handler)
                 throw new errors_1.CoreError("UNSUPPORTED_PROTOCOL", `Protocol ${protocol} is not enabled`);
+            // CORE-6: handshakeTimeoutMs is a PER-PHASE budget, not a total
+            // handshake budget — parse gets a fresh budget here, routing gets a
+            // second fresh budget below, and each dial attempt gets its own
+            // maxEgressDecisionMs budget. Worst case to first-byte failure is
+            // roughly 10 s + 10 s + attempts x 30 s. Operators must not tune it
+            // as if it capped the whole handshake.
             const session = await (0, lifecycle_1.withTimeout)((signal) => handler.parse(connection.reader, context, signal), this.handshakeTimeoutMs, sessionSignal.signal, "Protocol handshake timeout");
+            // CORE-7: defensive cross-check. Handlers are per-protocol singletons
+            // in-tree, so this only fires on a mis-registration — but routing
+            // under the wrong protocol label would otherwise proceed silently.
+            if (session.protocol !== protocol) {
+                throw new errors_1.CoreError("CONFIGURATION_ERROR", `Protocol handler for '${protocol}' returned a session for '${session.protocol}'`);
+            }
             const routeContext = {
                 destination: session.destination,
                 principal: session.principal,
@@ -10196,7 +14012,12 @@ class ProxyEngine {
             }
             if (lastOutcome?.error && lastOutcome.error.code !== "CLIENT_CLOSED")
                 throw lastOutcome.error;
-            metrics?.increment("session.completed");
+            // CORE-10: a client hangup is neither a failure nor a completed proxy
+            // session — count it separately instead of inflating session.completed.
+            if (lastOutcome?.error?.code === "CLIENT_CLOSED")
+                metrics?.increment("session.client_closed");
+            else
+                metrics?.increment("session.completed");
         }
         catch (error) {
             metrics?.increment("session.failed");
@@ -10242,6 +14063,13 @@ class ProxyEngine {
                 return { connection, index };
             }
             catch (error) {
+                // EG-03: non-retryable failures surface immediately instead of
+                // silently degrading to a weaker path (a proxyip AUTH_FAILED masked
+                // as "working via direct/nat64" hid credential misconfiguration).
+                // Transient EGRESS_FAILED / ROUTE_FAILED / timeouts still fall
+                // through to the next egress in the order.
+                if (error instanceof errors_1.CoreError && (error.code === "AUTH_FAILED" || error.code === "CONFIGURATION_ERROR" || error.code === "INVALID_DESTINATION"))
+                    throw error;
                 lastError = error;
                 if (signal.aborted)
                     throw signal.reason;
@@ -10300,6 +14128,24 @@ async function bridgeVlessDnsUdp(reader, writer, session, dns, signal) {
             throw error;
         }
     };
+    // C-1: same pause-and-retry as the bridge download pump — a transient
+    // queue-full on the response write pauses instead of failing the session.
+    const writeClient = async (data) => {
+        for (;;) {
+            try {
+                await writer.write(data, signal);
+                return;
+            }
+            catch (error) {
+                const normalized = error instanceof errors_1.CoreError ? error : null;
+                if (normalized?.code === "MESSAGE_TOO_LARGE" && normalized.retryable && writer.waitForRoom) {
+                    await writer.waitForRoom(signal, data.byteLength);
+                    continue;
+                }
+                throw error;
+            }
+        }
+    };
     let responseHeaderSent = false;
     let queries = 0;
     while (!signal.aborted) {
@@ -10317,24 +14163,37 @@ async function bridgeVlessDnsUdp(reader, writer, session, dns, signal) {
         if (!query)
             return;
         queries++;
-        const response = await dns.queryRaw(query, signal);
-        // The 2-byte VLESS UDP frame caps payloads at 0xffff bytes, one byte below
-        // the DNS layer's 64 KiB response bound; an oversize response cannot be
-        // framed and fails the session rather than being truncated (A10 note).
-        if (response.byteLength > 0xffff)
-            throw new errors_1.CoreError("MESSAGE_TOO_LARGE", "DNS response exceeds VLESS UDP frame size");
-        const frame = new Uint8Array(2 + response.byteLength);
-        new DataView(frame.buffer).setUint16(0, response.byteLength, false);
-        frame.set(response, 2);
-        if (!responseHeaderSent && session.responseHeader?.byteLength) {
-            const out = new Uint8Array(session.responseHeader.byteLength + frame.byteLength);
-            out.set(session.responseHeader);
-            out.set(frame, session.responseHeader.byteLength);
-            await writer.write(out, signal);
-            responseHeaderSent = true;
+        try {
+            const response = await dns.queryRaw(query, signal);
+            // The 2-byte VLESS UDP frame caps payloads at 0xffff bytes, one byte below
+            // the DNS layer's 64 KiB response bound; an oversize response cannot be
+            // framed and fails the session rather than being truncated (A10 note).
+            if (response.byteLength > 0xffff)
+                throw new errors_1.CoreError("MESSAGE_TOO_LARGE", "DNS response exceeds VLESS UDP frame size");
+            const frame = new Uint8Array(2 + response.byteLength);
+            new DataView(frame.buffer).setUint16(0, response.byteLength, false);
+            frame.set(response, 2);
+            if (!responseHeaderSent && session.responseHeader?.byteLength) {
+                const out = new Uint8Array(session.responseHeader.byteLength + frame.byteLength);
+                out.set(session.responseHeader);
+                out.set(frame, session.responseHeader.byteLength);
+                await writeClient(out);
+                responseHeaderSent = true;
+            }
+            else {
+                await writeClient(frame);
+            }
         }
-        else {
-            await writer.write(frame, signal);
+        catch (error) {
+            // C-6: a client close during queryRaw or the response write is a clean
+            // end, matching the read-side guard — not a session failure. A signal
+            // abort is likewise a clean end (the loop condition would end it on
+            // the next iteration anyway).
+            if (signal.aborted)
+                return;
+            if (error instanceof errors_1.CoreError && error.code === "CLIENT_CLOSED")
+                return;
+            throw error;
         }
     }
 }
@@ -10382,6 +14241,29 @@ async function bridgeSession(reader, clientWriter, upstream, options) {
     };
     const fail = (error) => { if (!state.failure)
         state.failure = (0, errors_1.asCoreError)(error); bridgeAbort.abort(state.failure); };
+    // C-1: pause-and-retry on transient queue-full instead of failing the
+    // session on a slow client. A MESSAGE_TOO_LARGE with retryable=true
+    // means room will exist after the peer drains, so wait for it (bounded
+    // by the combined signal: session deadline/idle timeout still fire) and
+    // retry. Permanent oversize (retryable=false) and writers without
+    // waitForRoom still fail immediately. The loop cannot spin: each
+    // waitForRoom returns only when the full chunk fits (or the signal
+    // fires), so a retry after a wait either succeeds or waits again on a
+    // genuinely changed queue state.
+    const writeToClient = async (data, signal) => {
+        for (;;) {
+            try {
+                await clientWriter.write(data, signal);
+                return;
+            }
+            catch (error) {
+                const normalized = error instanceof errors_1.CoreError ? error : (0, errors_1.asCoreError)(error);
+                if (normalized.code !== "MESSAGE_TOO_LARGE" || !normalized.retryable || !clientWriter.waitForRoom)
+                    throw error;
+                await clientWriter.waitForRoom(signal, data.byteLength);
+            }
+        }
+    };
     const recordDeadlineAbort = () => {
         if (!combined.signal.aborted || state.failure)
             return;
@@ -10394,7 +14276,7 @@ async function bridgeSession(reader, clientWriter, upstream, options) {
     try {
         const sendHeader = options.sendResponseHeader !== false && options.session.responseHeader?.byteLength;
         if (sendHeader) {
-            await clientWriter.write(options.session.responseHeader, combined.signal);
+            await writeToClient(options.session.responseHeader, combined.signal);
             state.responseHeaderSent = true;
             touch();
         }
@@ -10408,10 +14290,14 @@ async function bridgeSession(reader, clientWriter, upstream, options) {
         // never start the timer and can wait for a first byte forever.
         armFirstByteTimer();
         const upload = async () => {
-            const writer = upstream.writable.getWriter();
-            const abortWriter = () => { void writer.abort(combined.signal.reason).catch(() => { }); };
+            // C-2: acquisition sits INSIDE the try block. Acquiring outside it
+            // let a throw escape the pump, so Promise.all rejected immediately
+            // and the surviving pump was left detached during teardown.
+            let writer = null;
+            const abortWriter = () => { void writer?.abort(combined.signal.reason).catch(() => { }); };
             combined.signal.addEventListener("abort", abortWriter, { once: true });
             try {
+                writer = upstream.writable.getWriter();
                 if (options.session.initialPayload.byteLength) {
                     await writer.write(options.session.initialPayload);
                     armFirstByteTimer();
@@ -10438,18 +14324,22 @@ async function bridgeSession(reader, clientWriter, upstream, options) {
             }
             finally {
                 combined.signal.removeEventListener("abort", abortWriter);
-                try {
-                    await writer.close();
+                if (writer) {
+                    try {
+                        await writer.close();
+                    }
+                    catch { /* peer may already be closed */ }
+                    writer.releaseLock();
                 }
-                catch { /* peer may already be closed */ }
-                writer.releaseLock();
             }
         };
         const download = async () => {
-            const streamReader = upstream.readable.getReader();
-            const cancelReader = () => { void streamReader.cancel(combined.signal.reason).catch(() => { }); };
+            // C-2: same as upload — acquisition inside the try block.
+            let streamReader = null;
+            const cancelReader = () => { void streamReader?.cancel(combined.signal.reason).catch(() => { }); };
             combined.signal.addEventListener("abort", cancelReader, { once: true });
             try {
+                streamReader = upstream.readable.getReader();
                 while (!combined.signal.aborted) {
                     const result = await streamReader.read();
                     if (result.done) {
@@ -10463,7 +14353,7 @@ async function bridgeSession(reader, clientWriter, upstream, options) {
                     state.firstByteReceived = true;
                     firstByteAt ??= Date.now();
                     disarmFirstByteTimer();
-                    await clientWriter.write(result.value, combined.signal);
+                    await writeToClient(result.value, combined.signal);
                     touch();
                 }
             }
@@ -10474,7 +14364,7 @@ async function bridgeSession(reader, clientWriter, upstream, options) {
             finally {
                 disarmFirstByteTimer();
                 combined.signal.removeEventListener("abort", cancelReader);
-                streamReader.releaseLock();
+                streamReader?.releaseLock();
             }
         };
         await Promise.all([upload(), download()]);
@@ -10522,7 +14412,12 @@ async function closeUpstreamWithTimeout(close, timeoutMs = 1000) {
     let timer;
     try {
         await Promise.race([
-            close().catch(() => { }),
+            // C-10: a synchronous throw from close() used to propagate out of
+            // this helper and mask the bridge outcome from the finally block
+            // that awaits it. Route through a resolved promise so even a sync
+            // throw becomes a swallowed rejection. Theoretical only (every
+            // in-tree close() is async), but one line to close it.
+            Promise.resolve().then(close).catch(() => { }),
             new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
         ]);
     }
@@ -10585,6 +14480,7 @@ class DnsEngine {
     enabled;
     strategy;
     timeoutMs;
+    overallTimeoutMs;
     retries;
     fallback;
     cache;
@@ -10596,11 +14492,24 @@ class DnsEngine {
         const mode = (0, router_1.parseEgressMode)(env.EGRESS_MODE);
         const nat64MayNeedDns = mode === "nat64" || mode === "smart";
         this.dnsDisabledWithNat64Fallback = enabledRaw ? /^(0|false|no|off)$/i.test(enabledRaw) && nat64MayNeedDns : false;
+        // DNS-1: an invalid truthy value (e.g. a typo like "enable") used to
+        // silently disable DNS — inconsistent with parseBoolean below, which
+        // throws on invalid booleans. Now it fails closed at construction,
+        // matching startup validation (which already flagged it).
         this.enabled = enabledRaw
-            ? /^(1|true|yes|on)$/i.test(enabledRaw)
+            ? /^(1|true|yes|on)$/i.test(enabledRaw) ? true
+                : /^(0|false|no|off)$/i.test(enabledRaw) ? false
+                    : (() => { throw new errors_1.CoreError("CONFIGURATION_ERROR", "DNS_ENABLED must be one of true, false, 1, 0, yes, no, on, off"); })()
             : Boolean(env.DNS_RESOLVERS?.trim() || env.DNS_HOSTS?.trim() || nat64MayNeedDns);
         this.strategy = parseDnsStrategy(env.DNS_IP_PREFERENCE);
         this.timeoutMs = parseBoundedInteger(env.DNS_TIMEOUT_MS, 3000, "DNS_TIMEOUT_MS", 100, 60_000);
+        // DNS-8: one overall deadline per resolve()/queryRaw() call, bounding
+        // the pathological chain (many resolvers x CNAME hops x retries at a
+        // 60 s per-attempt timeout). Default 30 s covers the default
+        // configuration several times over (2 resolvers x 2 families x 8 hops
+        // x 2 attempts at 3 s would already be cut off — the budget of 64
+        // POSTs is the hard cap, this deadline is the time cap).
+        this.overallTimeoutMs = parseBoundedInteger(env.DNS_OVERALL_TIMEOUT_MS, 30_000, "DNS_OVERALL_TIMEOUT_MS", 1000, 300_000);
         this.retries = parseBoundedInteger(env.DNS_RETRIES, 1, "DNS_RETRIES", 0, 5);
         this.fallback = parseBoolean(env.DNS_FALLBACK, true);
         this.cache = parseBoolean(env.DNS_CACHE, true) ? new cache_1.DnsCache(parseBoundedInteger(env.DNS_CACHE_MAX_ENTRIES, 1024, "DNS_CACHE_MAX_ENTRIES", 1, 100_000), parseBoundedInteger(env.DNS_CACHE_MAX_TTL, 300, "DNS_CACHE_MAX_TTL", 1, 86_400), parseBoundedInteger(env.DNS_CACHE_NEGATIVE_TTL, 30, "DNS_CACHE_NEGATIVE_TTL", 1, 3_600)) : null;
@@ -10610,11 +14519,19 @@ class DnsEngine {
             ? (0, config_1.parseDohResolverEndpoints)(env.DNS_RESOLVERS, maxResolvers).map((endpoint) => new doh_1.DoHResolver({ endpoint, timeoutMs: this.timeoutMs, retries: this.retries, cache: this.cache ?? undefined }))
             : [];
     }
+    // DNS-8: combine the caller's signal with the per-call deadline. A
+    // deadline abort surfaces as TIMEOUT (not the caller's raw reason), so
+    // the control layer reports it as 504 rather than a generic 500.
+    deadlineSignal(signal) {
+        const deadline = AbortSignal.timeout(this.overallTimeoutMs);
+        return { signal: signal.aborted ? signal : AbortSignal.any([signal, deadline]), deadline };
+    }
     async queryRaw(message, signal) {
         if (!this.enabled)
             throw new errors_1.CoreError("DNS_FAILED", "DNS resolver is disabled", true);
         if (message.byteLength < 1 || message.byteLength > limits_1.CORE_LIMITS.maxDoHQueryBytes)
             throw new errors_1.CoreError("MESSAGE_TOO_LARGE", `DNS message must be 1..${limits_1.CORE_LIMITS.maxDoHQueryBytes} bytes`);
+        const { signal: bounded, deadline } = this.deadlineSignal(signal);
         let lastError;
         // DS-M6: one fresh budget per call, shared across all resolvers.
         const attemptBudget = new doh_1.DnsAttemptBudgetCounter();
@@ -10623,12 +14540,14 @@ class DnsEngine {
             if (!rawResolver.queryRaw)
                 continue;
             try {
-                return await rawResolver.queryRaw(message, signal, attemptBudget);
+                return await rawResolver.queryRaw(message, bounded, attemptBudget);
             }
             catch (error) {
                 lastError = error;
-                if (signal.aborted)
-                    throw signal.reason;
+                if (deadline.aborted)
+                    throw new errors_1.CoreError("TIMEOUT", "DNS resolution exceeded the overall deadline", true);
+                if (bounded.aborted)
+                    throw bounded.reason;
                 if (!this.fallback)
                     break;
             }
@@ -10651,9 +14570,16 @@ class DnsEngine {
             const values = await this.hosts.resolve(clean, strategy, signal);
             if (values.length)
                 return values;
+            // DNS-9: a hosts pin is terminal. If an entry exists for this host
+            // but has no address for the requested family (e.g. IPv4-only pin
+            // under strategy ipv6), falling through to DoH would silently
+            // defeat the pin — miss and family-mismatch are now distinguished.
+            if (this.hosts.has(clean))
+                return [];
         }
         if (!this.enabled)
             return [];
+        const { signal: bounded, deadline } = this.deadlineSignal(signal);
         let lastError;
         // DS-M6: one fresh budget per call, shared across resolvers, both
         // families (auto) and every CNAME hop. A fresh counter per call (not
@@ -10662,7 +14588,7 @@ class DnsEngine {
         const attemptBudget = new doh_1.DnsAttemptBudgetCounter();
         for (const resolver of this.resolvers) {
             try {
-                const values = await resolver.resolve(clean, strategy, signal, attemptBudget);
+                const values = await resolver.resolve(clean, strategy, bounded, attemptBudget);
                 if (values.length)
                     return values;
                 if (!this.fallback)
@@ -10670,8 +14596,10 @@ class DnsEngine {
             }
             catch (error) {
                 lastError = error;
-                if (signal.aborted)
-                    throw signal.reason;
+                if (deadline.aborted)
+                    throw new errors_1.CoreError("TIMEOUT", "DNS resolution exceeded the overall deadline", true);
+                if (bounded.aborted)
+                    throw bounded.reason;
                 if (!this.fallback)
                     break;
             }
@@ -10690,6 +14618,7 @@ class DnsEngine {
             resolver_count: this.resolvers.length,
             fallback: this.fallback,
             timeout_ms: this.timeoutMs,
+            overall_timeout_ms: this.overallTimeoutMs,
             retries: this.retries,
             warnings: this.dnsDisabledWithNat64Fallback ? [{
                     code: "DNS_DISABLED_NAT64_DOMAIN_FALLBACK",
@@ -10810,14 +14739,28 @@ class HostsResolver {
             const key = (0, hostname_1.toAsciiHostname)(host).toLowerCase().replace(/\.$/, "") || host.toLowerCase().replace(/\.$/, "");
             const values = this.map.get(key) ?? [];
             const normalizedAddress = address.replace(/^\[|\]$/g, "").toLowerCase();
-            values.push({ address: normalizedAddress, family, ttl: 0 });
+            // DNS-9: repeated IPs are not returned twice.
+            if (!values.some((item) => item.address === normalizedAddress && item.family === family)) {
+                values.push({ address: normalizedAddress, family, ttl: 0 });
+            }
             this.map.set(key, values);
         }
     }
     get size() { return this.map.size; }
+    // DNS-9: whether any pin exists for this host (any family) — lets the
+    // engine distinguish a family-mismatch pin (terminal []) from a miss
+    // (fall through to DoH). Uses the constructor's key normalization.
+    has(host) {
+        const key = (0, hostname_1.toAsciiHostname)(host).toLowerCase().replace(/\.$/, "") || host.toLowerCase().replace(/\.$/, "");
+        return this.map.has(key);
+    }
     diagnostics() { return { type: "hosts", queries: 0, successes: 0, failures: 0 }; }
     async resolve(host, strategy, _signal) {
-        const values = this.map.get(host.toLowerCase().replace(/\.$/, "")) ?? [];
+        // DNS-9: lookup normalizes exactly like the constructor keys
+        // (IDNA via toAsciiHostname), so Unicode entries match for direct
+        // HostsResolver callers too, not only via DnsEngine pre-normalization.
+        const key = (0, hostname_1.toAsciiHostname)(host).toLowerCase().replace(/\.$/, "") || host.toLowerCase().replace(/\.$/, "");
+        const values = this.map.get(key) ?? [];
         if (strategy === "ipv4")
             return values.filter((item) => item.family === 4);
         if (strategy === "ipv6")
@@ -10990,7 +14933,9 @@ function buildRuntimeConfig(env) {
     return {
         handshakeTimeoutMs: integer(env.CORE_HANDSHAKE_TIMEOUT_MS, limits_1.CORE_LIMITS.defaultHandshakeTimeoutMs, 100, 60_000, "CORE_HANDSHAKE_TIMEOUT_MS"),
         egressConnectTimeoutMs: integer(env.EGRESS_CONNECT_TIMEOUT_MS, limits_1.CORE_LIMITS.defaultEgressConnectTimeoutMs, 100, 60_000, "EGRESS_CONNECT_TIMEOUT_MS"),
-        idleTimeoutMs: integer(env.CORE_IDLE_TIMEOUT_MS, 0, 0, 24 * 60 * 60 * 1000, "CORE_IDLE_TIMEOUT_MS"),
+        // CORE-4: bounded by default (300s); 0 still disables explicitly. Matches the
+        // validation fallback in src/config/validation.ts (CFG-7).
+        idleTimeoutMs: integer(env.CORE_IDLE_TIMEOUT_MS, limits_1.CORE_LIMITS.defaultIdleTimeoutMs, 0, 24 * 60 * 60 * 1000, "CORE_IDLE_TIMEOUT_MS"),
         maxSessionDurationMs: integer(env.CORE_MAX_SESSION_MS, limits_1.CORE_LIMITS.maxSessionDurationMs, 0, 7 * 24 * 60 * 60 * 1000, "CORE_MAX_SESSION_MS"),
         maxEgressDecisionMs: integer(env.CORE_MAX_EGRESS_DECISION_MS, limits_1.CORE_LIMITS.defaultMaxEgressDecisionMs, 1_000, 120_000, "CORE_MAX_EGRESS_DECISION_MS"),
         retry,
@@ -11062,10 +15007,44 @@ class WebSocketByteWriter {
             this.queue.splice(0, this.queue.length, ...kept);
         }
     }
-    /** Bytes handed to the runtime send buffer but not yet consumed by the peer. */
+    /** Bytes handed to the runtime send buffer but not yet consumed by the peer.
+     * TU-10 (documented, not changed): a missing/non-finite bufferedAmount
+     * falls back to 0. Standard WebSocket defines bufferedAmount, but
+     * Cloudflare-Workers server-socket support for it is UNVERIFIED — if the
+     * runtime ever lacks it, admission and drain gating degenerate to
+     * queue-only accounting. The queue bound still caps the snapshot. */
     socketBufferedBytes() {
         const buffered = this.socket.bufferedAmount;
         return typeof buffered === "number" && Number.isFinite(buffered) && buffered > 0 ? buffered : 0;
+    }
+    // C-1: pause until at least one byte of room exists (queue + runtime
+    // send buffer below the bound), so a slow client pauses upstream instead
+    // of killing the session. Abort-aware; throws CLIENT_CLOSED when the
+    // socket closes while waiting. The bridge download pump uses this to
+    // retry transient queue-full rejections instead of failing the session.
+    async waitForRoom(signal, minBytes = 1) {
+        while (!this.closed && this.socket.readyState === WebSocket.OPEN) {
+            if (signal?.aborted)
+                throw signal.reason;
+            if (this.maxQueuedBytes - this.queuedBytes - this.socketBufferedBytes() >= minBytes)
+                return;
+            await new Promise((resolve, reject) => {
+                let onAbort;
+                const cleanup = () => { if (signal && onAbort)
+                    signal.removeEventListener("abort", onAbort); };
+                const timer = setTimeout(() => { cleanup(); resolve(); }, 10);
+                if (signal) {
+                    onAbort = () => { clearTimeout(timer); cleanup(); reject(signal.reason); };
+                    if (signal.aborted) {
+                        clearTimeout(timer);
+                        reject(signal.reason);
+                        return;
+                    }
+                    signal.addEventListener("abort", onAbort, { once: true });
+                }
+            });
+        }
+        throw new errors_1.CoreError("CLIENT_CLOSED", "WebSocket is closed");
     }
     async write(data, signal) {
         if (data.byteLength === 0)
@@ -11074,6 +15053,13 @@ class WebSocketByteWriter {
             throw signal.reason;
         if (this.closed || this.socket.readyState !== WebSocket.OPEN)
             throw new errors_1.CoreError("CLIENT_CLOSED", "WebSocket is closed");
+        // TU-9: split the flag by case. A write larger than the whole bound can
+        // never succeed (permanent oversize -> retryable: false); a write that
+        // merely exceeds currently-available room can succeed after the peer
+        // drains (transient backpressure -> retryable: true).
+        if (data.byteLength > this.maxQueuedBytes) {
+            throw new errors_1.CoreError("MESSAGE_TOO_LARGE", `WebSocket write of ${data.byteLength} bytes exceeds the ${this.maxQueuedBytes} byte queue bound`, false);
+        }
         // Admission accounts for both this queue and the runtime send buffer
         // (A1), and the check + the synchronous reservations in enqueue() happen
         // before the first await, so overlapping write() calls cannot jointly
@@ -11094,7 +15080,13 @@ class WebSocketByteWriter {
                 reject(signal.reason);
                 return;
             }
-            // Defense in depth (A16): re-validate at reservation time.
+            // Defense in depth (A16): re-validate at reservation time. TU-9: a
+            // chunk larger than the whole bound is permanent (retryable: false);
+            // queue-full at reservation time is transient (retryable: true).
+            if (data.byteLength > this.maxQueuedBytes) {
+                reject(new errors_1.CoreError("MESSAGE_TOO_LARGE", `WebSocket write chunk exceeds the ${this.maxQueuedBytes} byte queue bound`, false));
+                return;
+            }
             if (this.queuedBytes + data.byteLength > this.maxQueuedBytes) {
                 reject(new errors_1.CoreError("MESSAGE_TOO_LARGE", `WebSocket outbound queue exceeds ${this.maxQueuedBytes} bytes`, true));
                 return;
@@ -11173,6 +15165,7 @@ const runtime_1 = __r("../config/runtime");
 const planning_1 = __r("./planning");
 const aggregation_1 = __r("./aggregation");
 const share_link_1 = __r("./share-link");
+const generator_options_1 = __r("./generator-options");
 const artifacts_1 = __r("./artifacts");
 function budget(env) {
     return (0, runtime_1.buildRuntimeConfig)(env).output;
@@ -11223,7 +15216,7 @@ function fitNativeLines(lines, maxBytes, encoding) {
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `Output byte budget ${maxBytes} bytes is too small to fit a single node`);
     return { body: render(best), count: best, byteTruncated: best < lines.length };
 }
-function outputHeaders(page, returnedCount, byteTruncated) {
+function outputHeaders(page, returnedCount, byteTruncated, resumeOffset) {
     const headers = {
         "X-Core-Output-Count": String(returnedCount),
         "X-Core-Output-Limit": String(page.limit),
@@ -11233,7 +15226,11 @@ function outputHeaders(page, returnedCount, byteTruncated) {
     };
     if (page.limitClamped)
         headers["X-Core-Output-Limit-Clamped"] = "true";
-    if (page.hasMore)
+    // Same resume rule as artifacts.ts: a truncated page resumes at the first
+    // unrendered item of this page, never at the next page's offset.
+    if (byteTruncated && resumeOffset !== undefined)
+        headers["X-Core-Output-Next-Offset"] = String(resumeOffset);
+    else if (page.hasMore)
         headers["X-Core-Output-Next-Offset"] = String(page.nextOffset ?? (page.offset + page.items.length));
     return headers;
 }
@@ -11244,29 +15241,51 @@ async function renderSubscriptionWithProvider(env, request, provider, resolver, 
     }
     const selection = (0, planning_1.parseOutputSelection)(env, url.searchParams);
     const limits = budget(env);
-    const page = await (0, planning_1.buildOutputNodePage)(env, url.hostname, selection, (0, planning_1.createOutputCredentialSource)(provider), limits, request.signal, "native");
+    const generatorOptions = (0, generator_options_1.parseGeneratorOptions)(env);
+    const extraPreferred = await (0, generator_options_1.fetchPreferredIpEntries)(env, request.signal, { resolver });
+    const page = await (0, planning_1.buildOutputNodePage)(env, url.hostname, selection, (0, planning_1.createOutputCredentialSource)(provider), limits, request.signal, "native", extraPreferred);
+    // SCAN-06: an out-of-range offset is BAD_REQUEST, not an empty 200.
+    if (!page.items.length)
+        throw new errors_1.CoreError("BAD_REQUEST", "Output offset is outside the available candidate range");
     // DS-L25: native subscription lines carry the node name as a #remark
     // fragment, matching the remark + unique-passport naming the
     // sing-box/Xray/Clash outputs already use.
-    const lines = page.items.map((node) => (0, share_link_1.generateShareLink)(node, { includeFragment: true }));
+    const lines = (0, artifacts_1.shapeOutputNodes)(page.items, generatorOptions).map((node) => (0, share_link_1.generateShareLink)(node, { includeFragment: true }));
+    let aggregationHeader;
+    let aggregationDropped;
     if ((url.searchParams.get("aggregate") ?? "false").trim().toLowerCase() === "true") {
-        const external = await (0, aggregation_1.fetchNativeSubscriptionSources)(env, request.signal, 8, 256 * 1024, fetchImpl, resolver);
-        const output = [...lines];
-        const seen = new Set(output);
-        for (const line of external) {
-            if (output.length >= page.limit)
-                break;
-            if (!seen.has(line)) {
-                seen.add(line);
-                output.push(line);
-            }
-        }
+        const report = await (0, aggregation_1.fetchNativeSubscriptionSourcesWithReport)(env, request.signal, 8, 256 * 1024, fetchImpl, resolver);
+        // SCAN-03: the old loop broke as soon as native lines filled the limit,
+        // so external lines NEVER contributed when native lines sufficed. Reserve
+        // up to half the limit for external lines: dedup against all native
+        // lines first, keep at most half the limit of external lines, then trim
+        // native lines to make room.
+        const nativeSet = new Set(lines);
+        const externalDeduped = report.lines.filter((line) => !nativeSet.has(line));
+        const externalAllowance = Math.floor(page.limit / 2);
+        const externalKept = externalDeduped.slice(0, externalAllowance);
+        const nativeKept = lines.slice(0, Math.max(0, page.limit - externalKept.length));
         lines.length = 0;
-        lines.push(...output);
+        lines.push(...nativeKept, ...externalKept);
+        // SCAN-19: partial-failure signal. "complete" only when every source
+        // succeeded with at least one line; "partial" when any source failed,
+        // came back empty, or any line was dropped as malformed; "none" when
+        // aggregation contributed nothing at all.
+        aggregationHeader = externalKept.length === 0 && report.sourcesAttempted > 0
+            ? "none"
+            : report.sourcesFailed > 0 || report.sourcesEmpty > 0 || report.droppedMalformed > 0
+                ? "partial"
+                : "complete";
+        if (report.droppedMalformed > 0)
+            aggregationDropped = report.droppedMalformed;
     }
     const encoding = selectedEncode(request);
     const fitted = fitNativeLines(lines, limits.maxBytes, encoding);
-    const headers = outputHeaders(page, fitted.count, fitted.byteTruncated);
+    const headers = outputHeaders(page, fitted.count, fitted.byteTruncated, page.offset + fitted.count);
+    if (aggregationHeader)
+        headers["X-Core-Output-Aggregation"] = aggregationHeader;
+    if (aggregationDropped !== undefined)
+        headers["X-Core-Output-Aggregation-Dropped"] = String(aggregationDropped);
     return {
         body: fitted.body,
         contentType: "text/plain; charset=utf-8",
@@ -11276,8 +15295,8 @@ async function renderSubscriptionWithProvider(env, request, provider, resolver, 
         headers,
     };
 }
-async function renderCoreFormat(env, request, provider, format) {
-    const rendered = await (0, artifacts_1.renderOutputArtifact)(env, request, provider, format);
+async function renderCoreFormat(env, request, provider, format, resolver) {
+    const rendered = await (0, artifacts_1.renderOutputArtifact)(env, request, provider, format, resolver);
     return {
         body: rendered.body,
         contentType: rendered.contentType,
@@ -11295,6 +15314,7 @@ async function renderCoreFormat(env, request, provider, format) {
 __m["output/artifacts"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.shapeOutputNodes = shapeOutputNodes;
 exports.renderOutputArtifact = renderOutputArtifact;
 exports.parseArtifact = parseArtifact;
 const limits_1 = __r("../core/limits");
@@ -11304,6 +15324,7 @@ const planning_1 = __r("./planning");
 const adapters_1 = __r("./adapters");
 const profiles_1 = __r("./profiles");
 const rules_1 = __r("./rules");
+const generator_options_1 = __r("./generator-options");
 const outbounds_1 = __r("./outbounds");
 const compatibility_1 = __r("./compatibility");
 function budget(env) {
@@ -11317,7 +15338,7 @@ function fitNodes(nodes, render, maxBytes, renderedCount = (items) => items.leng
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "No nodes are available for output");
     const full = render(nodes);
     if (bytesOf(full) <= maxBytes)
-        return { body: full, count: renderedCount(nodes), byteTruncated: false };
+        return { body: full, count: renderedCount(nodes), byteTruncated: false, fittedNodes: nodes.length };
     let low = 1;
     let high = nodes.length;
     let best = 0;
@@ -11332,13 +15353,43 @@ function fitNodes(nodes, render, maxBytes, renderedCount = (items) => items.leng
     }
     if (best === 0)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `Output byte budget ${maxBytes} bytes is too small to fit a single node`);
-    return { body: render(nodes.slice(0, best)), count: renderedCount(nodes.slice(0, best)), byteTruncated: best < nodes.length };
+    return { body: render(nodes.slice(0, best)), count: renderedCount(nodes.slice(0, best)), byteTruncated: best < nodes.length, fittedNodes: best };
+}
+// P3 IPv4 wrap (opt-in): a bare-IPv4 node server is rewritten as a dash-form
+// sslip.io hostname so clients that need a domain SNI can use the node. The
+// WebSocket Host header is untouched (it already carries the worker host).
+// sslip.io is a third-party DNS mapping service: enabling this trusts it for
+// the dial address, so it stays off by default.
+function isIpv4Literal(value) {
+    const parts = value.split(".");
+    return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+function shapeOutputNodes(nodes, opts) {
+    if (!opts.ipv4Wrap)
+        return [...nodes];
+    return nodes.map((node) => {
+        if (!isIpv4Literal(node.server))
+            return node;
+        const wrapped = `${node.server.replaceAll(".", "-")}.sslip.io`;
+        return { ...node, server: wrapped, ...(node.tls ? { tls: { ...node.tls, serverName: wrapped } } : {}) };
+    });
 }
 function effectiveSelection(selection, limitOverride) {
     return limitOverride === undefined ? selection : { ...selection, limit: limitOverride };
 }
 function formatLabel(format) {
     return format === "sing-box" ? "singbox" : format;
+}
+// Surge renders plain text like Clash; xray/sing-box render JSON.
+function textContentType(format) {
+    return format === "clash" || format === "surge" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8";
+}
+function formatExtension(format) {
+    if (format === "clash")
+        return "yaml";
+    if (format === "surge")
+        return "conf";
+    return "json";
 }
 function parseArtifact(params) {
     const value = (params.get("artifact") ?? "manifest").trim().toLowerCase();
@@ -11363,8 +15414,11 @@ function artifactUrl(request, artifact, _target, extra = "") {
 function fragmentClientRequirements(target, kind) {
     if (kind !== "best-fragment" && kind !== "best-ping-fragment")
         return undefined;
+    // Fragment requirement wording: the exact tag v26.6.27 is UNVERIFIED
+    // (26.7.28/26.10.21/26.9.30 were seen, not 26.6.27), so the requirement is
+    // stated as "at least a v26 core" with the feature named, not a fake tag.
     if (target === "xray")
-        return ["Xray-core >= v26.6.27 (FinalMask TCP fragment lengths/delays support)"];
+        return ["Xray-core v26+ (FinalMask TCP fragment lengths/delays support)"];
     if (target === "sing-box")
         return ["sing-box >= 1.12.0 (TLS fragment/record_fragment support)"];
     return undefined;
@@ -11401,21 +15455,48 @@ function allowedProtocolCount(selection, target, security) {
         return true;
     return (0, compatibility_1.supportsOutputCombination)(target, selection.protocol, security);
 }
-async function pageFor(env, request, provider, target, selection, limitOverride) {
+async function pageFor(env, request, provider, target, selection, limitOverride, resolver) {
     const actualSelection = selection ?? (0, planning_1.parseOutputSelection)(env, new URL(request.url).searchParams);
-    return (0, planning_1.buildOutputNodePage)(env, new URL(request.url).hostname, effectiveSelection(actualSelection, limitOverride), (0, planning_1.createOutputCredentialSource)(provider), budget(env), request.signal, target);
+    // URL-fetched preferred IPs (cached 10s; empty when the var is unset).
+    // Fail-closed when a resolver is unavailable for a hostname URL.
+    const extraPreferred = await (0, generator_options_1.fetchPreferredIpEntries)(env, request.signal, { resolver });
+    return (0, planning_1.buildOutputNodePage)(env, new URL(request.url).hostname, effectiveSelection(actualSelection, limitOverride), (0, planning_1.createOutputCredentialSource)(provider), budget(env), request.signal, target, extraPreferred);
 }
 function baseOptions(env, fragmentArtifact = false) {
     const earlyData = (0, planning_1.parseOutputEarlyData)(env) ?? 0;
+    const generatorOptions = (0, generator_options_1.parseGeneratorOptions)(env);
+    // P2 chain outbounds join each target's custom set (peers reachable via
+    // rules, same v1 promise as existing custom outbounds). Warp joins the
+    // pool (balancer/group member) for xray/sing-box/clash; Surge gets no Warp
+    // lines (no verified Surge WireGuard proxy syntax in this release).
+    const chain = generatorOptions.chainOutbounds;
+    const warp = generatorOptions.warpEnabled && generatorOptions.warp ? generatorOptions.warp : null;
     return {
         // Client-side routing rules and custom outbounds. Startup validation has
         // already passed by the time a render runs (worker startup + control
         // routes both validate); the parse calls below are defense in depth for
         // direct renderers and fail the artifact closed on malformed input.
-        routingRules: (0, rules_1.parseRoutingRules)(env.CORE_OUTPUT_ROUTING_RULES),
-        singboxOutbounds: (0, outbounds_1.parseOutbounds)("sing-box", env.CORE_OUTPUT_SINGBOX_OUTBOUNDS),
-        xrayOutbounds: (0, outbounds_1.parseOutbounds)("xray", env.CORE_OUTPUT_XRAY_OUTBOUNDS),
-        clashProxies: (0, outbounds_1.parseOutbounds)("clash", env.CORE_OUTPUT_CLASH_PROXIES),
+        // Routing packs append AFTER user rules: first-match in every target
+        // means user rules always win over pack rules.
+        routingRules: [...(0, rules_1.parseRoutingRules)(env.CORE_OUTPUT_ROUTING_RULES), ...(0, rules_1.parseRoutingPacks)(env.CORE_OUTPUT_ROUTING_PACK)],
+        singboxOutbounds: [...(0, outbounds_1.parseOutbounds)("sing-box", env.CORE_OUTPUT_SINGBOX_OUTBOUNDS), ...chain.map((e) => (0, generator_options_1.translateChainToSingbox)(e))],
+        xrayOutbounds: [...(0, outbounds_1.parseOutbounds)("xray", env.CORE_OUTPUT_XRAY_OUTBOUNDS), ...chain.map((e) => (0, generator_options_1.translateChainToXray)(e))],
+        clashProxies: [...(0, outbounds_1.parseOutbounds)("clash", env.CORE_OUTPUT_CLASH_PROXIES), ...chain.map((e) => (0, generator_options_1.translateChainToClash)(e))],
+        surgeCustomLines: chain.map((e) => (0, generator_options_1.translateChainToSurgeLine)(e)),
+        surgePoolLines: [],
+        ...(warp ? {
+            xrayPoolOutbounds: [(0, generator_options_1.buildWarpXray)(warp)],
+            singboxPoolOutbounds: [(0, generator_options_1.buildWarpSingbox)(warp)],
+            clashPoolOutbounds: [(0, generator_options_1.buildWarpClash)(warp)],
+        } : {}),
+        // F8/DNS: precomputed DNS sections. Builders fall back to the old
+        // hardcoded sections when these are absent (direct callers).
+        xrayDns: (0, generator_options_1.buildXrayDns)(env, generatorOptions),
+        xrayFakeDns: (0, generator_options_1.buildXrayFakeDns)(generatorOptions),
+        xrayDnsInbound: (0, generator_options_1.buildXrayDnsInbound)(env, generatorOptions),
+        singboxDns: (0, generator_options_1.buildSingboxDns)(env, generatorOptions),
+        singboxEch: (0, generator_options_1.buildSingboxEch)(env, generatorOptions),
+        clashDns: (0, generator_options_1.buildClashDns)(env, generatorOptions),
         probeUrl: env.CORE_OUTPUT_PROBE_URL?.trim() || "https://www.gstatic.com/generate_204",
         probeInterval: fragmentArtifact
             ? env.CORE_XRAY_FRAGMENT_PROBE_INTERVAL?.trim() || "1s"
@@ -11423,20 +15504,28 @@ function baseOptions(env, fragmentArtifact = false) {
         // Fragment artifacts expand every base TLS node across profiles. Default to serial, one-second
         // probes for this matrix to avoid a synchronized burst; operators may explicitly opt back in.
         observatoryConcurrency: fragmentArtifact
-            ? parseBoolWithDefault(env.CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY, false)
-            : parseBoolWithDefault(env.CORE_XRAY_OBSERVATORY_CONCURRENCY, true),
-        interval: "30s",
-        tolerance: 50,
+            ? parseBoolWithDefault(env.CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY, false, "CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY")
+            : parseBoolWithDefault(env.CORE_XRAY_OBSERVATORY_CONCURRENCY, true, "CORE_XRAY_OBSERVATORY_CONCURRENCY"),
+        // SCAN-14: urltest interval/tolerance are operator vars now, not hardcoded.
+        interval: generatorOptions.singboxUrltestInterval,
+        tolerance: generatorOptions.singboxUrltestTolerance,
+        mihomoInterval: generatorOptions.mihomoUrltestInterval,
+        mihomoTolerance: generatorOptions.mihomoUrltestTolerance,
         fragmentProfiles: [...(0, profiles_1.getXrayFragmentProfiles)(env)],
+        generatorOptions,
         ...(earlyData > 0 ? { earlyData } : {}),
         // Legacy flag, still forwarded for compatibility; since audit F3 the sing-box adapter
         // emits uTLS whenever the node carries a selected fingerprint, flag or not.
         ...(parseBool(env.CORE_OUTPUT_SINGBOX_UTLS) ? { useUtls: true } : {}),
         ...(parseBool(env.CORE_OUTPUT_ENABLE_TUN) ? { enableTun: true } : {}),
         ...(parseBool(env.CORE_OUTPUT_XRAY_ALLOW_DIRECT_FALLBACK) ? { allowDirectFallback: true } : {}),
+        ...(generatorOptions.xrayFallbackNode ? { fallbackNode: generatorOptions.xrayFallbackNode } : {}),
     };
 }
-function parseBoolWithDefault(raw, fallback) {
+// SCAN-13: the wrong-var error message is fixed by threading the field name
+// through (the old code always named CORE_XRAY_OBSERVATORY_CONCURRENCY, even
+// for the fragment var).
+function parseBoolWithDefault(raw, fallback, field) {
     const value = raw?.trim();
     if (!value)
         return fallback;
@@ -11444,7 +15533,7 @@ function parseBoolWithDefault(raw, fallback) {
         return true;
     if (/^(0|false|no|off)$/i.test(value))
         return false;
-    throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_XRAY_OBSERVATORY_CONCURRENCY must be a boolean");
+    throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must be a boolean`);
 }
 function parseBool(raw) {
     return /^(1|true|yes|on)$/i.test(raw?.trim() ?? "");
@@ -11459,9 +15548,18 @@ function profileBaseLimit(env, kind, requestedLimit) {
     }
     // `limit` describes logical base nodes. Never replace a smaller user-requested limit with the
     // expansion budget; the number of rendered variants is base-node count × profile count.
-    return Math.max(1, Math.min(requestedBaseLimit, Math.floor(maxNodes / Math.max(1, variants))));
+    // SCAN-21: shrinking the requested limit to the expansion budget is a clamp
+    // and is flagged, not done silently.
+    const limit = Math.max(1, Math.min(requestedBaseLimit, Math.floor(maxNodes / Math.max(1, variants))));
+    return { limit, clamped: limit < requestedBaseLimit };
 }
-function headerSet(page, returnedCount, kind, byteTruncated, profileCandidateCount, nextOffsetOverride) {
+// SCAN-01/02 resume rule, shared by every artifact: when byte truncation cut
+// the page short, the resume offset is the first UNRENDERED item of this page
+// (passed in as resumeOffset), NOT the next page's offset — resuming from the
+// next page would silently skip the truncated tail. When nothing was
+// truncated, the next page offset applies. Truncation therefore always emits
+// Next-Offset, even on the last page (where hasMore is false).
+function headerSet(page, returnedCount, kind, byteTruncated, profileCandidateCount, resumeOffset, profileLimitClamped) {
     const headers = {
         "X-Core-Output-Artifact": kind,
         "X-Core-Output-Count": String(returnedCount),
@@ -11470,13 +15568,25 @@ function headerSet(page, returnedCount, kind, byteTruncated, profileCandidateCou
         "X-Core-Output-Total": String(profileCandidateCount ?? page.candidateCount),
         "X-Core-Output-Truncated": String(byteTruncated || page.hasMore),
     };
-    if (page.limitClamped)
+    if (page.limitClamped || profileLimitClamped)
         headers["X-Core-Output-Limit-Clamped"] = "true";
-    if (page.hasMore)
-        headers["X-Core-Output-Next-Offset"] = String(nextOffsetOverride ?? page.nextOffset ?? (page.offset + page.items.length));
+    if (byteTruncated && resumeOffset !== undefined)
+        headers["X-Core-Output-Next-Offset"] = String(resumeOffset);
+    else if (page.hasMore)
+        headers["X-Core-Output-Next-Offset"] = String(page.nextOffset ?? (page.offset + page.items.length));
     return headers;
 }
-async function renderOutputArtifact(env, request, provider, format) {
+// SCAN-01: the fragment resume offset is the position in basePage.items of
+// the last rendered TLS node, +1 — NOT fitted-count / profiles, which
+// undercounts whenever plaintext candidates are interspersed.
+function fragmentResumeOffset(basePage, tlsNodes, fittedBaseCount) {
+    if (fittedBaseCount <= 0)
+        return basePage.offset;
+    const lastRendered = tlsNodes[fittedBaseCount - 1];
+    const index = basePage.items.indexOf(lastRendered);
+    return basePage.offset + (index < 0 ? fittedBaseCount : index + 1);
+}
+async function renderOutputArtifact(env, request, provider, format, resolver) {
     const url = new URL(request.url);
     const params = url.searchParams;
     const artifact = parseArtifact(params);
@@ -11485,8 +15595,9 @@ async function renderOutputArtifact(env, request, provider, format) {
     const target = format;
     const queryAuthUsed = Boolean(params.get("token"));
     const artifactAuth = queryAuthUsed ? "authorization-bearer" : undefined;
+    const generatorOptions = (0, generator_options_1.parseGeneratorOptions)(env);
     if (artifact === "manifest") {
-        const probePage = await pageFor(env, request, provider, target, selection, 1);
+        const probePage = await pageFor(env, request, provider, target, selection, 1, resolver);
         const manifestOptions = baseOptions(env);
         const mihomoRequirement = format === "clash"
             ? clashMihomoRequirement(manifestOptions.routingRules ?? [], new Set((manifestOptions.clashProxies ?? []).map((item) => String(item.name))))
@@ -11494,13 +15605,17 @@ async function renderOutputArtifact(env, request, provider, format) {
         const descriptors = [];
         descriptors.push(descriptor("nodes", "node", format, selection.protocol === "all" ? "mixed" : selection.protocol, artifactUrl(request, "node", format, "?offset=0&limit=1"), true, undefined, probePage.candidateCount, artifactAuth, mihomoRequirement));
         descriptors.push(descriptor("bundle", "bundle", format, selection.protocol === "all" ? "mixed" : selection.protocol, artifactUrl(request, "bundle", format), true, undefined, undefined, artifactAuth, mihomoRequirement));
-        descriptors.push(descriptor("best-ping", "best-ping", format, "mixed", artifactUrl(request, "best-ping", format), true, undefined, undefined, artifactAuth, mihomoRequirement));
+        // SCAN-07: best-ping's protocol is derived from the selection like the
+        // bundle descriptor's, not hardcoded to "mixed".
+        descriptors.push(descriptor("best-ping", "best-ping", format, selection.protocol === "all" ? "mixed" : selection.protocol, artifactUrl(request, "best-ping", format), true, undefined, undefined, artifactAuth, mihomoRequirement));
         if ((0, profiles_1.isProfileSupported)(format, "best-fragment")) {
             descriptors.push(descriptor("best-fragment", "best-fragment", format, "mixed", artifactUrl(request, "best-fragment", format), true, undefined, undefined, artifactAuth));
             descriptors.push(descriptor("best-ping-fragment", "best-ping-fragment", format, "mixed", artifactUrl(request, "best-ping-fragment", format), true, undefined, undefined, artifactAuth));
         }
         else {
-            const reason = "Current Mihomo/Clash configuration does not expose a portable TLS fragmentation field in its proxy TLS schema.";
+            const reason = format === "surge"
+                ? "Surge proxy files do not expose a portable TLS fragmentation field in this output model."
+                : "Current Mihomo/Clash configuration does not expose a portable TLS fragmentation field in its proxy TLS schema.";
             descriptors.push(descriptor("best-fragment", "best-fragment", format, "mixed", artifactUrl(request, "best-fragment", format), false, reason, undefined, artifactAuth));
             descriptors.push(descriptor("best-ping-fragment", "best-ping-fragment", format, "mixed", artifactUrl(request, "best-ping-fragment", format), false, reason, undefined, artifactAuth));
         }
@@ -11530,55 +15645,69 @@ async function renderOutputArtifact(env, request, provider, format) {
         };
     }
     if (artifact === "node") {
-        const page = await pageFor(env, request, provider, target, selection, 1);
+        const page = await pageFor(env, request, provider, target, selection, 1, resolver);
         if (!page.items.length)
             throw new errors_1.CoreError("BAD_REQUEST", "Output node offset is outside the available candidate range");
         const adapter = adapters_1.outputAdapters[format];
-        const fitted = fitNodes([page.items[0]], (nodes) => adapter.render(nodes, "node", baseOptions(env)), limits.maxBytes);
+        const shaped = shapeOutputNodes(page.items, generatorOptions);
+        const fitted = fitNodes(shaped.slice(0, 1), (nodes) => adapter.render(nodes, "node", baseOptions(env)), limits.maxBytes);
         const headers = headerSet(page, fitted.count, artifact, fitted.byteTruncated);
         return {
             body: fitted.body,
-            contentType: format === "clash" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8",
+            contentType: textContentType(format),
             count: 1,
             kind: artifact,
-            filename: `node-${page.offset + 1}.${format === "clash" ? "yaml" : "json"}`,
+            filename: `node-${page.offset + 1}.${formatExtension(format)}`,
             headers,
         };
     }
     if (artifact === "bundle") {
-        const page = await pageFor(env, request, provider, target, selection);
+        const page = await pageFor(env, request, provider, target, selection, undefined, resolver);
+        // SCAN-06: an out-of-range offset is BAD_REQUEST in every artifact, not
+        // CONFIGURATION_ERROR (bundle/best-ping via fitNodes) or empty 200 (native).
+        if (!page.items.length)
+            throw new errors_1.CoreError("BAD_REQUEST", "Output offset is outside the available candidate range");
         const adapter = adapters_1.outputAdapters[format];
-        const fitted = fitNodes(page.items, (nodes) => adapter.render(nodes, "bundle", baseOptions(env)), limits.maxBytes);
+        const shaped = shapeOutputNodes(page.items, generatorOptions);
+        const fitted = fitNodes(shaped, (nodes) => adapter.render(nodes, "bundle", baseOptions(env)), limits.maxBytes);
         return {
             body: fitted.body,
-            contentType: format === "clash" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8",
+            contentType: textContentType(format),
             count: fitted.count,
             kind: artifact,
-            filename: `cloudflare-proxy-core-${formatLabel(format)}-bundle.${format === "clash" ? "yaml" : "json"}`,
-            headers: headerSet(page, fitted.count, artifact, fitted.byteTruncated),
+            filename: `cloudflare-proxy-core-${formatLabel(format)}-bundle.${formatExtension(format)}`,
+            headers: headerSet(page, fitted.count, artifact, fitted.byteTruncated, undefined, page.offset + fitted.fittedNodes),
         };
     }
-    if (format === "clash" && (artifact === "best-fragment" || artifact === "best-ping-fragment")) {
-        throw new errors_1.CoreError("UNSUPPORTED_TRANSPORT", "Mihomo/Clash does not expose the Worker fragment profiles in this output model");
+    if ((format === "clash" || format === "surge") && (artifact === "best-fragment" || artifact === "best-ping-fragment")) {
+        throw new errors_1.CoreError("UNSUPPORTED_TRANSPORT", `${format === "clash" ? "Mihomo/Clash" : "Surge"} does not expose the Worker fragment profiles in this output model`);
     }
     if (artifact === "best-ping") {
-        const page = await pageFor(env, request, provider, target, selection);
+        const page = await pageFor(env, request, provider, target, selection, undefined, resolver);
+        if (!page.items.length)
+            throw new errors_1.CoreError("BAD_REQUEST", "Output offset is outside the available candidate range");
         const adapter = adapters_1.outputAdapters[format];
-        const fitted = fitNodes(page.items, (nodes) => adapter.render(nodes, "best-ping", baseOptions(env)), limits.maxBytes);
+        const shaped = shapeOutputNodes(page.items, generatorOptions);
+        const fitted = fitNodes(shaped, (nodes) => adapter.render(nodes, "best-ping", baseOptions(env)), limits.maxBytes);
         return {
             body: fitted.body,
-            contentType: format === "clash" ? "text/plain; charset=utf-8" : "application/json; charset=utf-8",
+            contentType: textContentType(format),
             count: fitted.count,
             kind: artifact,
-            filename: `best-ping.${format === "clash" ? "yaml" : "json"}`,
-            headers: headerSet(page, fitted.count, artifact, fitted.byteTruncated),
+            filename: `best-ping.${formatExtension(format)}`,
+            headers: headerSet(page, fitted.count, artifact, fitted.byteTruncated, undefined, page.offset + fitted.fittedNodes),
         };
     }
-    const baseLimit = profileBaseLimit(env, format === "xray" ? "xray" : "sing-box", selection.limit);
-    const basePage = await pageFor(env, request, provider, target, selection, baseLimit);
-    const tlsNodes = basePage.items.filter((node) => node.security === "tls" && allowedProtocolCount(selection, target, node.security));
-    if (!tlsNodes.length)
+    const { limit: baseLimit, clamped: baseLimitClamped } = profileBaseLimit(env, format === "xray" ? "xray" : "sing-box", selection.limit);
+    const basePage = await pageFor(env, request, provider, target, selection, baseLimit, resolver);
+    if (!basePage.items.length)
+        throw new errors_1.CoreError("BAD_REQUEST", "Output offset is outside the available candidate range");
+    // Keep the pre-shape list for the resume offset: shaping may replace node
+    // objects (IPv4 wrap), breaking indexOf against basePage.items.
+    const tlsBase = basePage.items.filter((node) => node.security === "tls" && allowedProtocolCount(selection, target, node.security));
+    if (!tlsBase.length)
         throw new errors_1.CoreError("BAD_REQUEST", `${artifact} requires at least one TLS-compatible node`);
+    const tlsNodes = shapeOutputNodes(tlsBase, generatorOptions);
     const adapter = adapters_1.outputAdapters[format];
     const options = baseOptions(env, true);
     if (format === "xray") {
@@ -11595,7 +15724,7 @@ async function renderOutputArtifact(env, request, provider, format) {
             filename: `${artifact}.xray.json`,
             // Total counts only TLS candidates: fragment artifacts cannot render plaintext ones,
             // so candidateCount overstated the total whenever plaintext endpoints existed (F16).
-            headers: { ...headerSet(basePage, fitted.count, artifact, fitted.byteTruncated, basePage.tlsCandidateCount * profiles.length, basePage.offset + Math.floor(fitted.count / profiles.length)), ...fragmentCompatibilityHeaders(format) },
+            headers: { ...headerSet(basePage, fitted.count, artifact, fitted.byteTruncated, basePage.tlsCandidateCount * profiles.length, fragmentResumeOffset(basePage, tlsBase, fitted.fittedNodes), baseLimitClamped), ...fragmentCompatibilityHeaders(format) },
         };
     }
     const profiles = (0, profiles_1.getSingboxFragmentProfiles)();
@@ -11609,7 +15738,7 @@ async function renderOutputArtifact(env, request, provider, format) {
         count: fitted.count,
         kind: artifact,
         filename: `${artifact}.sing-box.json`,
-        headers: { ...headerSet(basePage, fitted.count, artifact, fitted.byteTruncated, basePage.tlsCandidateCount * profiles.length, basePage.offset + Math.floor(fitted.count / profiles.length)), ...fragmentCompatibilityHeaders(format) },
+        headers: { ...headerSet(basePage, fitted.count, artifact, fitted.byteTruncated, basePage.tlsCandidateCount * profiles.length, fragmentResumeOffset(basePage, tlsBase, fitted.fittedNodes), baseLimitClamped), ...fragmentCompatibilityHeaders(format) },
     };
 }
 
@@ -11623,12 +15752,18 @@ exports.outputTargetLabel = outputTargetLabel;
 /**
  * Compatibility describes the generated client-core contract, not the Worker wire capability.
  * The canonical Worker model supports HTTP/none for both VLESS and Trojan.
- * Xray's current public-network rules require outer transport security for both; Mihomo requires TLS for Trojan.
+ * SCAN-24: the restrictions below are PROJECT POLICY for public generated
+ * configs (outer transport security for Xray/Surge; TLS for Trojan on
+ * Mihomo), not requirements imposed by Xray itself — Xray can serve
+ * plaintext locally. The policy keeps public configs from accidentally
+ * exposing credentials in cleartext.
  */
 function supportsOutputCombination(target, protocol, security) {
     if (target === "native")
         return true;
     if (target === "xray")
+        return security === "tls";
+    if (target === "surge")
         return security === "tls";
     if (target === "clash")
         return protocol === "vless" || security === "tls";
@@ -11641,6 +15776,7 @@ function outputTargetLabel(target) {
         case "xray": return "Xray public configuration";
         case "sing-box": return "Sing-box configuration";
         case "clash": return "Mihomo/Clash configuration";
+        case "surge": return "Surge configuration";
     }
 }
 
@@ -11837,184 +15973,6 @@ function outboundTags(target, items) {
 
 };
 
-__m["output/profiles"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.getXrayFragmentProfiles = getXrayFragmentProfiles;
-exports.getSingboxFragmentProfiles = getSingboxFragmentProfiles;
-exports.isProfileSupported = isProfileSupported;
-exports.expandXrayFragments = expandXrayFragments;
-exports.expandSingboxFragments = expandSingboxFragments;
-const errors_1 = __r("../core/errors");
-const DEFAULT_XRAY_FRAGMENTS = [
-    { id: "f01", packets: "1-3", lengths: ["1-5"], delays: ["1-1"] },
-    { id: "f02", packets: "1-3", lengths: ["1-10"], delays: ["1-1"] },
-    { id: "f03", packets: "1-3", lengths: ["10-20"], delays: ["1-1"] },
-    { id: "f04", packets: "1-3", lengths: ["20-30"], delays: ["1-1"] },
-    { id: "f05", packets: "1-3", lengths: ["30-40"], delays: ["1-1"] },
-    { id: "f06", packets: "1-3", lengths: ["40-50"], delays: ["1-1"] },
-    { id: "f07", packets: "1-3", lengths: ["50-60"], delays: ["1-1"] },
-    { id: "f08", packets: "1-3", lengths: ["60-70"], delays: ["1-1"] },
-    { id: "f09", packets: "1-3", lengths: ["70-80"], delays: ["1-1"] },
-    { id: "f10", packets: "1-3", lengths: ["80-90"], delays: ["1-1"] },
-    { id: "f11", packets: "1-3", lengths: ["90-100"], delays: ["1-1"] },
-    { id: "f12", packets: "1-3", lengths: ["10-30"], delays: ["1-1"] },
-    { id: "f13", packets: "1-3", lengths: ["20-40"], delays: ["1-1"] },
-    { id: "f14", packets: "1-3", lengths: ["30-50"], delays: ["1-1"] },
-    { id: "f15", packets: "1-3", lengths: ["40-60"], delays: ["1-1"] },
-    { id: "f16", packets: "1-3", lengths: ["50-70"], delays: ["1-1"] },
-    { id: "f17", packets: "1-3", lengths: ["60-80"], delays: ["1-1"] },
-    { id: "f18", packets: "1-3", lengths: ["70-90"], delays: ["1-1"] },
-    { id: "f19", packets: "1-3", lengths: ["80-100"], delays: ["1-1"] },
-    { id: "f20", packets: "tlshello", lengths: ["100-200"], delays: ["1-1"] },
-];
-const DEFAULT_SINGBOX_FRAGMENTS = [
-    { id: "fragment", fragment: true },
-    { id: "record", recordFragment: true },
-];
-const MAX_FRAGMENT_DELAY_MS = 60_000;
-const MAX_FRAGMENT_SPLITS = 64;
-function rangeBounds(value) {
-    const match = value.match(/^(\d+)(?:-(\d+))?$/);
-    if (!match)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Internal fragment range parsing failure");
-    const first = Number(match[1]);
-    const second = match[2] === undefined ? first : Number(match[2]);
-    return [first, second];
-}
-function parseRange(value, field, bounds = {}) {
-    if (typeof value !== "string" || !value.trim())
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must be a non-empty range`);
-    const normalized = value.trim();
-    if (!/^(\d+)(?:-(\d+))?$/.test(normalized))
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must be an integer or integer range`);
-    const [first, second] = rangeBounds(normalized);
-    const min = bounds.min ?? 0;
-    const max = bounds.max ?? 2_147_483_647;
-    if (!Number.isSafeInteger(first) || !Number.isSafeInteger(second) || first < min || second < first || second > max) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must be within the supported range ${min}..${max}`);
-    }
-    return normalized;
-}
-function parseRangeList(value, field, bounds = {}, maxItems = 16) {
-    const list = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[|,]+/) : [];
-    if (!list.length || list.length > maxItems)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} must contain 1..${maxItems} ranges`);
-    return list.map((item) => parseRange(item, field, bounds));
-}
-function normalizeXrayProfile(value, index) {
-    if (!value || typeof value !== "object")
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES[${index}] must be an object`);
-    const raw = value;
-    const id = typeof raw.id === "string" && raw.id.trim() ? raw.id.trim().replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) : `f${index + 1}`;
-    const packets = raw.packets === "tlshello" ? "tlshello" : raw.packets === "1-3" ? "1-3" : null;
-    if (!packets)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES[${index}].packets must be 1-3 or tlshello`);
-    const field = `CORE_FRAGMENT_PROFILES[${index}]`;
-    // DS-M11: the official Xray FragmentMask struct has only singular
-    // `length` / `delay` (one Int32Range each); the builder emits only
-    // lengths[0] / delays[0] and the loader ignores unknown plural fields.
-    // Accepting several ranges therefore silently dropped every range after
-    // the first. Fail closed on multi-range profiles instead. Built-in
-    // defaults are all single-range, so they are unaffected.
-    const lengths = parseRangeList(raw.lengths, `${field}.lengths`, packets === "tlshello" ? { min: 1 } : {}, 1);
-    if (packets === "1-3" && rangeBounds(lengths[lengths.length - 1])[0] === 0) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field}.lengths: the final range must be positive; a final zero can idle indefinitely`);
-    }
-    return {
-        id,
-        packets,
-        lengths,
-        // A zero delay is valid in FinalMask; cap the upper bound to avoid pathological stalls.
-        delays: parseRangeList(raw.delays, `${field}.delays`, { min: 0, max: MAX_FRAGMENT_DELAY_MS }, 1),
-        // FinalMask defines maxSplit=0 as unlimited. This generator intentionally requires a finite
-        // positive bound so custom profiles cannot opt into unbounded splitting by mistake.
-        ...(raw.maxSplit === undefined || raw.maxSplit === null || raw.maxSplit === "" ? {} : { maxSplit: parseRange(raw.maxSplit, `${field}.maxSplit`, { min: 1, max: MAX_FRAGMENT_SPLITS }) }),
-    };
-}
-function parseProfileJson(raw) {
-    try {
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed))
-            throw new Error("must be an array");
-        return parsed.map(normalizeXrayProfile);
-    }
-    catch (error) {
-        if (error instanceof errors_1.CoreError)
-            throw error;
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES contains invalid JSON: ${error instanceof Error ? error.message : "invalid JSON"}`);
-    }
-}
-function getXrayFragmentProfiles(env) {
-    const raw = env.CORE_FRAGMENT_PROFILES?.trim();
-    if (!raw)
-        return DEFAULT_XRAY_FRAGMENTS;
-    if (raw.startsWith("[")) {
-        const profiles = parseProfileJson(raw) ?? [];
-        if (!profiles.length)
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_FRAGMENT_PROFILES must contain at least one profile");
-        if (profiles.length > 32)
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_FRAGMENT_PROFILES supports at most 32 profiles");
-        ensureUniqueProfileIds(profiles);
-        return profiles;
-    }
-    // Compact text form:
-    // id|packets|lengths|delays|[maxSplit];id|packets|lengths|delays|[maxSplit]
-    const profiles = raw.split(";").map((chunk, index) => {
-        const parts = chunk.split("|").map((item) => item.trim());
-        if (parts.length < 4 || parts.length > 5)
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES entry ${index + 1} must be id|packets|lengths|delays|[maxSplit]`);
-        return normalizeXrayProfile({ id: parts[0], packets: parts[1], lengths: parts[2], delays: parts[3], ...(parts[4] ? { maxSplit: parts[4] } : {}) }, index);
-    }).filter(Boolean);
-    if (!profiles.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_FRAGMENT_PROFILES must contain at least one profile");
-    if (profiles.length > 32)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "CORE_FRAGMENT_PROFILES supports at most 32 profiles");
-    ensureUniqueProfileIds(profiles);
-    return profiles;
-}
-function ensureUniqueProfileIds(profiles) {
-    const seen = new Set();
-    for (const profile of profiles) {
-        if (seen.has(profile.id))
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Duplicate fragment profile id after normalization: ${profile.id}`);
-        seen.add(profile.id);
-    }
-}
-function getSingboxFragmentProfiles() {
-    return DEFAULT_SINGBOX_FRAGMENTS;
-}
-function isProfileSupported(target, kind) {
-    if (kind === "best-ping")
-        return true;
-    if (target === "clash")
-        return false;
-    return kind === "best-fragment" || kind === "best-ping-fragment";
-}
-function expandXrayFragments(nodes, profiles) {
-    const out = [];
-    for (const node of nodes) {
-        if (node.security !== "tls")
-            continue;
-        for (const profile of profiles) {
-            out.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
-        }
-    }
-    return out;
-}
-function expandSingboxFragments(nodes, profiles) {
-    const out = [];
-    for (const node of nodes) {
-        if (node.security !== "tls")
-            continue;
-        for (const profile of profiles)
-            out.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
-    }
-    return out;
-}
-
-};
-
 __m["output/planning"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -12141,7 +16099,9 @@ function rejectUnknownParameters(params) {
 }
 function parseOutputSelection(env, params) {
     rejectUnknownParameters(params);
-    const protocolRaw = (params.get("protocol") ?? "all").trim().toLowerCase();
+    // P3: env defaults for protocol/port filters apply only when the request
+    // carries no explicit query value; the query always wins.
+    const protocolRaw = (params.get("protocol") ?? env.CORE_OUTPUT_PROTOCOLS ?? "all").trim().toLowerCase();
     const protocol = protocolRaw === "all" ? "all" : protocolRaw === "vless" || protocolRaw === "trojan" ? protocolRaw : null;
     if (!protocol)
         throw new errors_1.CoreError("BAD_REQUEST", "protocol must be all, vless or trojan");
@@ -12164,7 +16124,7 @@ function parseOutputSelection(env, params) {
     const offset = parseNonNegativeInteger(params.get("offset"), "offset") ?? 0;
     const fingerprints = parseFingerprints(params.get("fingerprint") ?? env.TLS_FINGERPRINT);
     const alpn = parseAlpn(params.get("alpn") ?? env.TLS_ALPN);
-    const ports = parsePorts(params.get("port") ?? undefined);
+    const ports = parsePorts(params.get("port") ?? env.CORE_OUTPUT_PORT_FILTER ?? undefined);
     const remarkTemplate = params.get("remark")?.trim()
         || params.get("name")?.trim()
         || env.OUTPUT_REMARK?.trim()
@@ -12174,8 +16134,8 @@ function parseOutputSelection(env, params) {
         throw new errors_1.CoreError("BAD_REQUEST", "remark/name is too long");
     return { protocol, endpoint, ports, fingerprints, alpn, transport: "ws", remarkTemplate, limit, offset };
 }
-function selectEndpoints(env, requestHost, selection) {
-    const pool = (0, endpoints_1.buildOutputEndpoints)(env, { requestHost });
+function selectEndpoints(env, requestHost, selection, extraPreferred) {
+    const pool = (0, endpoints_1.buildOutputEndpoints)(env, { requestHost, ...(extraPreferred ? { extraPreferred } : {}) });
     if (pool.endpoints.length > MAX_ENDPOINT_INPUTS) {
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `Output endpoint input count ${pool.endpoints.length} exceeds internal safety ceiling ${MAX_ENDPOINT_INPUTS}`);
     }
@@ -12185,7 +16145,14 @@ function selectEndpoints(env, requestHost, selection) {
         if (unknown.length)
             throw new errors_1.CoreError("BAD_REQUEST", `Requested port is not configured in OUTPUT_PORT: ${unknown.join(",")}`);
     }
-    const endpoints = pool.endpoints.filter((item, index) => {
+    // P3 TLS-only shaping happens HERE, not at render: filtering the endpoint
+    // pool before selection keeps candidate counts, pagination offsets and the
+    // numeric endpoint index all consistent with the TLS-only universe.
+    // (Fragment artifacts already filter to TLS; this extends the same rule to
+    // every artifact and to the native subscription.)
+    const tlsOnly = /^(1|true|yes|on)$/i.test(env.CORE_OUTPUT_TLS_ONLY?.trim() ?? "");
+    const poolEndpoints = tlsOnly ? pool.endpoints.filter((item) => item.security === "tls") : pool.endpoints;
+    const endpoints = poolEndpoints.filter((item, index) => {
         if (selection.endpoint === "domain" && item.kind !== "domain")
             return false;
         if (selection.endpoint === "cleanip" && item.kind !== "clean-ip")
@@ -12196,7 +16163,7 @@ function selectEndpoints(env, requestHost, selection) {
             return false;
         return true;
     });
-    if (typeof selection.endpoint === "number" && selection.endpoint >= pool.endpoints.length) {
+    if (typeof selection.endpoint === "number" && selection.endpoint >= poolEndpoints.length) {
         throw new errors_1.CoreError("BAD_REQUEST", `Endpoint index ${selection.endpoint} is out of range`);
     }
     return endpoints;
@@ -12206,11 +16173,30 @@ function renderRemark(template, protocol, endpoint, fingerprint, credentialIndex
         .replaceAll("{protocol}", protocol)
         .replaceAll("{kind}", endpoint.kind === "clean-ip" ? "cleanip" : "domain")
         .replaceAll("{address}", endpoint.address)
+        // P2: {endpoint} is the preferred-IP #NAME when present, else the address,
+        // so curated-pool nodes can be named by region (e.g. "CF-DE-01").
+        .replaceAll("{endpoint}", endpoint.label ?? endpoint.address)
         .replaceAll("{port}", String(endpoint.port))
         .replaceAll("{fingerprint}", fingerprint)
         .replaceAll("{security}", endpoint.security)
         .replaceAll("{credential}", String(credentialIndex))
         .replaceAll("{index}", String(credentialIndex));
+}
+// P3 fingerprint shaping: CORE_OUTPUT_FINGERPRINT_MODE=random picks a concrete
+// fingerprint deterministically per node (FNV-1a over endpoint+protocol+
+// credential), so renders are stable across requests. "random"/"randomized"
+// are excluded from the pick set: they already mean per-connection randomness
+// in the cores and would make the shaping itself non-deterministic.
+const CONCRETE_FINGERPRINTS = ["chrome", "safari", "firefox", "edge", "360", "qq", "android", "ios"];
+function shapedFingerprint(env, fingerprint, seed) {
+    if (fingerprint === "none" || (env.CORE_OUTPUT_FINGERPRINT_MODE?.trim().toLowerCase() ?? "keep") !== "random")
+        return fingerprint === "none" ? "chrome" : fingerprint;
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < seed.length; i++) {
+        hash ^= seed.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return CONCRETE_FINGERPRINTS[hash % CONCRETE_FINGERPRINTS.length];
 }
 function parseOutputEarlyDataValue(rawValue) {
     const raw = rawValue?.trim();
@@ -12233,13 +16219,65 @@ function parseOutputEarlyData(env) {
  * suffixing repeat occurrences (-2, -3, ...). Iteration order is deterministic, so the
  * assignment is stable across renders of the same selection.
  */
-function createUniqueNamer() {
-    const seen = new Map();
+function createUniqueNamer(seed) {
+    const seen = new Map(seed);
     return (base) => {
         const occurrence = (seen.get(base) ?? 0) + 1;
         seen.set(base, occurrence);
         return occurrence === 1 ? base : `${base}-${occurrence}`;
     };
+}
+// SCAN-20: count base-name occurrences over the SKIPPED candidates so the
+// per-page namer can be seeded with them. Remark rendering needs only
+// endpoint/protocol/fingerprint/credential-index — no record fetches — so
+// this walk is pure arithmetic mirroring the main page walk exactly (same
+// support checks, same block order, same fingerprint/credential order).
+// Without the seed, two pages could both emit the same bare name for
+// different nodes whenever the operator's template does not discriminate.
+function countSkippedBaseNames(endpoints, selection, credentialCounts, target, skipTotal) {
+    const counts = new Map();
+    let skip = skipTotal;
+    outer: for (const endpoint of endpoints) {
+        for (const protocol of protocolsFor(selection)) {
+            if (!(0, compatibility_1.supportsOutputCombination)(target, protocol, endpoint.security))
+                continue;
+            const credentialCount = credentialCounts[protocol];
+            if (!credentialCount)
+                continue;
+            const fingerprints = endpoint.security === "tls" ? selection.fingerprints : ["none"];
+            const blockSize = fingerprints.length * credentialCount;
+            if (skip >= blockSize) {
+                for (const fingerprint of fingerprints) {
+                    for (let credentialIndex = 0; credentialIndex < credentialCount; credentialIndex++) {
+                        const base = renderRemark(selection.remarkTemplate, protocol, endpoint, fingerprint, credentialIndex + 1);
+                        counts.set(base, (counts.get(base) ?? 0) + 1);
+                    }
+                }
+                skip -= blockSize;
+                continue;
+            }
+            // Partial block: exactly the first `skip` names of this block are
+            // skipped, in block order (fingerprint-major, then credential). An
+            // earlier draft counted `skip` names STARTING at the skip point
+            // (fpIndex = skip / credentialCount), which undercounts whenever the
+            // skip crosses a fingerprint boundary and collides suffixes across
+            // pages for non-discriminating templates (found by the strengthened
+            // output.selection-pagination test, 2026-10-29).
+            let counted = 0;
+            for (const fingerprint of fingerprints) {
+                for (let credentialIndex = 0; credentialIndex < credentialCount && counted < skip; credentialIndex++) {
+                    const base = renderRemark(selection.remarkTemplate, protocol, endpoint, fingerprint, credentialIndex + 1);
+                    counts.set(base, (counts.get(base) ?? 0) + 1);
+                    counted++;
+                }
+                if (counted >= skip)
+                    break;
+            }
+            // After a partial block nothing further is skipped.
+            break outer;
+        }
+    }
+    return counts;
 }
 function createNode(env, endpoint, protocol, record, fingerprint, alpn, remark) {
     const rawCredential = record.rawCredential ?? (protocol === "vless" ? record.credential : "");
@@ -12265,7 +16303,7 @@ function createNode(env, endpoint, protocol, record, fingerprint, alpn, remark) 
             tls: {
                 serverName: endpoint.tlsServerName ?? endpoint.httpHost,
                 alpn,
-                fingerprint: fingerprint === "none" ? "chrome" : fingerprint,
+                fingerprint: shapedFingerprint(env, fingerprint, `${endpoint.address}:${endpoint.port}:${protocol}:${record.id}`),
             },
         };
     }
@@ -12313,7 +16351,7 @@ function materializePageFromRecords(env, requestHost, selection, recordsByProtoc
         throw new errors_1.CoreError("BAD_REQUEST", "No output candidates are available for the requested protocol/endpoint selection");
     if (offset >= candidateCount)
         return { items: [], offset, requestedLimit, limit: effectiveLimit, limitClamped, candidateCount, tlsCandidateCount, hasMore: false, truncated: false };
-    const uniqueName = createUniqueNamer();
+    const uniqueName = createUniqueNamer(countSkippedBaseNames(endpoints, selection, credentialCounts, "native", offset));
     const items = [];
     let skip = offset;
     outer: for (const endpoint of endpoints) {
@@ -12353,8 +16391,8 @@ function materializePageFromRecords(env, requestHost, selection, recordsByProtoc
         truncated: items.length < Math.min(effectiveLimit, candidateCount - offset),
     };
 }
-async function buildOutputNodePage(env, requestHost, selection, provider, budget, signal, target = "native") {
-    const endpoints = selectEndpoints(env, requestHost, selection);
+async function buildOutputNodePage(env, requestHost, selection, provider, budget, signal, target = "native", extraPreferred) {
+    const endpoints = selectEndpoints(env, requestHost, selection, extraPreferred);
     const credentialCounts = {
         vless: await provider.count("vless", signal),
         trojan: await provider.count("trojan", signal),
@@ -12395,7 +16433,7 @@ async function buildOutputNodePage(env, requestHost, selection, provider, budget
         cache.set(key, page);
         return page;
     };
-    const uniqueName = createUniqueNamer();
+    const uniqueName = createUniqueNamer(countSkippedBaseNames(endpoints, selection, credentialCounts, target, offset));
     const items = [];
     let skip = offset;
     outer: for (const endpoint of endpoints) {
@@ -12575,341 +16613,6 @@ exports.SUPPORTED_TLS_FINGERPRINTS = [
 
 };
 
-__m["output/endpoints"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.getOutputHost = getOutputHost;
-exports.getOutputPorts = getOutputPorts;
-exports.getOutputPort = getOutputPort;
-exports.buildOutputEndpoints = buildOutputEndpoints;
-exports.isIpAddress = isIpAddress;
-const errors_1 = __r("../core/errors");
-const binary_1 = __r("../util/binary");
-const hostname_1 = __r("../util/hostname");
-const security_1 = __r("./security");
-function isIpv4Literal(value) {
-    const parts = value.trim().split(".");
-    if (parts.length !== 4 || parts.some((part) => !/^\d{1,3}$/.test(part)))
-        return false;
-    const numbers = parts.map(Number);
-    return numbers.every((part) => part >= 0 && part <= 255);
-}
-function isIpv6Literal(value) {
-    let input = value.trim();
-    if (input.startsWith("[") && input.endsWith("]"))
-        input = input.slice(1, -1);
-    if (!input.includes(":"))
-        return false;
-    const pieces = input.split("::");
-    if (pieces.length > 2)
-        return false;
-    const parseSide = (side) => {
-        if (!side)
-            return 0;
-        const tokens = side.split(":");
-        let count = 0;
-        for (const token of tokens) {
-            if (token.includes(".")) {
-                if (!isIpv4Literal(token))
-                    return null;
-                count += 2;
-                continue;
-            }
-            if (!/^[0-9a-fA-F]{1,4}$/.test(token))
-                return null;
-            count += 1;
-        }
-        return count;
-    };
-    const left = parseSide(pieces[0]);
-    const right = parseSide(pieces[1] ?? "");
-    if (left === null || right === null)
-        return false;
-    if (pieces.length === 2)
-        return left + right < 8;
-    return left === 8;
-}
-function isIpLiteral(value) {
-    return isIpv4Literal(value) || isIpv6Literal(value);
-}
-function normalizeOutputHost(value) {
-    const raw = value.trim();
-    if (!raw)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST cannot be empty");
-    // Strip an optional scheme (and trailing slashes) BEFORE the delimiter checks: the raw
-    // value was previously rejected for containing "/" first, which made the scheme strip
-    // unreachable dead code (audit F11).
-    const candidate = raw.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
-    if (!candidate || /[/\\\s?#@]/.test(candidate) || candidate.includes(":") || candidate.includes("[") || candidate.includes("]")) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST must be a hostname without credentials, port, path, query or fragment");
-    }
-    if (isIpLiteral(candidate)) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST must be a hostname, not an IP literal");
-    }
-    // Enforce real LDH label rules (the previous URL round-trip accepted e.g. "exa_mple.com").
-    const hostname = (0, hostname_1.toAsciiHostname)(candidate);
-    if (!hostname || isIpLiteral(hostname)) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST is not a valid hostname");
-    }
-    return hostname;
-}
-function normalizeIp(value) {
-    const trimmed = value.trim();
-    const host = trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
-    if (!isIpLiteral(host))
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CLEAN_IPS entry is not an IP literal: ${value}`);
-    return host.toLowerCase();
-}
-function hasExplicitPort(value) {
-    const raw = value.trim();
-    if (raw.startsWith("[")) {
-        const close = raw.indexOf("]");
-        if (close < 0)
-            return false;
-        return raw.slice(close + 1).startsWith(":");
-    }
-    const colonCount = (raw.match(/:/g) ?? []).length;
-    if (colonCount !== 1)
-        return false;
-    const index = raw.lastIndexOf(":");
-    return /^\d+$/.test(raw.slice(index + 1));
-}
-function getWebSocketHost(env, outputHost) {
-    const configured = env.WS_HOST?.trim();
-    return configured ? normalizeOutputHost(configured) : outputHost;
-}
-function makeEndpoint(id, kind, address, port, httpHost, tlsServerName, securityConfig) {
-    const profile = (0, security_1.portProfileFor)(port, securityConfig);
-    return {
-        id,
-        kind,
-        address,
-        port,
-        scheme: profile.scheme,
-        security: profile.security,
-        httpHost,
-        tlsServerName: profile.security === "tls" ? tlsServerName : null,
-        edgePortClass: profile.edgePortClass,
-    };
-}
-function parseCleanIpEntries(raw, outputPorts, securityConfig, httpHost, tlsServerName) {
-    const values = (raw ?? "").split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean);
-    const endpoints = [];
-    const seen = new Set();
-    for (const value of values) {
-        let host;
-        let parsedPort;
-        try {
-            const parsed = (0, binary_1.parseHostPort)(value, outputPorts[0]);
-            host = normalizeIp(parsed.host);
-            parsedPort = parsed.port ?? outputPorts[0];
-            (0, binary_1.validatePort)(parsedPort);
-        }
-        catch (error) {
-            if (error instanceof errors_1.CoreError)
-                throw error;
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid CLEAN_IPS entry: ${value}`, false, { cause: error });
-        }
-        const ports = hasExplicitPort(value) ? [parsedPort] : outputPorts;
-        if (hasExplicitPort(value) && !outputPorts.includes(parsedPort)) {
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `CLEAN_IPS entry ${value} uses port ${parsedPort}, which is not present in OUTPUT_PORT`);
-        }
-        for (const port of ports) {
-            try {
-                (0, binary_1.validatePort)(port);
-            }
-            catch (error) {
-                throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid port for CLEAN_IPS entry: ${value}`, false, { cause: error });
-            }
-            const key = `${host}\0${port}`;
-            if (seen.has(key))
-                continue;
-            seen.add(key);
-            endpoints.push(makeEndpoint(`clean-ip-${endpoints.length + 1}`, "clean-ip", host, port, httpHost, tlsServerName, securityConfig));
-        }
-    }
-    return endpoints;
-}
-function getOutputHost(env, requestHost) {
-    const configured = env.OUTPUT_HOST?.trim();
-    if (configured)
-        return normalizeOutputHost(configured);
-    const wsHost = env.WS_HOST?.trim();
-    if (wsHost)
-        return normalizeOutputHost(wsHost);
-    if (!requestHost)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_HOST is required when no request hostname is available");
-    return normalizeOutputHost(requestHost);
-}
-function getOutputPorts(env) {
-    const raw = env.OUTPUT_PORT?.trim();
-    if (!raw)
-        return [443];
-    const values = raw.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean);
-    if (values.length === 0)
-        return [443];
-    const ports = [];
-    const seen = new Set();
-    for (const value of values) {
-        if (!/^\d+$/.test(value)) {
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid OUTPUT_PORT entry: ${value}. Expected an integer from 1 to 65535`);
-        }
-        const port = Number(value);
-        try {
-            (0, binary_1.validatePort)(port);
-        }
-        catch (error) {
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid OUTPUT_PORT entry: ${value}. Expected an integer from 1 to 65535`, false, { cause: error });
-        }
-        if (!seen.has(port)) {
-            seen.add(port);
-            ports.push(port);
-        }
-    }
-    return ports.length > 0 ? ports : [443];
-}
-function getOutputPort(env) {
-    return getOutputPorts(env)[0];
-}
-function buildOutputEndpoints(env, options = {}) {
-    const host = getOutputHost(env, options.requestHost);
-    const outputPorts = getOutputPorts(env);
-    const securityConfig = (0, security_1.normalizeOutputSecurityConfig)(env);
-    const httpHost = getWebSocketHost(env, host);
-    const tlsServerName = host;
-    const endpoints = [];
-    for (const port of outputPorts) {
-        endpoints.push({
-            id: `domain-${port}`,
-            kind: "domain",
-            address: host,
-            port,
-            scheme: (0, security_1.portProfileFor)(port, securityConfig).scheme,
-            security: (0, security_1.portProfileFor)(port, securityConfig).security,
-            httpHost,
-            tlsServerName: (0, security_1.portProfileFor)(port, securityConfig).security === "tls" ? tlsServerName : null,
-            edgePortClass: (0, security_1.portProfileFor)(port, securityConfig).edgePortClass,
-        });
-    }
-    endpoints.push(...parseCleanIpEntries(env.CLEAN_IPS, outputPorts, securityConfig, httpHost, tlsServerName));
-    return {
-        host,
-        defaultPort: outputPorts[0],
-        outputPorts,
-        endpoints,
-    };
-}
-function isIpAddress(value) {
-    return isIpLiteral(value);
-}
-
-};
-
-__m["output/security"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.normalizeOutputSecurityConfig = normalizeOutputSecurityConfig;
-exports.portProfileFor = portProfileFor;
-exports.securityForPort = securityForPort;
-exports.schemeForPort = schemeForPort;
-const errors_1 = __r("../core/errors");
-const binary_1 = __r("../util/binary");
-const cloudflare_1 = __r("./edge/cloudflare");
-function parsePortList(raw, field) {
-    if (!raw?.trim())
-        return [];
-    const out = [];
-    const seen = new Set();
-    for (const value of raw.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean)) {
-        if (!/^\d+$/.test(value))
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field} contains invalid port '${value}'`);
-        const port = Number(value);
-        (0, binary_1.validatePort)(port);
-        if (!seen.has(port)) {
-            seen.add(port);
-            out.push(port);
-        }
-    }
-    return out;
-}
-function normalizeOutputSecurityConfig(env) {
-    const explicitTlsPorts = parsePortList(env.OUTPUT_TLS_PORTS, "OUTPUT_TLS_PORTS");
-    const explicitHttpPorts = parsePortList(env.OUTPUT_HTTP_PORTS, "OUTPUT_HTTP_PORTS");
-    const tlsSet = new Set(explicitTlsPorts);
-    if (explicitHttpPorts.some((port) => tlsSet.has(port))) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "OUTPUT_TLS_PORTS and OUTPUT_HTTP_PORTS must not overlap");
-    }
-    const httpSet = new Set(cloudflare_1.CLOUDFLARE_HTTP_PORTS);
-    const httpsSet = new Set(cloudflare_1.CLOUDFLARE_HTTPS_PORTS);
-    const invalidTls = explicitTlsPorts.filter((port) => !httpsSet.has(port));
-    const invalidHttp = explicitHttpPorts.filter((port) => !httpSet.has(port));
-    if (invalidTls.length) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `OUTPUT_TLS_PORTS contains non-HTTPS Cloudflare ports: ${invalidTls.join(", ")}`);
-    }
-    if (invalidHttp.length) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `OUTPUT_HTTP_PORTS contains non-HTTP Cloudflare ports: ${invalidHttp.join(", ")}`);
-    }
-    return {
-        tlsPorts: [...cloudflare_1.CLOUDFLARE_HTTPS_PORTS],
-        httpPorts: [...cloudflare_1.CLOUDFLARE_HTTP_PORTS],
-        explicitTlsPorts,
-        explicitHttpPorts,
-    };
-}
-function portProfileFor(port, envOrConfig) {
-    // A configured list is an assertion/compatibility layer only. It never overrides Cloudflare's canonical classification.
-    if (!("tlsPorts" in envOrConfig))
-        normalizeOutputSecurityConfig(envOrConfig);
-    return (0, cloudflare_1.cloudflarePortProfile)(port);
-}
-function securityForPort(port, envOrConfig) {
-    return portProfileFor(port, envOrConfig).security;
-}
-function schemeForPort(port, envOrConfig) {
-    return portProfileFor(port, envOrConfig).scheme;
-}
-
-};
-
-__m["output/edge/cloudflare"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.CLOUDFLARE_HTTPS_PORTS = exports.CLOUDFLARE_HTTP_PORTS = void 0;
-exports.cloudflarePortProfile = cloudflarePortProfile;
-exports.isCloudflareHttpPort = isCloudflareHttpPort;
-exports.isCloudflareHttpsPort = isCloudflareHttpsPort;
-exports.allCloudflarePortProfiles = allCloudflarePortProfiles;
-const errors_1 = __r("../../core/errors");
-const binary_1 = __r("../../util/binary");
-exports.CLOUDFLARE_HTTP_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095];
-exports.CLOUDFLARE_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443];
-const profiles = new Map();
-for (const port of exports.CLOUDFLARE_HTTP_PORTS) {
-    profiles.set(port, { port, scheme: "http", security: "none", websocket: true, edgePortClass: "cloudflare-http" });
-}
-for (const port of exports.CLOUDFLARE_HTTPS_PORTS) {
-    profiles.set(port, { port, scheme: "https", security: "tls", websocket: true, edgePortClass: "cloudflare-https" });
-}
-function cloudflarePortProfile(port) {
-    (0, binary_1.validatePort)(port);
-    const profile = profiles.get(port);
-    if (!profile) {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `Output port ${port} is not one of Cloudflare's default HTTP/HTTPS proxy-compatible Worker ports`);
-    }
-    return profile;
-}
-function isCloudflareHttpPort(port) {
-    return profiles.get(port)?.scheme === "http";
-}
-function isCloudflareHttpsPort(port) {
-    return profiles.get(port)?.scheme === "https";
-}
-function allCloudflarePortProfiles() {
-    return [...profiles.values()];
-}
-
-};
-
 __m["output/bundle"] = function(module, exports, __r) {
 "use strict";
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
@@ -12960,10 +16663,16 @@ function isWebSocketUpgrade(request) {
 }
 function decodeBase64Url(value) {
     const normalized = value.trim().replace(/-/g, "+").replace(/_/g, "/");
-    if (!normalized || /[^A-Za-z0-9+/=]/.test(normalized) || normalized.includes("=") && !/=+$/.test(normalized)) {
+    if (!normalized || /[^A-Za-z0-9+/=]/.test(normalized)) {
         throw new Error("Invalid base64url");
     }
+    // TU-7: '=' is valid ONLY as trailing padding. The old check
+    // (`includes("=") && !/=+$/) accepted "AB=CD=" because it ends with '=',
+    // leaving atob to throw on the interior '=' — indistinguishable from "not
+    // early data". Reject interior '=' explicitly instead.
     const body = normalized.replace(/=+$/g, "");
+    if (body.includes("="))
+        throw new Error("Invalid base64url");
     if (body.length % 4 === 1)
         throw new Error("Invalid base64url length");
     const padded = body + "=".repeat((4 - (body.length % 4)) % 4);
@@ -12975,6 +16684,22 @@ function decodeBase64Url(value) {
 }
 function protocolTokens(value) {
     return value.split(",").map((token) => token.trim()).filter(Boolean);
+}
+// TU-1 (RFC 6455 §4.1 item 10): a subprotocol token is 1#token — non-empty,
+// chars U+0021–U+007E excluding the RFC 2616 separators. Only validated
+// tokens are ever echoed into the 101; an invalid offer is dropped from
+// negotiation instead of echoed verbatim (which produced a malformed 101
+// or a TypeError escaping accept()).
+const WS_TOKEN_SEPARATORS = new Set([...'()<>@,;:\\"/[]?={} \t']);
+function isValidWsToken(token) {
+    if (!token)
+        return false;
+    for (const ch of token) {
+        const code = ch.charCodeAt(0);
+        if (code < 0x21 || code > 0x7e || WS_TOKEN_SEPARATORS.has(ch))
+            return false;
+    }
+    return true;
 }
 function extractEarlyData(request, options) {
     if (!options.earlyDataEnabled)
@@ -13037,6 +16762,14 @@ function normalizedExpectedHost(value) {
         if (end > 0)
             return trimmed.slice(1, end);
     }
+    // TU-3 (bare-IPv6 half only; the trailing-dot half is cleared per the
+    // delta — WHATWG preserves the dot on both sides, so both sides already
+    // agree): the old unconditional `:\d+$` strip mangled bare IPv6 literals
+    // (::1 -> ":"), failing closed on every WS. Only a single colon can be a
+    // host:port separator; two or more colons mean a bare IPv6 literal, which
+    // is returned as-is.
+    if ((trimmed.match(/:/g) ?? []).length > 1)
+        return trimmed;
     return trimmed.replace(/:\d+$/, "");
 }
 class CloudflareWebSocketAdapter {
@@ -13071,14 +16804,30 @@ class CloudflareWebSocketAdapter {
             queue.push(early.bytes);
         // RFC 6455 §4.2.2 (A9): when the client offered subprotocols, select the
         // first one that was not consumed as early data and echo it in the 101.
+        // TU-1: only RFC-valid tokens participate in selection, so an invalid
+        // offer can never be echoed. TU-2 (accepted limitation, documented):
+        // early data is examined only in token 0, matching the Xray single-value
+        // convention; a multi-token offer selects the first non-consumed token
+        // as the subprotocol and ignores later-token early data (the session
+        // then fails closed at the engine timeout, never misrouted). Scanning
+        // later tokens would misclassify ordinary printable subprotocol names
+        // whose base64 decoding happens to be non-printable bytes.
         const earlyHeaderIsProtocol = (options.earlyDataHeaderName ?? "Sec-WebSocket-Protocol") === "Sec-WebSocket-Protocol";
-        const offeredProtocols = protocolTokens(request.headers.get("Sec-WebSocket-Protocol") ?? "");
+        const offeredProtocols = protocolTokens(request.headers.get("Sec-WebSocket-Protocol") ?? "").filter(isValidWsToken);
         const selectedProtocol = offeredProtocols.find((_, index) => !(early && earlyHeaderIsProtocol && index === early.tokenIndex));
         let closePromise = null;
         server.addEventListener("message", (event) => {
             try {
                 if (typeof event.data === "string") {
                     queue.end(new errors_1.CoreError("BAD_REQUEST", "Text WebSocket messages are not supported"));
+                    // TU-6: ending the reader alone left a half-open socket for any
+                    // caller that only stops reading. Close the socket itself (the
+                    // production worker path already closed on engine failure, so
+                    // this only fixes the adapter contract for future callers).
+                    try {
+                        server.close(1003, "Text WebSocket messages are not supported");
+                    }
+                    catch { /* already closing */ }
                     return;
                 }
                 if (event.data instanceof ArrayBuffer) {
@@ -13090,6 +16839,10 @@ class CloudflareWebSocketAdapter {
                     return;
                 }
                 queue.end(new errors_1.CoreError("BAD_REQUEST", "Unsupported WebSocket message type"));
+                try {
+                    server.close(1003, "Unsupported WebSocket message type");
+                }
+                catch { /* already closing */ }
             }
             catch (error) {
                 queue.end(error);
@@ -13135,13 +16888,23 @@ class CloudflareWebSocketAdapter {
 }
 exports.CloudflareWebSocketAdapter = CloudflareWebSocketAdapter;
 function truncateUtf8(value, maxBytes) {
+    // TU-8: linear, not quadratic. The old loop re-encoded the whole prefix
+    // on every single-character step. Walk code points once, accumulating
+    // byte lengths, and stop before the first code point that would overflow
+    // (so no character is ever split).
     const encoder = new TextEncoder();
     if (encoder.encode(value).byteLength <= maxBytes)
         return value;
-    let end = Math.min(value.length, maxBytes);
-    while (end > 0 && encoder.encode(value.slice(0, end)).byteLength > maxBytes)
-        end--;
-    return value.slice(0, end);
+    let used = 0;
+    let out = "";
+    for (const ch of value) {
+        const len = encoder.encode(ch).byteLength;
+        if (used + len > maxBytes)
+            break;
+        used += len;
+        out += ch;
+    }
+    return out;
 }
 function websocketUpgradeRequiredResponse() {
     // DS-I1 (RFC 9110 §15.5.22): a 426 response carries the Upgrade header
@@ -13156,13 +16919,19 @@ __m["core/byte-queue"] = function(module, exports, __r) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ByteQueue = void 0;
 const errors_1 = __r("./errors");
+const limits_1 = __r("./limits");
 class ByteQueue {
     maxBufferedBytes;
     chunks = [];
     buffered = 0;
     ended = null;
     waiter = null;
-    constructor(maxBufferedBytes = 8 * 1024 * 1024) {
+    // CORE-1: the default bound is the same 128 KiB per-direction limit the
+    // WebSocket adapter passes explicitly. The old 8 MiB default reopened the
+    // isolate-memory product for any direct embedder (256 sessions x 8 MiB
+    // inbound alone = 2 GiB against a 128 MB ceiling); with this default the
+    // worst case is 256 x (128 KiB inbound + 128 KiB outbound) = 64 MiB.
+    constructor(maxBufferedBytes = limits_1.CORE_LIMITS.maxWebSocketBufferedBytes) {
         this.maxBufferedBytes = maxBufferedBytes;
         if (!Number.isInteger(maxBufferedBytes) || maxBufferedBytes <= 0) {
             throw new RangeError("maxBufferedBytes must be a positive integer");
@@ -13221,6 +16990,12 @@ class ByteQueue {
     readAvailable(maxLength = this.buffered) {
         if (!Number.isInteger(maxLength) || maxLength <= 0 || this.buffered === 0)
             return null;
+        // CORE-2: same single-reader rule as readExact/readSome. A pending
+        // exact waiter must never have its partial buffer stolen by a
+        // readAvailable call (which would make the waiter need more total bytes
+        // than `amount` to ever complete).
+        if (this.waiter)
+            throw new errors_1.CoreError("INTERNAL", "Concurrent ByteReader reads are not supported");
         return this.takeSomeIfAvailable(maxLength);
     }
     waitFor(mode, amount, signal) {
@@ -13320,9 +17095,9 @@ const errors_1 = __r("../core/errors");
 const binary_1 = __r("../util/binary");
 const security_1 = __r("../output/security");
 const endpoints_1 = __r("../output/endpoints");
-const runtime_1 = __r("./runtime");
 const nat64_1 = __r("../egress/nat64");
 const aggregation_1 = __r("../output/aggregation");
+const generator_options_1 = __r("../output/generator-options");
 const config_1 = __r("../dns/config");
 const defaults_1 = __r("../egress/defaults");
 const relay_1 = __r("../egress/relay");
@@ -13373,11 +17148,27 @@ const STRING_ENV_FIELDS = new Set([
     "CORE_XRAY_FRAGMENT_PROBE_INTERVAL", "CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY",
     "CORE_OUTPUT_PROBE_URL",
     "CORE_OUTPUT_ROUTING_RULES", "CORE_OUTPUT_SINGBOX_OUTBOUNDS", "CORE_OUTPUT_XRAY_OUTBOUNDS", "CORE_OUTPUT_CLASH_PROXIES",
+    "CORE_OUTPUT_ROUTING_PACK", "CORE_OUTPUT_SINGBOX_URLTEST_INTERVAL", "CORE_OUTPUT_SINGBOX_URLTEST_TOLERANCE",
+    "CORE_OUTPUT_MIHOMO_URLTEST_INTERVAL", "CORE_OUTPUT_MIHOMO_URLTEST_TOLERANCE", "CORE_OUTPUT_XRAY_FALLBACK_NODE",
+    "CORE_OUTPUT_SOCKOPT_TCP_FAST_OPEN", "CORE_OUTPUT_SOCKOPT_MARK", "CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_IDLE",
+    "CORE_OUTPUT_SOCKOPT_TCP_KEEPALIVE_INTERVAL", "CORE_OUTPUT_SOCKOPT_TPROXY", "CORE_OUTPUT_SOCKOPT_ACCEPT_PROXY_PROTOCOL",
+    "CORE_OUTPUT_SOCKOPT_BIND_INTERFACE", "CORE_OUTPUT_SOCKOPT_DOMAIN_STRATEGY", "CORE_OUTPUT_ROUTING_DOMAIN_STRATEGY",
+    "CORE_OUTPUT_DNS_QUERY_STRATEGY", "CORE_OUTPUT_SNI_CASE_MODE", "CORE_OUTPUT_SNI", "CORE_OUTPUT_LOG_LEVEL",
+    "CORE_OUTPUT_INBOUND_TYPE", "CORE_OUTPUT_DNS_FOLLOW_WORKER", "CORE_OUTPUT_DNS_DISABLE_FALLBACK",
+    "CORE_OUTPUT_FAKE_DNS_ENABLED", "CORE_OUTPUT_FAKE_IP_RANGE", "CORE_OUTPUT_FAKE_IP_RANGE_V6", "CORE_OUTPUT_FAKE_IP_FILTER",
+    "CORE_OUTPUT_XRAY_FAKE_DNS_POOL_SIZE", "CORE_OUTPUT_ECH_ENABLED", "CORE_OUTPUT_ECH_CONFIG", "CORE_OUTPUT_ECH_CONFIG_PATH",
+    "CORE_OUTPUT_ECH_QUERY_SERVER_NAME", "CORE_OUTPUT_XRAY_BLACKHOLE_RESPONSE", "CORE_OUTPUT_TLS_ONLY", "CORE_OUTPUT_IPV4_WRAP",
+    "CORE_OUTPUT_FINGERPRINT_MODE", "CORE_OUTPUT_PORT_FILTER", "CORE_OUTPUT_PROTOCOLS",
+    "CORE_OUTPUT_PREFERRED_IPS", "CORE_OUTPUT_PREFERRED_IP_URL",
+    "CORE_OUTPUT_WARP_ENABLED", "CORE_OUTPUT_WARP_PRIVATE_KEY", "CORE_OUTPUT_WARP_PEER_PUBLIC_KEY",
+    "CORE_OUTPUT_WARP_ENDPOINT", "CORE_OUTPUT_WARP_LOCAL_IPV4", "CORE_OUTPUT_WARP_LOCAL_IPV6",
+    "CORE_OUTPUT_WARP_MTU", "CORE_OUTPUT_WARP_RESERVED", "CORE_OUTPUT_CHAIN_OUTBOUNDS",
+    "CORE_OUTPUT_DNS_LISTEN", "CORE_OUTPUT_XRAY_DNS_INBOUND",
     "CORE_OUTPUT_TOKEN", "CORE_OUTPUT_ALLOW_QUERY_TOKEN", "CORE_OUTPUT_ALLOW_RAW",
     "CORE_OUTPUT_DEFAULT_NODES", "CORE_OUTPUT_MAX_NODES", "CORE_OUTPUT_MAX_BYTES",
     "CORE_OUTPUT_MAX_ENDPOINTS", "CORE_OUTPUT_MAX_CREDENTIALS",
     "DNS_ENABLED", "DNS_RESOLVERS", "DNS_CACHE", "DNS_CACHE_MAX_ENTRIES", "DNS_CACHE_MAX_TTL",
-    "DNS_CACHE_NEGATIVE_TTL", "DNS_TIMEOUT_MS", "DNS_RETRIES", "DNS_FALLBACK",
+    "DNS_CACHE_NEGATIVE_TTL", "DNS_TIMEOUT_MS", "DNS_OVERALL_TIMEOUT_MS", "DNS_RETRIES", "DNS_FALLBACK",
     "DNS_IP_PREFERENCE", "DNS_HOSTS", "DNS_MAX_RESOLVERS",
     "CORE_CREDENTIAL_MODE", "CORE_HANDSHAKE_TIMEOUT_MS", "CORE_FIRST_BYTE_TIMEOUT_MS",
     "EGRESS_CONNECT_TIMEOUT_MS", "CORE_MAX_INITIAL_RETRIES", "CORE_RETRY_ON_EMPTY_RESPONSE",
@@ -13526,16 +17317,25 @@ function validatePath(issues, field, raw, fallback) {
         || /[^\x00-\x7f]/.test(value)
         || /[\s\u0000-\u001f\u007f]/.test(value)
         || (value.length > 1 && value.endsWith("/"))
-        || value.split("/").some((segment) => segment === "." || segment === "..")) {
-        pushIssue(issues, field, "must be a canonical URL pathname starting with / and must not contain query, fragment, backslash, percent-encoding, spaces, control characters, the characters \" < > ` { }, non-ASCII characters, dot segments or a trailing slash");
+        || value.split("/").some((segment) => segment === "." || segment === "..")
+        // CFG-8: a bare "/" path collides with the root route, and empty
+        // segments ("//", "/a//b") never match a normalized pathname.
+        // (RT-1: "/" for DOH_PATH used to diverge between Pages and Workers;
+        // it is now rejected here and the Pages entry falls back defensively.)
+        || value === "/"
+        || value.slice(1).split("/").some((segment) => segment === "")) {
+        pushIssue(issues, field, "must be a canonical URL pathname starting with / and must not contain query, fragment, backslash, percent-encoding, spaces, control characters, the characters \" < > ` { }, non-ASCII characters, dot segments, a trailing slash, a bare / root path, or empty segments");
         return fallback;
     }
     return value;
 }
 // Paths owned by the fixed control/subscription routes; a configurable protocol or DoH path
-// must never shadow the authorization boundary (C5).
+// must never shadow the authorization boundary (C5). CFG-2: /sub/* is reserved too —
+// a protocol path under /sub/ can never serve on Pages (where /sub/* is the
+// subscription route) and collides with it on Workers, so it is rejected here
+// rather than left as a platform-dependent trap.
 function isReservedRoutePath(value) {
-    return value === "/sub" || value === "/__core" || value.startsWith("/__core/");
+    return value === "/sub" || value.startsWith("/sub/") || value === "/__core" || value.startsWith("/__core/");
 }
 // Strict host:port with a mandatory port (unlike parseEndpoint, which defaults the port).
 function isValidHostPort(value) {
@@ -13565,6 +17365,17 @@ function isValidHostPort(value) {
     return Number.isSafeInteger(port) && port >= 1 && port <= 65535;
 }
 function validateUsers(issues, env) {
+    // CFG-3 (documented, not re-split): TROJAN_USERS is a comma/newline
+    // list in BOTH this validator and EnvironmentCredentialProvider, with
+    // identical trimming — so a comma inside a password becomes two
+    // passwords in both layers, and surrounding whitespace is stripped in
+    // both. There is no validation-vs-storage divergence to fix; the
+    // constraint is that passwords must not contain commas or
+    // leading/trailing whitespace (those are list syntax), documented in
+    // CONFIGURATION.md. The 1-byte minimum stays: short passwords are
+    // weak but functional (SHA-224-hashed at the provider), and the
+    // project's own contract harness uses short fixture passwords —
+    // raising the floor would break that harness, not a deployment.
     const vless = splitList(env.VLESS_USERS);
     const trojan = splitList(env.TROJAN_USERS);
     const hasDb = Boolean(env.DB);
@@ -13612,6 +17423,15 @@ const PLACEHOLDER_PASSWORDS = new Set([
     "your-password", "your-trojan-password", "example-password", "default-password",
     "trojan-password", "generate-a-password",
 ]);
+// P2 benchmark gate: well-known default credentials must fail closed, not just for
+// Trojan passwords but for every token/path-secret capability. Exact-match only (a
+// longer random token merely containing "test" is unaffected).
+const WELL_KNOWN_DEFAULT_TOKENS = new Set([
+    ...PLACEHOLDER_PASSWORDS,
+    "admin", "test", "secret", "token", "default", "changeme123", "123456", "12345678",
+    "qwerty", "letmein", "password123", "admin123", "root", "demo", "sample", "example",
+    "test123", "abc123", "1234", "0000", "token123", "admin-token", "secret-token",
+]);
 function validateToken(issues, field, value, required) {
     const trimmed = value?.trim() ?? "";
     if (required && !trimmed)
@@ -13624,6 +17444,8 @@ function validateToken(issues, field, value, required) {
         pushIssue(issues, field, `must not exceed ${MAX_TOKEN_LENGTH} characters`);
     if (trimmed && /[\r\n]/.test(trimmed))
         pushIssue(issues, field, "must not contain CR/LF characters");
+    if (trimmed && WELL_KNOWN_DEFAULT_TOKENS.has(trimmed.toLowerCase()))
+        pushIssue(issues, field, "must not be a well-known default credential; generate a unique random value");
 }
 // DS-L4: path secrets travel inside `url.pathname`, which the URL parser
 // serializes with percent-encoding, so a secret containing a character
@@ -13698,11 +17520,17 @@ function validateProxyIp(issues, env) {
                     }
                     const entry = item;
                     const host = typeof entry.host === "string" ? entry.host.trim() : "";
-                    const port = entry.port === undefined ? 1080 : Number(entry.port);
+                    // CFG-4: port must be a JSON number (or absent → 1080). The old
+                    // Number() coercion turned `port: true` into port 1, silently.
+                    const port = entry.port === undefined ? 1080 : typeof entry.port === "number" ? entry.port : Number.NaN;
                     if ((!validHostname(host) && !isIpLiteral(host)) || !Number.isInteger(port) || port < 1 || port > 65535)
                         pushIssue(issues, "PROXY_IP_ENDPOINTS_JSON", "contains an endpoint with an invalid host or port");
                     if (entry.tls !== undefined && typeof entry.tls !== "boolean")
                         pushIssue(issues, "PROXY_IP_ENDPOINTS_JSON", "endpoint tls must be boolean");
+                    // CFG-4: non-string credentials were silently dropped to "".
+                    // They are a mistype now, not an empty credential.
+                    if ((entry.username !== undefined && typeof entry.username !== "string") || (entry.password !== undefined && typeof entry.password !== "string"))
+                        pushIssue(issues, "PROXY_IP_ENDPOINTS_JSON", "endpoint username/password must be strings");
                     const username = typeof entry.username === "string" ? entry.username : "";
                     const password = typeof entry.password === "string" ? entry.password : "";
                     if (Boolean(username) !== Boolean(password))
@@ -13816,6 +17644,7 @@ function validateDns(issues, env) {
     parseIntegerField(issues, "DNS_CACHE_MAX_TTL", env.DNS_CACHE_MAX_TTL, 300, 1, 86_400);
     parseIntegerField(issues, "DNS_CACHE_NEGATIVE_TTL", env.DNS_CACHE_NEGATIVE_TTL, 30, 1, 3_600);
     parseIntegerField(issues, "DNS_TIMEOUT_MS", env.DNS_TIMEOUT_MS, 3000, 100, 60_000);
+    parseIntegerField(issues, "DNS_OVERALL_TIMEOUT_MS", env.DNS_OVERALL_TIMEOUT_MS, 30_000, 1000, 300_000);
     parseIntegerField(issues, "DNS_RETRIES", env.DNS_RETRIES, 1, 0, 5);
     parseBooleanField(issues, "DNS_FALLBACK", env.DNS_FALLBACK, true);
     parseBooleanField(issues, "CORE_TEST_LIVE_DNS", env.CORE_TEST_LIVE_DNS, false);
@@ -13886,6 +17715,16 @@ function validateOutput(issues, env, securityConfig) {
         }
         else if (parsed.username || parsed.password) {
             pushIssue(issues, "CORE_OUTPUT_PROBE_URL", "must not contain credentials");
+        }
+        else if (parsed.hash) {
+            // CFG-8: a fragment is never sent to the probe target, so a
+            // fragment-bearing probe URL is always an operator mistake.
+            // Queries stay allowed: they ARE sent and can be legitimate
+            // (e.g. a health endpoint that needs ?check=1).
+            pushIssue(issues, "CORE_OUTPUT_PROBE_URL", "must not contain a fragment");
+        }
+        else if (probeUrl.length > 2048) {
+            pushIssue(issues, "CORE_OUTPUT_PROBE_URL", "must not exceed 2048 characters");
         }
     }
     // OUTPUT_NAME / OUTPUT_REMARK shape the names/remarks of generated client configs and were
@@ -13977,7 +17816,7 @@ function validateExternalSubscriptions(issues, env) {
     // only surfaced the day subscriptions were switched on.
     const allowHttp = parseBooleanField(issues, "CORE_OUTPUT_SUBS_ALLOW_HTTP", env.CORE_OUTPUT_SUBS_ALLOW_HTTP, false);
     parseIntegerField(issues, "CORE_OUTPUT_SUBS_TIMEOUT_MS", env.CORE_OUTPUT_SUBS_TIMEOUT_MS, 5000, 250, 30_000);
-    const sources = splitList(env.OUTPUT_CUSTOM_SUBS);
+    const sources = (0, aggregation_1.splitSubscriptionSources)(env.OUTPUT_CUSTOM_SUBS);
     if (!sources.length)
         return;
     const allowlist = splitList(env.CORE_OUTPUT_SUBS_ALLOWLIST);
@@ -13997,13 +17836,54 @@ function validateExternalSubscriptions(issues, env) {
             pushIssue(issues, "CORE_OUTPUT_SUBS_ALLOWLIST", `contains an invalid hostname pattern: ${rule}`);
     }
 }
+// CFG-1: Xray durations accept the full documented grammar — single or compound
+// parts ("30s", "2h45m", "1500ms") with ns/us/µs/ms/s/m/h units — parsed to
+// milliseconds for the range check. The 1s floor is deliberately NOT raised:
+// Xray clamps sub-10s probe intervals to 10s at runtime anyway, so raising the
+// floor would only forbid values Xray already handles; the clamp is documented
+// here, in the error message, and in CONFIGURATION.md instead.
+function parseXrayDurationMs(raw) {
+    const trimmed = raw.trim();
+    if (!trimmed)
+        return null;
+    const part = /(\d+(?:\.\d+)?)(ns|us|µs|μs|ms|s|m|h)/g;
+    let total = 0;
+    let consumed = 0;
+    let match;
+    while ((match = part.exec(trimmed)) !== null) {
+        if (match.index !== consumed)
+            return null;
+        consumed += match[0].length;
+        const value = Number(match[1]);
+        const unit = match[2];
+        const multiplier = unit === "ns" ? 1 / 1_000_000
+            : unit === "us" || unit === "µs" || unit === "μs" ? 1 / 1000
+                : unit === "ms" ? 1
+                    : unit === "s" ? 1000
+                        : unit === "m" ? 60_000 : 3_600_000;
+        total += value * multiplier;
+    }
+    if (consumed !== trimmed.length || !Number.isFinite(total) || total <= 0)
+        return null;
+    return total;
+}
+function validateXrayDurationField(issues, field, raw, example) {
+    const value = raw?.trim();
+    if (!value)
+        return;
+    const ms = parseXrayDurationMs(value);
+    if (ms === null || ms < 1_000 || ms > 3_600_000) {
+        pushIssue(issues, field, `must be an Xray duration between 1s and 1h (e.g. ${example}); Xray clamps values below 10s to 10s at runtime`);
+    }
+}
 function validateAdvanced(issues, env) {
-    try {
-        (0, runtime_1.buildRuntimeConfig)(env);
-    }
-    catch (error) {
-        pushIssue(issues, issueFieldFromError(error, "CORE_RUNTIME"), error instanceof errors_1.CoreError ? error.message : "invalid runtime settings");
-    }
+    // CFG-7: the old buildRuntimeConfig() call here pushed its first thrown
+    // error as an issue and then every field was re-parsed individually
+    // below, double-reporting one invalid field. It is removed: every field
+    // buildRuntimeConfig parses is individually parsed in this function or
+    // in validateEnvironment with identical bounds (verified field by
+    // field), so nothing is lost. buildRuntimeConfig still runs on every
+    // request path via runtimeFor.
     // CORE_FRAGMENT_PROFILES is parsed with strict bounds by the output layer; run that same
     // parser at startup so an invalid value fails validation instead of failing the first
     // Fragment output request (C9).
@@ -14060,8 +17940,10 @@ function validateAdvanced(issues, env) {
     parseIntegerField(issues, "CORE_FIRST_BYTE_TIMEOUT_MS", env.CORE_FIRST_BYTE_TIMEOUT_MS, 0, 0, 60_000);
     parseIntegerField(issues, "CORE_MAX_INITIAL_RETRIES", env.CORE_MAX_INITIAL_RETRIES, 3, 0, 4);
     parseBooleanField(issues, "CORE_RETRY_ON_EMPTY_RESPONSE", env.CORE_RETRY_ON_EMPTY_RESPONSE, true);
-    parseIntegerField(issues, "CORE_IDLE_TIMEOUT_MS", env.CORE_IDLE_TIMEOUT_MS, 0, 0, 86_400_000);
-    parseIntegerField(issues, "CORE_MAX_SESSION_MS", env.CORE_MAX_SESSION_MS, 0, 0, 604_800_000);
+    // CFG-7: fallbacks match the runtime defaults exactly (idle 300s bounded-by-default
+    // per CORE-4; session 1h), so validation and runtime can no longer disagree.
+    parseIntegerField(issues, "CORE_IDLE_TIMEOUT_MS", env.CORE_IDLE_TIMEOUT_MS, 300_000, 0, 86_400_000);
+    parseIntegerField(issues, "CORE_MAX_SESSION_MS", env.CORE_MAX_SESSION_MS, 3_600_000, 0, 604_800_000);
     parseIntegerField(issues, "CORE_MAX_PROXYIP_FAILURES", env.CORE_MAX_PROXYIP_FAILURES, 3, 1, 20);
     parseIntegerField(issues, "CORE_PROXYIP_COOLDOWN_MS", env.CORE_PROXYIP_COOLDOWN_MS, 15_000, 1_000, 86_400_000);
     parseBooleanField(issues, "CORE_OUTPUT_ALLOW_QUERY_TOKEN", env.CORE_OUTPUT_ALLOW_QUERY_TOKEN, false);
@@ -14070,7 +17952,9 @@ function validateAdvanced(issues, env) {
     parseBooleanField(issues, "CORE_OUTPUT_XRAY_ALLOW_DIRECT_FALLBACK", env.CORE_OUTPUT_XRAY_ALLOW_DIRECT_FALLBACK, false);
     parseBooleanField(issues, "CORE_OUTPUT_ENABLE_TUN", env.CORE_OUTPUT_ENABLE_TUN, false);
     parseIntegerField(issues, "CORE_OUTPUT_EARLY_DATA", env.CORE_OUTPUT_EARLY_DATA, 0, 0, 8192);
-    if (env.OUTPUT_CUSTOM_SUBS?.trim() && env.OUTPUT_CUSTOM_SUBS.split(/[\r\n,]+/).filter((x) => x.trim()).length > 8)
+    // SCAN-18: count with the scheme-aware splitter (a comma inside a subscription URL
+    // query must not count as a separator).
+    if ((0, aggregation_1.splitSubscriptionSources)(env.OUTPUT_CUSTOM_SUBS).length > 8)
         pushIssue(issues, "OUTPUT_CUSTOM_SUBS", "supports at most 8 sources");
     validateRoutingProviders(issues, env);
     validateExternalSubscriptions(issues, env);
@@ -14110,6 +17994,16 @@ function validateCustomRouting(issues, env) {
         else
             tagsByTarget.set(target, new Set());
     }
+    // P2 chain tags exist in every target (the translator preserves `tag`),
+    // so they satisfy the every-target cross-check below. Parse errors are
+    // already reported via collectGeneratorOptionIssues; skip silently here.
+    try {
+        for (const entry of (0, generator_options_1.parseChainEntries)(env.CORE_OUTPUT_CHAIN_OUTBOUNDS)) {
+            for (const target of ["sing-box", "xray", "clash"])
+                tagsByTarget.get(target)?.add(entry.tag);
+        }
+    }
+    catch { /* reported elsewhere */ }
     if (ruleIssues.length)
         return;
     let rules = [];
@@ -14196,37 +18090,11 @@ function validateEnvironment(env) {
     }
     validateOutput(issues, env, outputSecurity);
     validateCustomRouting(issues, env);
-    const probeInterval = env.CORE_XRAY_PROBE_INTERVAL?.trim();
-    if (probeInterval && !/^\d+(?:ms|s|m|h)$/.test(probeInterval)) {
-        pushIssue(issues, "CORE_XRAY_PROBE_INTERVAL", "must be an Xray duration such as 30s, 60s, 5m or 1h");
-    }
-    if (probeInterval) {
-        const match = probeInterval.match(/^(\d+)(ms|s|m|h)$/);
-        if (match) {
-            const unit = match[2];
-            const multiplier = unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000;
-            const value = Number(match[1]) * multiplier;
-            if (!Number.isSafeInteger(value) || value < 1_000 || value > 3_600_000) {
-                pushIssue(issues, "CORE_XRAY_PROBE_INTERVAL", "must be between 1s and 1h");
-            }
-        }
-    }
+    validateXrayDurationField(issues, "CORE_XRAY_PROBE_INTERVAL", env.CORE_XRAY_PROBE_INTERVAL, "30s, 60s, 5m or 1h");
     parseBooleanField(issues, "CORE_XRAY_OBSERVATORY_CONCURRENCY", env.CORE_XRAY_OBSERVATORY_CONCURRENCY, true);
-    const fragmentProbeInterval = env.CORE_XRAY_FRAGMENT_PROBE_INTERVAL?.trim();
-    if (fragmentProbeInterval && !/^\d+(?:ms|s|m|h)$/.test(fragmentProbeInterval)) {
-        pushIssue(issues, "CORE_XRAY_FRAGMENT_PROBE_INTERVAL", "must be an Xray duration such as 1s, 5s, 1m or 1h");
-    }
-    if (fragmentProbeInterval) {
-        const match = fragmentProbeInterval.match(/^(\d+)(ms|s|m|h)$/);
-        if (match) {
-            const unit = match[2];
-            const multiplier = unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000;
-            const value = Number(match[1]) * multiplier;
-            if (!Number.isSafeInteger(value) || value < 1_000 || value > 3_600_000) {
-                pushIssue(issues, "CORE_XRAY_FRAGMENT_PROBE_INTERVAL", "must be between 1s and 1h");
-            }
-        }
-    }
+    validateXrayDurationField(issues, "CORE_XRAY_FRAGMENT_PROBE_INTERVAL", env.CORE_XRAY_FRAGMENT_PROBE_INTERVAL, "1s, 5s, 1m or 1h");
+    for (const issue of (0, generator_options_1.collectGeneratorOptionIssues)(env))
+        pushIssue(issues, issue.field, issue.message);
     parseBooleanField(issues, "CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY", env.CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY, false);
     validatePathSecret(issues, "CORE_DOH_PATH_SECRET", env.CORE_DOH_PATH_SECRET);
     validatePathSecret(issues, "CORE_OUTPUT_PATH_SECRET", env.CORE_OUTPUT_PATH_SECRET);
@@ -14237,10 +18105,46 @@ function validateEnvironment(env) {
         cachedValidation = error;
         throw error;
     }
-    const result = { outputSecurity };
+    const warnings = collectValidationWarnings(env);
+    const result = { outputSecurity, warnings };
     cachedValidationSignature = signature;
     cachedValidation = result;
     return result;
+}
+// Non-fatal startup warnings. These never fail validation (a deprecated
+// var, an oversize var, or a shadowed rule is not a broken deployment),
+// but silently ignoring them was the gap in CFG-5, CFG-6, and PR-2.
+function collectValidationWarnings(env) {
+    const warnings = [];
+    const warn = (field, message) => { warnings.push(Object.freeze({ field, message })); };
+    // CFG-5: deprecated vars are silently inert — say so at startup.
+    for (const field of ["CORE_OUTPUT_MAX_ENDPOINTS", "CORE_OUTPUT_MAX_CREDENTIALS"]) {
+        if (env[field]?.trim())
+            warn(field, "is deprecated and has no effect; remove it from the configuration");
+    }
+    // CFG-6: Cloudflare platform caps — 5 KiB per variable, 64 vars on
+    // Free / 128 on Paid. These warn (a Paid deployment may legitimately
+    // exceed 64) rather than fail; values are never echoed.
+    let setCount = 0;
+    for (const [key, value] of Object.entries(env)) {
+        if (typeof value !== "string" || !value.trim())
+            continue;
+        setCount++;
+        if (new TextEncoder().encode(value).byteLength > 5120) {
+            warn(key, "exceeds the Cloudflare 5 KiB per-variable limit and may fail at deploy time");
+        }
+    }
+    if (setCount > 128)
+        warn("ENVIRONMENT", `${setCount} string variables are set, exceeding the Cloudflare Paid-plan cap of 128 per Worker`);
+    else if (setCount > 64)
+        warn("ENVIRONMENT", `${setCount} string variables are set, exceeding the Cloudflare Free-plan cap of 64 per Worker (Paid allows 128)`);
+    // PR-2: first-match shadowing — a later rule an earlier rule fully
+    // covers can never fire. Indices are 0-based in CORE_RULES order.
+    const entries = splitList(env.CORE_RULES);
+    for (const { index, shadowedBy } of (0, rules_1.findShadowedCoreRules)(entries)) {
+        warn("CORE_RULES", `rule ${index} is fully shadowed by rule ${shadowedBy} (first-match order) and can never fire; reorder or remove it`);
+    }
+    return warnings;
 }
 
 };
