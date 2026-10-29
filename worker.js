@@ -3630,7 +3630,7 @@ async function runSelfTests(env) {
             throw new Error("Sing-box Fragment client requirements missing from manifest");
     }));
     tests.push(await runOne("output.fragment-observatory-overrides", "Fragment probe cadence and concurrency are bounded by defaults but remain operator-overridable", "output", async () => {
-        const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: "proxy.example.com", OUTPUT_PORT: "443", CORE_OUTPUT_MAX_NODES: "20", CORE_XRAY_FRAGMENT_PROBE_INTERVAL: "5s", CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY: "true" };
+        const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: "proxy.example.com", OUTPUT_PORT: "443", CORE_OUTPUT_MAX_NODES: "20", CORE_XRAY_FRAGMENT_PROBE_INTERVAL: "5s", CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY: "true", CORE_OUTPUT_PROBE_URL: "https://probe.example.com/generate_204" };
         const records = [1, 2].map((id) => ({ id: String(id), protocol: "vless", credential: vlessUuid, rawCredential: vlessUuid, enabled: true }));
         const provider = { authenticate: async () => null, count: async (protocol) => protocol === "vless" ? records.length : 0, listPage: async (protocol, offset, limit) => protocol === "vless" ? records.slice(offset, offset + limit) : [] };
         const rendered = await (0, artifacts_1.renderOutputArtifact)(env, new Request("https://proxy.example.com/__core/outputs/xray?artifact=best-fragment&protocol=vless&limit=1"), provider, "xray");
@@ -3638,6 +3638,13 @@ async function runSelfTests(env) {
         const observatory = config.observatory;
         if (observatory?.probeInterval !== "5s" || observatory?.enableConcurrency !== true)
             throw new Error(`Fragment Observatory overrides were ignored: ${JSON.stringify(observatory)}`);
+        if (observatory?.probeUrl !== "https://probe.example.com/generate_204")
+            throw new Error(`CORE_OUTPUT_PROBE_URL was not propagated to the Xray Observatory: ${JSON.stringify(observatory)}`);
+        const singboxRendered = await (0, artifacts_1.renderOutputArtifact)(env, new Request("https://proxy.example.com/__core/outputs/sing-box?artifact=best-ping&protocol=vless"), provider, "sing-box");
+        const singboxConfig = JSON.parse(singboxRendered.body);
+        const urltest = singboxConfig.outbounds?.find((item) => item.type === "urltest");
+        if (urltest?.url !== "https://probe.example.com/generate_204")
+            throw new Error(`CORE_OUTPUT_PROBE_URL was not propagated to the sing-box urltest group: ${JSON.stringify(urltest)}`);
     }));
     tests.push(await runOne("output.best-ping-fragment-composition", "Xray Best Fragment and Best Ping Fragment are documented aliases; Sing-box fragment groups use urltest selection", "output", async () => {
         const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: "proxy.example.com", OUTPUT_PORT: "443" };
@@ -8508,7 +8515,7 @@ async function pageFor(env, request, provider, target, selection, limitOverride)
 function baseOptions(env, fragmentArtifact = false) {
     const earlyData = (0, planning_1.parseOutputEarlyData)(env) ?? 0;
     return {
-        probeUrl: "https://www.gstatic.com/generate_204",
+        probeUrl: env.CORE_OUTPUT_PROBE_URL?.trim() || "https://www.gstatic.com/generate_204",
         probeInterval: fragmentArtifact
             ? env.CORE_XRAY_FRAGMENT_PROBE_INTERVAL?.trim() || "1s"
             : env.CORE_XRAY_PROBE_INTERVAL?.trim() || "30s",
@@ -10772,6 +10779,7 @@ const STRING_ENV_FIELDS = new Set([
     "CORE_OUTPUT_SINGBOX_UTLS", "CORE_OUTPUT_XRAY_ALLOW_DIRECT_FALLBACK", "CORE_OUTPUT_ENABLE_TUN",
     "CORE_XRAY_PROBE_INTERVAL", "CORE_XRAY_OBSERVATORY_CONCURRENCY",
     "CORE_XRAY_FRAGMENT_PROBE_INTERVAL", "CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY",
+    "CORE_OUTPUT_PROBE_URL",
     "CORE_OUTPUT_TOKEN", "CORE_OUTPUT_ALLOW_QUERY_TOKEN", "CORE_OUTPUT_ALLOW_RAW",
     "CORE_OUTPUT_DEFAULT_NODES", "CORE_OUTPUT_MAX_NODES", "CORE_OUTPUT_MAX_BYTES",
     "CORE_OUTPUT_MAX_ENDPOINTS", "CORE_OUTPUT_MAX_CREDENTIALS",
@@ -11199,6 +11207,26 @@ function validateOutput(issues, env, securityConfig) {
     }
     catch (error) {
         pushIssue(issues, issueFieldFromError(error, "OUTPUT_HOST/CLEAN_IPS"), error instanceof errors_1.CoreError ? error.message : "contains an invalid endpoint");
+    }
+    // Probe URL for the latency tests in generated configs (sing-box urltest groups,
+    // Xray Observatory, Mihomo url-test groups). Unset keeps the built-in default;
+    // when set it must be an absolute http(s) URL without credentials, since the
+    // value is emitted verbatim into client configs.
+    const probeUrl = env.CORE_OUTPUT_PROBE_URL?.trim();
+    if (probeUrl) {
+        let parsed = null;
+        try {
+            parsed = new URL(probeUrl);
+        }
+        catch {
+            parsed = null;
+        }
+        if (!parsed || (parsed.protocol !== "http:" && parsed.protocol !== "https:")) {
+            pushIssue(issues, "CORE_OUTPUT_PROBE_URL", "must be an absolute http(s) URL");
+        }
+        else if (parsed.username || parsed.password) {
+            pushIssue(issues, "CORE_OUTPUT_PROBE_URL", "must not contain credentials");
+        }
     }
     // OUTPUT_NAME / OUTPUT_REMARK shape the names/remarks of generated client configs and were
     // previously only bounded at request time; apply the same 512-char bound plus the CR/LF /
