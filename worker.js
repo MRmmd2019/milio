@@ -40,7 +40,17 @@ const wsAdapter = new websocket_1.CloudflareWebSocketAdapter();
 // connection until the isolate's memory limit degrades every session.
 let activeSessions = 0;
 function jsonResponse(data, status = 200) { return new Response(JSON.stringify(data, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } }); }
-function textResponse(body, status = 200) { return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } }); }
+function textResponse(body, status = 200, extraHeaders) { return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", ...(extraHeaders ?? {}) } }); }
+// DS-I2 (RFC 6455 §4.2.1): the Upgrade header must CONTAIN the
+// "websocket" token, not equal it — "WebSocket, h2c" is a valid upgrade
+// offer. Split on commas, trim, and compare case-insensitively (mirrors
+// hasWebSocketUpgradeToken in the WebSocket adapter).
+function hasWebSocketUpgradeToken(request) {
+    const header = request.headers.get("Upgrade");
+    if (!header)
+        return false;
+    return header.split(",").some((token) => token.trim().toLowerCase() === "websocket");
+}
 function requestId() { return crypto.randomUUID(); }
 function statusForCoreError(error) { switch (error.code) {
     case "BAD_REQUEST":
@@ -62,6 +72,12 @@ function validateEnvironment(env) { (0, validation_1.validateEnvironment)(env); 
 exports.default = {
     async fetch(request, env, ctx) {
         const url = new URL(request.url);
+        // DS-L28: health/ready are read-only status endpoints — non-GET
+        // methods get 405 + Allow: GET, like the other control routes.
+        if (url.pathname === "/__core/health" || url.pathname === "/__core/ready") {
+            if (request.method !== "GET")
+                return textResponse("Health and readiness endpoints require GET", 405, { allow: "GET" });
+        }
         if (url.pathname === "/__core/health")
             return jsonResponse({ status: "ok", core_version: core_1.CORE_VERSION });
         if (url.pathname === "/__core/ready") {
@@ -88,9 +104,10 @@ exports.default = {
         const protocol = chooseProtocol(url.pathname, env);
         if (!protocol)
             return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+        // DS-I1 (RFC 9110 §15.5.6): a 405 response carries an Allow header.
         if (request.method !== "GET")
-            return textResponse("WebSocket endpoint requires GET", 405);
-        if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket")
+            return textResponse("WebSocket endpoint requires GET", 405, { allow: "GET" });
+        if (!hasWebSocketUpgradeToken(request))
             return (0, websocket_1.websocketUpgradeRequiredResponse)();
         if (activeSessions >= core_1.CORE_LIMITS.maxConcurrentSessions)
             return textResponse("Too many concurrent sessions", 503);
@@ -156,11 +173,12 @@ const service_1 = __r("../output/service");
 const runner_1 = __r("../tests/runner");
 const doh_1 = __r("../handlers/doh");
 const authorize_1 = __r("../security/authorize");
-function jsonResponse(data, status = 200) {
-    return new Response(JSON.stringify(data, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
+function jsonResponse(data, status = 200, extraHeaders) {
+    // DS-I17: control responses carry X-Content-Type-Options: nosniff.
+    return new Response(JSON.stringify(data, null, 2), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", ...(extraHeaders ?? {}) } });
 }
-function textResponse(body, status = 200) {
-    return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+function textResponse(body, status = 200, extraHeaders) {
+    return new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", ...(extraHeaders ?? {}) } });
 }
 function requestId() { return crypto.randomUUID(); }
 function statusForCoreError(error) {
@@ -182,7 +200,13 @@ function errorResponse(error, id) {
         payload.issues = coreError.issues;
     if (statusForCoreError(coreError) >= 500)
         console.error(JSON.stringify({ request_id: id, code: coreError.code, message: coreError.message }));
-    return jsonResponse(payload, statusForCoreError(coreError));
+    // DS-I17: control 401s (including AUTH_FAILED thrown by
+    // src/security/authorize.ts requireScope/requireAdminOperation/
+    // requireOutputAccess, which surface here) carry WWW-Authenticate: Bearer
+    // per RFC 7235 §3.1. CoreError carries no headers, so the challenge is
+    // attached at this single error-response choke point.
+    const status = statusForCoreError(coreError);
+    return jsonResponse(payload, status, status === 401 ? { "www-authenticate": "Bearer" } : undefined);
 }
 function validateEnvironment(env) { (0, validation_1.validateEnvironment)(env); }
 // Path-secret checks go through security/authorize's digest-based constant-time
@@ -190,7 +214,33 @@ function validateEnvironment(env) { (0, validation_1.validateEnvironment)(env); 
 // short-circuited on the first differing character (audit F9).
 async function handleControlRequest(request, env) {
     const url = new URL(request.url);
-    if (url.pathname === "/__core/diagnostics" || url.pathname === "/__core/tests" || url.pathname === "/__core/endpoints") {
+    // Compare on the canonical path form: validation guarantees DOH_PATH has
+    // no trailing slash (C4/C5), but strip trailing slashes on both sides the
+    // same way the DoH handler's path-secret matcher does, so routing and
+    // authorization can never disagree over a stray slash.
+    const dohPath = (env.DOH_PATH?.trim() || "/dns-query").replace(/\/+$/, "") || "/dns-query";
+    const isDohPath = (url.pathname.replace(/\/+$/, "") || "/") === dohPath || (0, doh_1.privateDohPathSecretMatches)(request, env);
+    const isOutputPath = (base) => url.pathname === base || (0, authorize_1.pathSecretMatches)(request, base, env.CORE_OUTPUT_PATH_SECRET);
+    // Derive the format from the route base that actually matched. Scanning the whole
+    // pathname for "/xray" / "/sing-box" substrings let a path secret containing such a
+    // segment misroute the request to the wrong renderer (audit F10).
+    const outputRoutes = [
+        ["/__core/outputs/xray", "xray"],
+        ["/__core/outputs/sing-box", "sing-box"],
+        ["/__core/outputs/clash", "clash"],
+    ];
+    const matchedOutput = outputRoutes.find(([base]) => isOutputPath(base));
+    const isSubscriptionPath = url.pathname === "/sub" || (0, authorize_1.pathSecretMatches)(request, "/sub", env.CORE_OUTPUT_PATH_SECRET) || url.pathname === "/__core/outputs" || (0, authorize_1.pathSecretMatches)(request, "/__core/outputs", env.CORE_OUTPUT_PATH_SECRET) || url.pathname === "/__core/outputs/share" || (0, authorize_1.pathSecretMatches)(request, "/__core/outputs/share", env.CORE_OUTPUT_PATH_SECRET);
+    const isAdminPath = url.pathname === "/__core/diagnostics" || url.pathname === "/__core/tests" || url.pathname === "/__core/endpoints";
+    // DS-L28: control routes are documented GET-only, but previously
+    // accepted any method (e.g. POST /__core/tests ran the suite). Reject
+    // non-GET methods with 405 + Allow: GET (RFC 9110 §15.5.6). DoH paths
+    // are excluded: the DoH handler itself allows GET and POST and already
+    // answers other methods with 405 + Allow: GET, POST.
+    if (!isDohPath && request.method !== "GET" && (isAdminPath || matchedOutput || isSubscriptionPath)) {
+        return textResponse("Method Not Allowed", 405, { allow: "GET" });
+    }
+    if (isAdminPath) {
         const id = requestId();
         try {
             const scope = url.pathname === "/__core/tests" ? "tests:run" : "diagnostics:read";
@@ -208,7 +258,10 @@ async function handleControlRequest(request, env) {
                 protocols: ["vless", "trojan"], transports: ["websocket"],
                 egress: { direct: true, proxyip, relay: Boolean(env.PROXY_RELAY_ENDPOINTS?.trim()), nat64: Boolean((env.NAT64_PREFIXES?.trim() || env.EGRESS_MODE?.trim().toLowerCase() === "smart" || env.EGRESS_MODE?.trim().toLowerCase() === "nat64")) },
                 bindings: { DB: Boolean(env.DB), KV: Boolean(env.KV) }, metrics: runtime.metrics.snapshot(),
-                routing: { mode: env.EGRESS_MODE?.trim() || "smart", rules: env.CORE_RULES ? env.CORE_RULES.split(/\r?\n/).filter(Boolean).length : 0 },
+                // DS-H2: count with the same comma-and-newline split the
+                // validator and the runtime parser use, so a comma-form value is
+                // not undercounted here.
+                routing: { mode: env.EGRESS_MODE?.trim() || "smart", rules: env.CORE_RULES ? env.CORE_RULES.split(/[\r\n,]+/).map((value) => value.trim()).filter(Boolean).length : 0 },
                 dns: runtime.dns.diagnostics(), output: (0, planning_1.outputSummary)(env, url.hostname), limits: runtime.config, request_id: id,
             });
         }
@@ -216,12 +269,7 @@ async function handleControlRequest(request, env) {
             return errorResponse(error, id);
         }
     }
-    // Compare on the canonical path form: validation guarantees DOH_PATH has
-    // no trailing slash (C4/C5), but strip trailing slashes on both sides the
-    // same way the DoH handler's path-secret matcher does, so routing and
-    // authorization can never disagree over a stray slash.
-    const dohPath = (env.DOH_PATH?.trim() || "/dns-query").replace(/\/+$/, "") || "/dns-query";
-    if ((url.pathname.replace(/\/+$/, "") || "/") === dohPath || (0, doh_1.privateDohPathSecretMatches)(request, env)) {
+    if (isDohPath) {
         try {
             return await (0, doh_1.handlePrivateDoh)(request, env);
         }
@@ -229,16 +277,6 @@ async function handleControlRequest(request, env) {
             return errorResponse(error, requestId());
         }
     }
-    const isOutputPath = (base) => url.pathname === base || (0, authorize_1.pathSecretMatches)(request, base, env.CORE_OUTPUT_PATH_SECRET);
-    // Derive the format from the route base that actually matched. Scanning the whole
-    // pathname for "/xray" / "/sing-box" substrings let a path secret containing such a
-    // segment misroute the request to the wrong renderer (audit F10).
-    const outputRoutes = [
-        ["/__core/outputs/xray", "xray"],
-        ["/__core/outputs/sing-box", "sing-box"],
-        ["/__core/outputs/clash", "clash"],
-    ];
-    const matchedOutput = outputRoutes.find(([base]) => isOutputPath(base));
     if (matchedOutput) {
         const [outputBase, format] = matchedOutput;
         const id = requestId();
@@ -247,13 +285,12 @@ async function handleControlRequest(request, env) {
             validateEnvironment(env);
             const runtime = (0, runtime_1.runtimeFor)(env);
             const rendered = await (0, service_1.renderCoreFormat)(env, request, runtime.credentials, format);
-            return new Response(rendered.body, { status: 200, headers: { "content-type": rendered.contentType, "cache-control": "no-store", ...(rendered.headers ?? {}) } });
+            return new Response(rendered.body, { status: 200, headers: { "content-type": rendered.contentType, "cache-control": "no-store", "x-content-type-options": "nosniff", ...(rendered.headers ?? {}) } });
         }
         catch (error) {
             return errorResponse(error, id);
         }
     }
-    const isSubscriptionPath = url.pathname === "/sub" || (0, authorize_1.pathSecretMatches)(request, "/sub", env.CORE_OUTPUT_PATH_SECRET) || url.pathname === "/__core/outputs" || (0, authorize_1.pathSecretMatches)(request, "/__core/outputs", env.CORE_OUTPUT_PATH_SECRET) || url.pathname === "/__core/outputs/share" || (0, authorize_1.pathSecretMatches)(request, "/__core/outputs/share", env.CORE_OUTPUT_PATH_SECRET);
     if (isSubscriptionPath) {
         const id = requestId();
         try {
@@ -264,7 +301,7 @@ async function handleControlRequest(request, env) {
             validateEnvironment(env);
             const runtime = (0, runtime_1.runtimeFor)(env);
             const rendered = await (0, service_1.renderSubscriptionWithProvider)(env, request, runtime.credentials, runtime.dns);
-            return new Response(rendered.body, { status: 200, headers: { "content-type": rendered.contentType, "cache-control": "no-store, no-cache, must-revalidate", ...(rendered.headers ?? {}) } });
+            return new Response(rendered.body, { status: 200, headers: { "content-type": rendered.contentType, "cache-control": "no-store, no-cache, must-revalidate", "x-content-type-options": "nosniff", ...(rendered.headers ?? {}) } });
         }
         catch (error) {
             return errorResponse(error, id);
@@ -609,7 +646,13 @@ function privateDohPathSecretMatches(request, env) {
     // Constant-time comparison, same as the Bearer token path (D7). Note the
     // secret still travels in the URL by design (client-config feature); the
     // token remains the preferred credential.
-    return constantTimeEqual(path, `${base}/${secret}`);
+    // DS-M7: accept the documented dash form (`<DOH_PATH>-<secret>`) as well
+    // as the slash form. Both are exact full-path comparisons, so a wrong
+    // secret still fails and the request falls through to the generic 404;
+    // src/control/routes.ts routes on this same matcher, and
+    // src/pages-entry.ts already anticipated the dash prefix, so no routing
+    // change was needed beyond this matcher.
+    return constantTimeEqual(path, `${base}/${secret}`) || constantTimeEqual(path, `${base}-${secret}`);
 }
 async function handlePrivateDoh(request, env) {
     if (request.method !== "GET" && request.method !== "POST")
@@ -620,8 +663,10 @@ async function handlePrivateDoh(request, env) {
         return new Response("Private DoH disabled", { status: 503 });
     if (!pathAuthorized) {
         const supplied = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "").trim();
+        // DS-I14 (RFC 7235 §3.1; RFC 8484 §4.2.1 contemplates 401 for DoH):
+        // a 401 response carries a WWW-Authenticate challenge.
         if (!supplied || !token || !constantTimeEqual(supplied, token))
-            return new Response("Unauthorized", { status: 401 });
+            return new Response("Unauthorized", { status: 401, headers: { "www-authenticate": "Bearer" } });
     }
     // DNS_ENABLED=false is the global DNS kill switch and also disables this
     // endpoint (D8); checked after auth so the gate is not an oracle.
@@ -712,7 +757,13 @@ async function handlePrivateDoh(request, env) {
                 lastError = error;
                 if (request.signal.aborted)
                     throw request.signal.reason;
-                if (error instanceof errors_1.CoreError && error.code === "DNS_FAILED" && !error.retryable)
+                // DS-L20: a certainly-oversize response (MESSAGE_TOO_LARGE) is
+                // deterministic for this endpoint, exactly like a non-retryable
+                // DNS_FAILED — retrying it up to DNS_RETRIES cannot succeed, so
+                // end the endpoint's attempts immediately instead of multiplying
+                // a known-too-large response. (The resolver path already rethrows
+                // MESSAGE_TOO_LARGE without retrying; this is the handler side.)
+                if (error instanceof errors_1.CoreError && (error.code === "MESSAGE_TOO_LARGE" || (error.code === "DNS_FAILED" && !error.retryable)))
                     endpointDone = true;
             }
             finally {
@@ -846,7 +897,7 @@ async function cappedResponseBody(response, maxBytes) {
 __m["dns/doh"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.DoHResolver = void 0;
+exports.DoHResolver = exports.DnsAttemptBudgetCounter = exports.MAX_DNS_ENGINE_UPSTREAM_ATTEMPTS = void 0;
 exports.validateRawDnsQuery = validateRawDnsQuery;
 exports.validateRawDnsResponse = validateRawDnsResponse;
 const errors_1 = __r("../core/errors");
@@ -1053,7 +1104,7 @@ function parseMessage(bytes, expectedId, expectedName, expectedType) {
                     throw new errors_1.CoreError("DNS_FAILED", "CNAME RDATA exceeds record boundary", true);
                 data = cname.name;
             }
-            else if (type === TYPE_SOA) {
+            else if (klass === 1 && type === TYPE_SOA) {
                 data = "soa";
                 // Parse MNAME/RNAME + the five uint32 fields so the SOA TTL and the
                 // MINIMUM field survive for RFC 2308 §5 negative caching (D4).
@@ -1086,12 +1137,42 @@ function normalizeEndpoint(value) {
     if (!endpoint)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", "DNS resolver endpoint cannot be empty");
     const url = new URL(endpoint);
+    // DS-L16: never echo the endpoint — it may carry embedded credentials
+    // (which are rejected here, but the rejection message itself must not
+    // become the leak). The operator can see their own configuration; an
+    // authenticated DoH client must not receive it in a 503.
     if (url.protocol !== "https:" || url.username || url.password || url.hash)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `Only credential-free HTTPS DoH endpoints are supported: ${endpoint}`);
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Only credential-free HTTPS DoH endpoints are supported");
     if (url.hostname.length > 253 || url.href.length > 2048)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `DoH endpoint is too long: ${endpoint}`);
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "DoH endpoint is too long");
     return url.toString();
 }
+/**
+ * DS-M6: the global upstream-attempt budget for one DnsEngine resolve()
+ * or queryRaw() call. 64 is principled, not arbitrary: it is exactly the
+ * worst-case POST count of the DEFAULT configuration (2 resolvers x 2
+ * families x 8 CNAME hops x 2 attempts with DNS_RETRIES=1), so no
+ * default-config behaviour changes at all; it only bounds the maximum
+ * configuration, which previously multiplied to 8 x 2 x 8 x 6 = 768 POSTs
+ * per resolve. The private-DoH handler's tighter cap of 8 (handlers/doh.ts)
+ * is a different path — one client message, one qtype, no CNAME chasing
+ * and no family fan-out — and is unchanged.
+ */
+exports.MAX_DNS_ENGINE_UPSTREAM_ATTEMPTS = 64;
+class DnsAttemptBudgetCounter {
+    left;
+    constructor(limit = exports.MAX_DNS_ENGINE_UPSTREAM_ATTEMPTS) {
+        this.left = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : exports.MAX_DNS_ENGINE_UPSTREAM_ATTEMPTS;
+    }
+    get remaining() { return this.left; }
+    tryConsume() {
+        if (this.left <= 0)
+            return false;
+        this.left -= 1;
+        return true;
+    }
+}
+exports.DnsAttemptBudgetCounter = DnsAttemptBudgetCounter;
 /**
  * RFC 2308 §5: the TTL for negative caching is the minimum of the SOA
  * record's TTL and the SOA MINIMUM field, taken from the authority section.
@@ -1102,8 +1183,12 @@ function negativeCacheTtlSeconds(message) {
     const soa = message.authority.find((item) => item.type === TYPE_SOA && item.soaMinimum !== undefined);
     if (!soa || soa.soaMinimum === undefined)
         return undefined;
+    // DS-L15: a computed TTL of 0 is a real value (RFC 2308 §5: do not
+    // cache), not an absence — only a missing SOA returns undefined (and
+    // therefore the cache default). The klass === 1 gate above (DS-L18,
+    // mirroring the CNAME fix) ensures only IN-class SOA records reach here.
     const ttl = Math.min(Math.max(0, soa.soaTtl ?? soa.ttl), soa.soaMinimum);
-    return ttl > 0 ? ttl : undefined;
+    return ttl;
 }
 /**
  * Bounded retry wait for the resolver paths (D3): exponential backoff with
@@ -1282,7 +1367,7 @@ class DoHResolver {
             at: Date.now(),
         };
     }
-    async queryRaw(message, signal) {
+    async queryRaw(message, signal, attemptBudget) {
         if (message.byteLength < 1 || message.byteLength > limits_1.CORE_LIMITS.maxDoHQueryBytes) {
             this.recordFailure("validation", new errors_1.CoreError("MESSAGE_TOO_LARGE", `DNS message must be 1..${limits_1.CORE_LIMITS.maxDoHQueryBytes} bytes`), 0);
             throw new errors_1.CoreError("MESSAGE_TOO_LARGE", `DNS message must be 1..${limits_1.CORE_LIMITS.maxDoHQueryBytes} bytes`);
@@ -1298,6 +1383,10 @@ class DoHResolver {
         }
         let lastError;
         for (let attempt = 0; attempt <= this.options.retries; attempt++) {
+            // DS-M6: checked before any backoff or POST, so an exhausted
+            // budget fails fast with zero further upstream traffic.
+            if (attemptBudget && !attemptBudget.tryConsume())
+                throw new errors_1.CoreError("DNS_FAILED", "DNS upstream attempt budget exhausted", true);
             if (attempt > 0)
                 await retryBackoff(attempt, signal);
             this.q++;
@@ -1370,18 +1459,18 @@ class DoHResolver {
         this.f++;
         throw new errors_1.CoreError("DNS_FAILED", "DoH raw DNS query failed", true, { cause: lastError });
     }
-    async resolve(host, strategy, signal) {
+    async resolve(host, strategy, signal, attemptBudget) {
         this.lastFailure = undefined;
         const clean = (0, hostname_1.toAsciiHostname)(host).replace(/\.$/, "").toLowerCase();
         if (!clean)
             throw new errors_1.CoreError("DNS_FAILED", "DNS hostname is empty");
         if (strategy === "ipv4")
-            return this.queryChain(clean, "A", signal);
+            return this.queryChain(clean, "A", signal, attemptBudget);
         if (strategy === "ipv6")
-            return this.queryChain(clean, "AAAA", signal);
+            return this.queryChain(clean, "AAAA", signal, attemptBudget);
         if (strategy === "prefer_ipv4") {
             try {
-                const a = await this.queryChain(clean, "A", signal);
+                const a = await this.queryChain(clean, "A", signal, attemptBudget);
                 if (a.length)
                     return a;
             }
@@ -1389,11 +1478,11 @@ class DoHResolver {
                 if (signal.aborted)
                     throw signal.reason;
             }
-            return this.queryChain(clean, "AAAA", signal);
+            return this.queryChain(clean, "AAAA", signal, attemptBudget);
         }
         if (strategy === "prefer_ipv6") {
             try {
-                const aaaa = await this.queryChain(clean, "AAAA", signal);
+                const aaaa = await this.queryChain(clean, "AAAA", signal, attemptBudget);
                 if (aaaa.length)
                     return aaaa;
             }
@@ -1401,11 +1490,11 @@ class DoHResolver {
                 if (signal.aborted)
                     throw signal.reason;
             }
-            return this.queryChain(clean, "A", signal);
+            return this.queryChain(clean, "A", signal, attemptBudget);
         }
         const [aResult, aaaaResult] = await Promise.allSettled([
-            this.queryChain(clean, "A", signal),
-            this.queryChain(clean, "AAAA", signal),
+            this.queryChain(clean, "A", signal, attemptBudget),
+            this.queryChain(clean, "AAAA", signal, attemptBudget),
         ]);
         if (signal.aborted)
             throw signal.reason;
@@ -1417,7 +1506,7 @@ class DoHResolver {
         }
         return [...a, ...aaaa];
     }
-    async queryChain(host, type, signal) {
+    async queryChain(host, type, signal, attemptBudget) {
         const visited = new Set();
         let current = host;
         let chainTtl = Number.POSITIVE_INFINITY;
@@ -1426,7 +1515,7 @@ class DoHResolver {
             if (visited.has(current))
                 throw new errors_1.CoreError("DNS_FAILED", "DNS CNAME loop detected", true);
             visited.add(current);
-            const response = await this.query(current, type, signal);
+            const response = await this.query(current, type, signal, attemptBudget);
             const wantedType = type === "A" ? TYPE_A : TYPE_AAAA;
             const records = response.answers.filter((item) => item.type === wantedType && item.data && canonicalDnsName(item.name) === current);
             if (records.length) {
@@ -1458,7 +1547,7 @@ class DoHResolver {
         }
         throw new errors_1.CoreError("DNS_FAILED", "DNS CNAME chain is too long", true);
     }
-    async query(host, type, signal) {
+    async query(host, type, signal, attemptBudget) {
         const cached = this.options.cache?.get(host, type);
         if (cached)
             return {
@@ -1469,6 +1558,9 @@ class DoHResolver {
         const query = buildQuery(host, type);
         let lastError;
         for (let attempt = 0; attempt <= this.options.retries; attempt++) {
+            // DS-M6: see queryRaw — cache hits above do not consume budget.
+            if (attemptBudget && !attemptBudget.tryConsume())
+                throw new errors_1.CoreError("DNS_FAILED", "DNS upstream attempt budget exhausted", true);
             if (attempt > 0)
                 await retryBackoff(attempt, signal);
             this.q++;
@@ -1790,7 +1882,10 @@ function normalizeDohResolverEndpoint(value) {
     catch (error) {
         if (error instanceof errors_1.CoreError)
             throw error;
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", `Invalid DNS_RESOLVERS endpoint: ${raw}`);
+        // DS-L16: never echo the raw endpoint — it may carry embedded
+        // credentials (user:pass@host), which this function rejects. The
+        // generic message still identifies the variable at fault.
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Invalid DNS_RESOLVERS endpoint");
     }
 }
 
@@ -1858,6 +1953,9 @@ const lifecycle_1 = __r("../util/lifecycle");
 const hostname_1 = __r("../util/hostname");
 const byte_writer_1 = __r("../transport/websocket/byte-writer");
 const runtime_1 = __r("../runtime/runtime");
+const adapters_1 = __r("../output/adapters");
+const rules_2 = __r("../output/rules");
+const pages_entry_1 = __r("../pages-entry");
 class StaticProvider {
     protocol;
     credential;
@@ -1985,6 +2083,21 @@ async function runSelfTests(env) {
         await new Promise((resolve) => setTimeout(resolve, 60));
         if (!closed)
             throw new Error("Late dial result was not closed");
+        // DS-L29: a throwing onLateResolve must never mask the abort reason
+        // or become an unhandled rejection (guarded inside raceWithAbort).
+        {
+            const lateController = new AbortController();
+            lateController.abort(new Error("boom-abort"));
+            try {
+                await (0, lifecycle_1.raceWithAbort)(Promise.resolve("late"), lateController.signal, () => { throw new Error("cleanup boom"); });
+                throw new Error("Aborted race was accepted");
+            }
+            catch (error) {
+                if (error.message !== "boom-abort")
+                    throw new Error(`Abort reason was masked by cleanup error: ${error.message}`);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 50));
+        }
     }));
     tests.push(await runOne("core.websocket-writer-limit", "WebSocket writer rejects oversized writes before sending", "resource", async () => {
         let sends = 0;
@@ -1999,6 +2112,20 @@ async function runSelfTests(env) {
         }
         if (!rejected || sends !== 0)
             throw new Error("Oversized WebSocket write was not rejected before send");
+        // DS-M5: a pending write under backpressure settles when its signal aborts.
+        {
+            const abortController = new AbortController();
+            const backpressureSocket = { readyState: 1, bufferedAmount: 1024 * 1024, send: () => { } };
+            const backpressureWriter = new byte_writer_1.WebSocketByteWriter(backpressureSocket, 4, 8);
+            const pending = backpressureWriter.write(new Uint8Array(8), abortController.signal);
+            setTimeout(() => abortController.abort(new Error("session aborted")), 30);
+            const raced = await Promise.race([
+                pending.then(() => "resolved", (error) => `rejected:${error?.message ?? error}`),
+                new Promise((resolve) => setTimeout(() => resolve("TIMEOUT"), 2000)),
+            ]);
+            if (raced === "TIMEOUT" || !String(raced).startsWith("rejected:"))
+                throw new Error(`Pending write did not settle on abort: ${raced}`);
+        }
     }));
     tests.push(await runOne("core.sha224", "SHA-224 known vector", "core", async () => {
         const actual = (0, sha224_1.sha224Hex)(new TextEncoder().encode("abc"));
@@ -2049,17 +2176,37 @@ async function runSelfTests(env) {
     tests.push(await runOne("protocol.vless-malformed", "VLESS rejects unsupported command", "protocol", async (signal) => {
         const reader = new byte_queue_1.ByteQueue(8192);
         reader.push((0, binary_1.concatBytes)(new Uint8Array([0]), vlessBytes, new Uint8Array([0]), new Uint8Array([3])));
+        let malformedRejected = false;
         try {
             await new parser_1.VlessHandler(new StaticProvider("vless", vlessBytes)).parse(reader, ctx(signal), signal);
         }
         catch (error) {
-            if (error instanceof errors_1.CoreError && error.code === "BAD_REQUEST")
-                return;
-            throw error;
+            malformedRejected = error instanceof errors_1.CoreError && error.code === "BAD_REQUEST";
+            if (!malformedRejected)
+                throw error;
         }
-        throw new Error("Unsupported command was accepted");
+        if (!malformedRejected)
+            throw new Error("Unsupported command was accepted");
+        // DS-L11: VLESS addons [0x08,0x01] (field 1, varint wire type) are
+        // rejected, not silently parsed as a plain stream.
+        {
+            const addonReader = new byte_queue_1.ByteQueue(8192);
+            const addonDomain = new TextEncoder().encode("example.com");
+            addonReader.push((0, binary_1.concatBytes)(new Uint8Array([0]), vlessBytes, new Uint8Array([2, 0x08, 0x01]), new Uint8Array([1]), new Uint8Array([1, 187]), new Uint8Array([2, addonDomain.length]), addonDomain));
+            let addonRejected = false;
+            try {
+                await new parser_1.VlessHandler(new StaticProvider("vless", vlessBytes)).parse(addonReader, ctx(signal), signal);
+            }
+            catch (error) {
+                addonRejected = error instanceof errors_1.CoreError && error.code === "BAD_REQUEST";
+                if (!addonRejected)
+                    throw error;
+            }
+            if (!addonRejected)
+                throw new Error("Varint field-1 addons were silently accepted as a plain stream");
+        }
     }));
-    const password = "password";
+    const password = "trojan-test-secret-7f3a9c21";
     const passwordDigest = (0, sha224_1.sha224Hex)(new TextEncoder().encode(password));
     tests.push(await runOne("protocol.vless-dns-udp", "VLESS UDP is accepted only for DNS port 53 and marks the session for DoH bridging", "protocol", async (signal) => {
         const reader = new byte_queue_1.ByteQueue(8192);
@@ -2118,6 +2265,23 @@ async function runSelfTests(env) {
             throw new Error("Egress mode parser mismatch");
         if ((0, relay_1.parseRelayEndpoints)("relay.example.com:443,[2001:db8::1]:8443,relay.example.com:443").length !== 2)
             throw new Error("Relay endpoint parser/dedupe mismatch");
+        // DS-I7: relay endpoints are capped at 64 (symmetric with the
+        // per-attempt rotation cap); 65 endpoints are rejected at startup.
+        {
+            const many = Array.from({ length: 65 }, (_, i) => `relay${i}.example.com:443`).join(",");
+            try {
+                (0, relay_1.parseRelayEndpoints)(many);
+                throw new Error("65 relay endpoints were accepted");
+            }
+            catch (error) {
+                if (error instanceof Error && error.message.startsWith("65 relay"))
+                    throw error;
+                if (!(error instanceof errors_1.CoreError) || error.code !== "CONFIGURATION_ERROR")
+                    throw error;
+            }
+            if ((0, relay_1.parseRelayEndpoints)(Array.from({ length: 64 }, (_, i) => `relay${i}.example.com:443`).join(",")).length !== 64)
+                throw new Error("64 relay endpoints were not accepted");
+        }
     }));
     tests.push(await runOne("storage.trojan-normalization", "Environment credentials normalize Trojan digest correctly", "storage", async (signal) => {
         const provider = new cloudflare_1.EnvironmentCredentialProvider({ TROJAN_USERS: password });
@@ -2241,6 +2405,14 @@ async function runSelfTests(env) {
             throw new Error("Share link mismatch");
         if (!parsed.searchParams.get("path")?.includes("ed=2048"))
             throw new Error("Early-data path marker missing");
+        // DS-L25 (unit level): a subscription line carries the node name as
+        // a #remark fragment when requested; the default call is unchanged.
+        {
+            const fragmentNode = { protocol: "vless", server: "example.com", port: 443, credential: vlessUuid, name: "test", security: "tls", scheme: "https", endpointKind: "domain", tls: { serverName: "example.com" }, websocket: { path: "/vless", earlyData: 2048 } };
+            const linkWithFragment = (0, share_link_1.generateShareLink)(fragmentNode, { includeFragment: true });
+            if (!linkWithFragment.endsWith(`#${encodeURIComponent(fragmentNode.name)}`))
+                throw new Error(`Subscription line lacks the remark fragment: ${linkWithFragment}`);
+        }
     }));
     tests.push(await runOne("output.port-security", "TLS-only fields are emitted only on TLS ports and custom ports require explicit classification", "output", async () => {
         const env = { VLESS_USERS: vlessUuid, TROJAN_USERS: password, OUTPUT_HOST: "proxy.example.com", OUTPUT_PORT: "443,80", TLS_FINGERPRINT: "chrome", TLS_ALPN: "http/1.1" };
@@ -2368,6 +2540,130 @@ async function runSelfTests(env) {
         }
         if (!unknownParameter)
             throw new Error("Unknown subscription parameter was accepted");
+        // Layer-1 validation for routing rules + custom outbounds: valid shared
+        // input passes (a geo rule passes startup; it fails only sing-box at
+        // render), and each invalid shape is attributed to its own field.
+        const routingBase = {
+            ...env,
+            CORE_OUTPUT_ROUTING_RULES: JSON.stringify([
+                { domain_suffix: ["example.com"], action: "direct" },
+                { domain_suffix: ["video.example.org"], port: [443], action: "outbound", outbound: "warp-socks" },
+                { geosite: ["category-ads"], action: "block" },
+            ]),
+            CORE_OUTPUT_SINGBOX_OUTBOUNDS: JSON.stringify([{ type: "socks", tag: "warp-socks", server: "127.0.0.1", server_port: 40000 }]),
+            CORE_OUTPUT_XRAY_OUTBOUNDS: JSON.stringify([{ tag: "warp-socks", protocol: "socks", settings: { servers: [{ address: "127.0.0.1", port: 40000 }] } }]),
+            CORE_OUTPUT_CLASH_PROXIES: JSON.stringify([{ type: "socks5", name: "warp-socks", server: "127.0.0.1", port: 40000 }]),
+        };
+        (0, validation_1.validateEnvironment)(routingBase);
+        const fieldOf = (fn) => {
+            try {
+                fn();
+                return null;
+            }
+            catch (error) {
+                if (error instanceof validation_1.ConfigurationValidationError)
+                    return error.issues.map((issue) => issue.field).join(",");
+                return "wrong-error";
+            }
+        };
+        const badJson = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_ROUTING_RULES: "[not json" }));
+        if (!badJson?.includes("CORE_OUTPUT_ROUTING_RULES"))
+            throw new Error(`Invalid routing JSON was not attributed: ${badJson}`);
+        const badCidr = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_ROUTING_RULES: JSON.stringify([{ ip_cidr: ["10.0.0.0/33"], action: "direct" }]) }));
+        if (!badCidr?.includes("CORE_OUTPUT_ROUTING_RULES"))
+            throw new Error(`Bad CIDR was not attributed: ${badCidr}`);
+        // DS-M13: LDH hostname validation + normalization at layer 1.
+        {
+            const normalizedRules = (0, rules_2.parseRoutingRules)(JSON.stringify([
+                { domain_suffix: [" example.com "], action: "direct" },
+                { domain: ["example.com."], action: "direct" },
+            ]));
+            if (normalizedRules[0]?.domain_suffix?.[0] !== "example.com" || normalizedRules[1]?.domain?.[0] !== "example.com")
+                throw new Error(`Hostname normalization failed: ${JSON.stringify(normalizedRules)}`);
+            for (const bad of [
+                [{ domain_suffix: ["a,b.com"], action: "direct" }],
+                [{ domain: ["foo,bar"], action: "direct" }],
+                [{ domain: ["*.example.com"], action: "direct" }],
+                [{ domain: ["a..b.com"], action: "direct" }],
+            ]) {
+                const attributed = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_ROUTING_RULES: JSON.stringify(bad) }));
+                if (!attributed?.includes("CORE_OUTPUT_ROUTING_RULES"))
+                    throw new Error(`Invalid hostname was not rejected at layer 1: ${JSON.stringify(bad)} -> ${attributed}`);
+            }
+        }
+        // DS-M13 (coordinator correction): a comma inside domain_regex is
+        // also rejected at layer 1 — the report's counterexample ("^a,b$")
+        // otherwise still corrupts Clash output into a 4-field line. A
+        // literal comma can be written as [,]; "*" stays allowed (valid
+        // regex syntax, breaks nothing).
+        {
+            const regexComma = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_ROUTING_RULES: JSON.stringify([{ domain_regex: ["^a,b$"], action: "direct" }]) }));
+            if (!regexComma?.includes("CORE_OUTPUT_ROUTING_RULES"))
+                throw new Error(`domain_regex comma was not rejected at layer 1: ${regexComma}`);
+        }
+        const unknownTag = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_XRAY_OUTBOUNDS: "[]", CORE_OUTPUT_CLASH_PROXIES: "[]" }));
+        if (!unknownTag?.includes("CORE_OUTPUT_ROUTING_RULES"))
+            throw new Error(`Rule tag missing from a target was not attributed: ${unknownTag}`);
+        const dupTag = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_SINGBOX_OUTBOUNDS: JSON.stringify([
+                { type: "socks", tag: "warp-socks", server: "127.0.0.1", server_port: 40000 },
+                { type: "http", tag: "warp-socks", server: "127.0.0.1", server_port: 40001 },
+            ]) }));
+        if (!dupTag?.includes("CORE_OUTPUT_SINGBOX_OUTBOUNDS"))
+            throw new Error(`Duplicate outbound tag was not attributed: ${dupTag}`);
+        const collidingTag = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_SINGBOX_OUTBOUNDS: JSON.stringify([{ type: "socks", tag: "proxy", server: "127.0.0.1", server_port: 40000 }]) }));
+        if (!collidingTag?.includes("CORE_OUTPUT_SINGBOX_OUTBOUNDS"))
+            throw new Error(`Colliding outbound tag was not attributed: ${collidingTag}`);
+        const unknownType = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_SINGBOX_OUTBOUNDS: JSON.stringify([{ type: "wireguardx", tag: "warp-socks" }]) }));
+        if (!unknownType?.includes("CORE_OUTPUT_SINGBOX_OUTBOUNDS"))
+            throw new Error(`Unknown outbound type was not attributed: ${unknownType}`);
+        // DS-M14: required-field type/range checks at startup.
+        {
+            const badPortType = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_SINGBOX_OUTBOUNDS: JSON.stringify([{ type: "socks", tag: "warp-socks", server: "127.0.0.1", server_port: "abc" }]) }));
+            if (!badPortType?.includes("CORE_OUTPUT_SINGBOX_OUTBOUNDS"))
+                throw new Error(`server_port "abc" was accepted: ${badPortType}`);
+            const badPortRange = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_SINGBOX_OUTBOUNDS: JSON.stringify([{ type: "socks", tag: "warp-socks", server: "127.0.0.1", server_port: 70000 }]) }));
+            if (!badPortRange?.includes("CORE_OUTPUT_SINGBOX_OUTBOUNDS"))
+                throw new Error(`server_port 70000 was accepted: ${badPortRange}`);
+            const emptyServers = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_XRAY_OUTBOUNDS: JSON.stringify([{ tag: "warp-socks", protocol: "socks", settings: { servers: [] } }]) }));
+            if (!emptyServers?.includes("CORE_OUTPUT_XRAY_OUTBOUNDS"))
+                throw new Error(`Empty servers array was accepted: ${emptyServers}`);
+        }
+        // DS-M15: Clash group types are deliberately excluded from v1
+        // custom proxies (groups belong under proxy-groups:, not proxies:).
+        {
+            const clashSelector = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_CLASH_PROXIES: JSON.stringify([{ type: "selector", name: "my-group", proxies: ["PROXY"] }]) }));
+            if (!clashSelector?.includes("CORE_OUTPUT_CLASH_PROXIES"))
+                throw new Error(`Clash selector custom proxy was accepted: ${clashSelector}`);
+        }
+        const xrayPrefix = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_XRAY_OUTBOUNDS: JSON.stringify([{ tag: "proxy-foo", protocol: "socks", settings: { servers: [] } }]) }));
+        if (!xrayPrefix?.includes("CORE_OUTPUT_XRAY_OUTBOUNDS"))
+            throw new Error(`Xray balancer-prefix tag was not attributed: ${xrayPrefix}`);
+        // DS-L21: the Xray "proxy-balancer" tag fails startup validation
+        // (previously it passed startup and failed only the Xray render).
+        {
+            const balancerTag = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_XRAY_OUTBOUNDS: JSON.stringify([{ tag: "proxy-balancer", protocol: "socks", settings: { servers: [{ address: "127.0.0.1", port: 40000 }] } }]) }));
+            if (!balancerTag?.includes("CORE_OUTPUT_XRAY_OUTBOUNDS"))
+                throw new Error(`Xray proxy-balancer tag passed startup validation: ${balancerTag}`);
+        }
+        const tooManyRules = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_ROUTING_RULES: JSON.stringify(Array.from({ length: 513 }, (_, i) => ({ domain_suffix: [`d${i}.example.com`], action: "direct" }))) }));
+        if (!tooManyRules?.includes("CORE_OUTPUT_ROUTING_RULES"))
+            throw new Error(`Rule cap was not enforced: ${tooManyRules}`);
+        const clashOverflow = fieldOf(() => (0, validation_1.validateEnvironment)({ ...routingBase, CORE_OUTPUT_ROUTING_RULES: JSON.stringify(Array.from({ length: 512 }, (_, i) => ({ domain_suffix: [`a${i}.example.com`, `b${i}.example.com`, `c${i}.example.com`], port: [80, 443, 8080], action: "direct" }))) }));
+        if (!clashOverflow?.includes("CORE_OUTPUT_ROUTING_RULES"))
+            throw new Error(`Clash expanded-line cap was not enforced: ${clashOverflow}`);
+        // DS-L39: every invalid CORE_OUTPUT_PROBE_URL shape fails startup
+        // validation attributed to CORE_OUTPUT_PROBE_URL itself.
+        {
+            const badProbeNonAbsolute = fieldOf(() => (0, validation_1.validateEnvironment)({ ...env, CORE_OUTPUT_PROBE_URL: "probe.example.com/generate_204" }));
+            if (!badProbeNonAbsolute?.includes("CORE_OUTPUT_PROBE_URL"))
+                throw new Error(`Non-absolute probe URL was not attributed: ${badProbeNonAbsolute}`);
+            const badProbeScheme = fieldOf(() => (0, validation_1.validateEnvironment)({ ...env, CORE_OUTPUT_PROBE_URL: "ftp://probe.example.com/generate_204" }));
+            if (!badProbeScheme?.includes("CORE_OUTPUT_PROBE_URL"))
+                throw new Error(`Non-http(s) probe URL was not attributed: ${badProbeScheme}`);
+            const badProbeCredentials = fieldOf(() => (0, validation_1.validateEnvironment)({ ...env, CORE_OUTPUT_PROBE_URL: "https://user:pass@probe.example.com/generate_204" }));
+            if (!badProbeCredentials?.includes("CORE_OUTPUT_PROBE_URL"))
+                throw new Error(`Credential-bearing probe URL was not attributed: ${badProbeCredentials}`);
+        }
     }));
     tests.push(await runOne("dns.nat64-explicit-disable-warning", "Explicitly disabled DNS warns when smart/NAT64 domain fallback cannot resolve names", "configuration", async () => {
         const implicit = new engine_2.DnsEngine({ EGRESS_MODE: "smart" });
@@ -2412,7 +2708,7 @@ async function runSelfTests(env) {
         }
         if (!largeSplitRejected)
             throw new Error("maxSplit above 64 was accepted");
-        const valid = get([profile("1-3", ["0-20", "1-20"], ["0-10"], "1-4")]);
+        const valid = get([profile("1-3", ["1-20"], ["0-10"], "1-4")]);
         if (valid[0]?.delays[0] !== "0-10")
             throw new Error("A valid zero delay or a non-final idle length range was rejected");
         let finalZeroRejected = false;
@@ -2433,6 +2729,33 @@ async function runSelfTests(env) {
         }
         if (!delayLimitRejected)
             throw new Error("Delay over one minute was accepted");
+        // DS-M11: fragment profiles must contain exactly one lengths range
+        // and exactly one delays range; multi-range profiles are rejected
+        // at startup because Xray's FragmentMask only has singular
+        // length/delay.
+        {
+            let multiLengthRejected = false;
+            try {
+                get([profile("1-3", ["1-5", "10-20"])]);
+            }
+            catch (error) {
+                multiLengthRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+            }
+            if (!multiLengthRejected)
+                throw new Error("Multi-range fragment lengths were accepted");
+            let multiDelayRejected = false;
+            try {
+                get([profile("1-3", ["1-5"], ["1-1", "2-2"])]);
+            }
+            catch (error) {
+                multiDelayRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+            }
+            if (!multiDelayRejected)
+                throw new Error("Multi-range fragment delays were accepted");
+            const singleRange = get([profile("1-3", ["1-5"], ["1-1"])]);
+            if (singleRange[0]?.lengths.length !== 1 || singleRange[0]?.delays.length !== 1)
+                throw new Error("A single-range profile did not render with singular length/delay only");
+        }
     }));
     tests.push(await runOne("output.multiple-ports", "OUTPUT_PORT supports multiple ports and expands non-explicit Clean-IP endpoints", "output", async () => {
         const env = {
@@ -2501,6 +2824,10 @@ async function runSelfTests(env) {
             throw new Error("Subscription contained non-native output");
         if (lines.some((line) => line.includes("core_version") || line.includes("endpoint")))
             throw new Error("Core metadata leaked into subscription");
+        // DS-L25 (end to end): the served subscription lines carry a #remark
+        // fragment (renderSubscription delegates to the service mapping).
+        if (lines.filter(Boolean).some((line) => !line.includes("#")))
+            throw new Error("Served subscription lines lack the remark fragment");
     }));
     tests.push(await runOne("output.raw-debug", "Raw output is available only as an explicit developer override", "output", async () => {
         const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: "proxy.example.com" };
@@ -2558,6 +2885,96 @@ async function runSelfTests(env) {
         finally {
             Date.now = realNow;
         }
+        // DS-L15: an explicit negative TTL of 0 means "do not cache" (unset
+        // keeps the 30s default); DS-I12: set() mirrors the setNegative
+        // non-finite guard so a NaN TTL cannot create a never-expiring entry.
+        {
+            const negCache = new cache_1.DnsCache(10, 300, 30);
+            negCache.setNegative("a.example", "A", 0);
+            if (negCache.get("a.example", "A") !== null)
+                throw new Error("TTL-0 negative answer was cached (RFC 2308 §5 violation)");
+            negCache.setNegative("b.example", "A");
+            const negative = negCache.get("b.example", "A");
+            if (!Array.isArray(negative) || negative.length !== 0)
+                throw new Error("Unset negative TTL did not cache with the default");
+            negCache.set("c.example", "A", [{ address: "1.2.3.4", family: 4, ttl: 60 }], NaN);
+            if (negCache.get("c.example", "A") !== null)
+                throw new Error("NaN TTL produced a never-expiring cache entry");
+        }
+        // DS-L18: only an IN-class SOA sets the negative TTL (RFC 2308 §5).
+        // A non-IN SOA must fall back to the cache default instead of
+        // min(SOA TTL, MINIMUM). Observable by ageing: past the MINIMUM (5s)
+        // but not past the default (30s), the non-IN entry must survive
+        // while the IN entry (TTL 5s) must already be gone. (A missing SOA
+        // also falls back to the default, so "no entry" would be the wrong
+        // observable here — the TTL value itself is what the klass gate
+        // protects.)
+        {
+            const wireName = (name) => {
+                const out = [];
+                for (const label of name.split(".")) {
+                    const bytes = new TextEncoder().encode(label);
+                    out.push(bytes.length, ...bytes);
+                }
+                out.push(0);
+                return out;
+            };
+            const nxdomainFetch = (klass) => async (_input, init) => {
+                const query = new Uint8Array(init?.body);
+                const id = new DataView(query.buffer, query.byteOffset, query.byteLength).getUint16(0);
+                const qnameEnd = query.findIndex((x, i) => i >= 12 && x === 0);
+                const questionEnd = 12 + (qnameEnd - 12 + 1) + 4;
+                const soaRdata = [...wireName("ns.example.com"), ...wireName("hostmaster.example.com")];
+                const soaFields = new DataView(new ArrayBuffer(20));
+                soaFields.setUint32(0, 1);
+                soaFields.setUint32(4, 3600);
+                soaFields.setUint32(8, 600);
+                soaFields.setUint32(12, 86400);
+                soaFields.setUint32(16, 5);
+                soaRdata.push(...new Uint8Array(soaFields.buffer));
+                const out = new Uint8Array(questionEnd + 2 + 10 + soaRdata.length);
+                const view = new DataView(out.buffer);
+                view.setUint16(0, id);
+                view.setUint16(2, 0x8183);
+                view.setUint16(4, 1);
+                view.setUint16(6, 0);
+                view.setUint16(8, 1);
+                view.setUint16(10, 0);
+                out.set(query.subarray(12, questionEnd), 12);
+                let off = questionEnd;
+                out.set([0xc0, 0x0c], off);
+                off += 2;
+                view.setUint16(off, 6);
+                view.setUint16(off + 2, klass);
+                view.setUint32(off + 4, 60);
+                view.setUint16(off + 8, soaRdata.length);
+                off += 10;
+                out.set(soaRdata, off);
+                return new Response(out, { status: 200, headers: { "content-type": "application/dns-message" } });
+            };
+            const l18RealNow = Date.now;
+            let l18Now = 1_700_000_000_000;
+            Date.now = () => l18Now;
+            try {
+                const nonInCache = new cache_1.DnsCache(10, 300, 30);
+                const nonInResolver = new doh_1.DoHResolver({ endpoint: "https://dns.example/dns-query", timeoutMs: 1000, retries: 0, fetchImpl: nxdomainFetch(3), cache: nonInCache });
+                await nonInResolver.resolve("nonexistent.example", "ipv4", new AbortController().signal);
+                if (!Array.isArray(nonInCache.get("nonexistent.example", "A")))
+                    throw new Error("Non-IN SOA NXDOMAIN was not negative-cached");
+                l18Now += 6000;
+                if (!Array.isArray(nonInCache.get("nonexistent.example", "A")))
+                    throw new Error("Non-IN SOA set the negative TTL from its MINIMUM instead of the cache default");
+                const inCache = new cache_1.DnsCache(10, 300, 30);
+                const inResolver = new doh_1.DoHResolver({ endpoint: "https://dns.example/dns-query", timeoutMs: 1000, retries: 0, fetchImpl: nxdomainFetch(1), cache: inCache });
+                await inResolver.resolve("nonexistent.example", "ipv4", new AbortController().signal);
+                l18Now += 6000;
+                if (inCache.get("nonexistent.example", "A") !== null)
+                    throw new Error("IN SOA did not set the 5s negative TTL (entry should already be expired)");
+            }
+            finally {
+                Date.now = l18RealNow;
+            }
+        }
     }));
     tests.push(await runOne("dns.hosts", "DNS hosts override supports IPv4/IPv6 and preference", "dns", async (signal) => {
         const hosts = new hosts_1.HostsResolver("example.com=1.2.3.4,example.com=2001:db8::1");
@@ -2567,6 +2984,21 @@ async function runSelfTests(env) {
             throw new Error("Hosts IPv6 lookup failed");
         if (hosts.size !== 1)
             throw new Error("Hosts size mismatch");
+        // DS-I13: DNS_HOSTS rejects leading-zero IPv4 values (non-canonical).
+        {
+            try {
+                new hosts_1.HostsResolver("example.com=010.0.0.1");
+                throw new Error("Leading-zero IPv4 was accepted");
+            }
+            catch (error) {
+                if (error instanceof Error && error.message.startsWith("Leading-zero IPv4"))
+                    throw error;
+                if (!(error instanceof errors_1.CoreError) || error.code !== "CONFIGURATION_ERROR")
+                    throw error;
+            }
+            if (new hosts_1.HostsResolver("example.com=10.0.0.1").size !== 1)
+                throw new Error("Canonical IPv4 was rejected");
+        }
     }));
     tests.push(await runOne("dns.doh-parser", "DoH resolver parses A and follows CNAME", "dns", async (signal) => {
         const requestFetch = async (_input, init) => {
@@ -2753,6 +3185,37 @@ async function runSelfTests(env) {
         const d = resolver.diagnostics();
         if (!rejected || d.queries !== 2 || d.failures !== 1 || d.endpoint !== "https://dns.example/dns-query" || d.lastFailure?.phase !== "http" || d.lastFailure?.attempt !== 1 || d.lastFailure?.status !== 503)
             throw new Error(`DoH failure diagnostics mismatch: ${JSON.stringify(d)}`);
+        // DS-M6: one resolve call may issue at most 64 upstream DoH POSTs in
+        // total, shared across resolvers (the max config previously reached 768).
+        // The 8 resolvers run concurrently: sequentially they would exceed the
+        // 5s test timeout on retry backoff alone, while the shared counter
+        // caps total POSTs identically under either order.
+        {
+            let posts = 0;
+            const fetchImpl = async () => { posts++; return new Response("", { status: 500 }); };
+            const budget = new doh_1.DnsAttemptBudgetCounter();
+            await Promise.allSettled(Array.from({ length: 8 }, (_, i) => {
+                const budgetedResolver = new doh_1.DoHResolver({ endpoint: `https://dns${i}.example.com/dns-query`, timeoutMs: 1000, retries: 5, fetchImpl });
+                return budgetedResolver.resolve("example.com", "auto", signal, budget);
+            }));
+            if (posts > 64)
+                throw new Error(`Attempt budget exceeded: ${posts} upstream POSTs for one resolve (pre-fix max config: 768)`);
+            if (budget.remaining !== 0)
+                throw new Error(`Attempt budget was not fully consumed by the max config: ${budget.remaining} left`);
+            let smallPosts = 0;
+            const smallFetch = async () => { smallPosts++; return new Response("", { status: 500 }); };
+            const smallResolver = new doh_1.DoHResolver({ endpoint: "https://dns.example.com/dns-query", timeoutMs: 1000, retries: 5, fetchImpl: smallFetch });
+            try {
+                await smallResolver.resolve("example.com", "auto", signal, new doh_1.DnsAttemptBudgetCounter(3));
+                throw new Error("Budgeted resolve was accepted");
+            }
+            catch (error) {
+                if (!(error instanceof errors_1.CoreError))
+                    throw error;
+            }
+            if (smallPosts > 3)
+                throw new Error(`Small budget exceeded: ${smallPosts} POSTs`);
+        }
     }));
     tests.push(await runOne("dns.empty-resolver-default", "Explicitly blank DNS_RESOLVERS does not accidentally disable the resolver list", "dns", async () => {
         const engine = new engine_2.DnsEngine({ DNS_ENABLED: "true", DNS_RESOLVERS: "", DNS_CACHE: "false" });
@@ -2795,6 +3258,33 @@ async function runSelfTests(env) {
         const expected = ["https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"];
         if (JSON.stringify(values) !== JSON.stringify(expected))
             throw new Error(`Unexpected resolver normalization: ${JSON.stringify(values)}`);
+        // DS-L16: credential-bearing DoH endpoints never appear in error text.
+        {
+            try {
+                (0, config_1.parseDohResolverEndpoints)("https://alice:s3cretpass@dns.example.com/dns-query");
+                throw new Error("Credential endpoint was accepted");
+            }
+            catch (error) {
+                if (error instanceof Error && error.message.startsWith("Credential endpoint"))
+                    throw error;
+                if (!(error instanceof errors_1.CoreError) || error.code !== "CONFIGURATION_ERROR")
+                    throw error;
+                if (error.message.includes("s3cretpass"))
+                    throw new Error("Config error leaks the DoH endpoint password");
+            }
+            try {
+                new doh_1.DoHResolver({ endpoint: "https://alice:s3cretpass@dns.example.com/dns-query", timeoutMs: 1000, retries: 0 });
+                throw new Error("Credential endpoint was accepted");
+            }
+            catch (error) {
+                if (error instanceof Error && error.message.startsWith("Credential endpoint"))
+                    throw error;
+                if (!(error instanceof errors_1.CoreError) || error.code !== "CONFIGURATION_ERROR")
+                    throw error;
+                if (error.message.includes("s3cretpass"))
+                    throw new Error("Resolver error leaks the DoH endpoint password");
+            }
+        }
     }));
     tests.push(await runOne("dns.vless-udp-bridge", "VLESS UDP DNS bridge frames query and response correctly", "dns", async (signal) => {
         const reader = new byte_queue_1.ByteQueue(8192);
@@ -2924,9 +3414,53 @@ async function runSelfTests(env) {
         const decoded = (0, adapter_1.tryExtractEarlyData)(request, { earlyDataEnabled: true, earlyDataHeaderName: "Sec-WebSocket-Protocol", maxEarlyDataBytes: 8192 });
         if (!decoded || decoded.byteLength !== payload.byteLength || !decoded.every((byte, index) => byte === payload[index]))
             throw new Error("Early data was not decoded");
+        // DS-L10: a decodable-but-oversize first early-data token is rejected
+        // with BAD_REQUEST instead of being silently dropped (which used to
+        // hang the handshake until the 10s timeout closed it with 1011).
         const oversized = new Request("https://example.com/vless", { headers: { Upgrade: "websocket", "Sec-WebSocket-Protocol": encoded } });
-        if ((0, adapter_1.tryExtractEarlyData)(oversized, { earlyDataEnabled: true, maxEarlyDataBytes: 2 }) !== null)
-            throw new Error("Early-data byte cap was ignored");
+        let oversizeRejected = false;
+        try {
+            (0, adapter_1.tryExtractEarlyData)(oversized, { earlyDataEnabled: true, maxEarlyDataBytes: 2 });
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError && error.code === "BAD_REQUEST")
+                oversizeRejected = true;
+            else
+                throw error;
+        }
+        if (!oversizeRejected)
+            throw new Error("Oversize early-data token was silently dropped instead of rejected with BAD_REQUEST");
+        // DS-I2 (RFC 6455 §4.2.1): the Upgrade header must CONTAIN the
+        // "websocket" token, not equal it. Pure header logic — no
+        // WebSocketPair needed, so it is unit-testable in every runtime.
+        // This proves the adapter's gate; the worker's own identical gate
+        // was proven separately by driving the real worker bundle in Node
+        // with multi-token Upgrade headers (past the gate, not 426).
+        // (Full 101 over HTTP for a multi-token offer is NOT provable in
+        // the local wrangler dev proxy: it strips hop-by-hop Upgrade
+        // headers for offers it does not recognize as websocket upgrades,
+        // so the worker sees no token and correctly answers 426.
+        // Single-token 101 was proven live against wrangler pages dev.)
+        const upgradeCases = [
+            ["websocket", true],
+            ["WebSocket", true],
+            ["WEBSOCKET", true],
+            ["WebSocket, h2c", true],
+            ["websocket, h2c", true],
+            ["h2c, websocket", true],
+            ["  websocket  ", true],
+            ["h2c", false],
+            ["websockets", false],
+            [undefined, false],
+        ];
+        for (const [value, expected] of upgradeCases) {
+            const headers = {};
+            if (value !== undefined)
+                headers["Upgrade"] = value;
+            const got = (0, adapter_1.hasWebSocketUpgradeToken)(new Request("https://example.com/vless", { headers }));
+            if (got !== expected)
+                throw new Error(`Upgrade gate mismatch for ${JSON.stringify(value)}: got ${got}, expected ${expected}`);
+        }
     }));
     tests.push(await runOne("connection.bridge-response-header", "Bridge sends VLESS response header before waiting for upstream payload", "connection", async () => {
         const clientReader = new byte_queue_1.ByteQueue(1024);
@@ -2946,6 +3480,30 @@ async function runSelfTests(env) {
             throw new Error("Upstream response was not forwarded");
         if (new TextDecoder().decode(upstreamWrites[0]) !== "hello")
             throw new Error("Initial payload was not forwarded");
+        // DS-L42: only exactly one complete ClientHello is replay-safe.
+        {
+            const runReplay = async (initialPayload) => {
+                const replayReader = new byte_queue_1.ByteQueue(1024);
+                replayReader.end();
+                const replayWriter = { write: async (_data) => { } };
+                const replayUpstream = {
+                    type: "direct",
+                    readable: new ReadableStream({ start(controller) { controller.close(); } }),
+                    writable: new WritableStream(),
+                    close: async () => { },
+                };
+                return (0, bridge_1.bridgeSession)(replayReader, replayWriter, replayUpstream, {
+                    signal: new AbortController().signal,
+                    session: { protocol: "vless", principal: { id: "test", protocol: "vless" }, destination: { host: "example.com", port: 443 }, initialPayload },
+                });
+            };
+            const forged = await runReplay(new Uint8Array([0x16, 0x03, 0x01, 0x00, 0x00, 0x01, 0xde, 0xad]));
+            if (forged.kind !== "upstream-empty" || forged.safeToRetry !== false)
+                throw new Error(`Forged ClientHello prefix was replay-safe: ${JSON.stringify(forged)}`);
+            const genuine = await runReplay(new Uint8Array([0x16, 0x03, 0x01, 0x00, 0x08, 0x01, 0x00, 0x00, 0x04, 0xaa, 0xbb, 0xcc, 0xdd]));
+            if (genuine.kind !== "upstream-empty" || genuine.safeToRetry !== true)
+                throw new Error(`Genuine single ClientHello was not replay-safe: ${JSON.stringify(genuine)}`);
+        }
     }));
     tests.push(await runOne("connection.bridge-cancel", "Bridge cancels a pending upstream read when the client closes", "connection", async () => {
         const clientReader = new byte_queue_1.ByteQueue(1024);
@@ -2960,6 +3518,42 @@ async function runSelfTests(env) {
             } });
         if (closeCalls !== 1)
             throw new Error(`Upstream close expected once, got ${closeCalls}`);
+        // DS-L8: a client close mid-download reports "client-closed", not
+        // "completed". The client closes after the first upstream byte, so
+        // the session is neither a failure nor upstream-empty: the
+        // client-closed branch (not the completed fallthrough) must win.
+        // (A client that closes before any byte, with the upstream still
+        // open, resolves as upstream-empty once the cancel settles the
+        // pending read — that precedence is unchanged.)
+        {
+            const closedReader = new byte_queue_1.ByteQueue(1024);
+            let closedOnce = false;
+            const closedWriter = { write: async (_data) => { if (!closedOnce) {
+                    closedOnce = true;
+                    closedReader.end(new errors_1.CoreError("CLIENT_CLOSED", "test client closed"));
+                } } };
+            const closedUpstream = {
+                type: "direct",
+                readable: new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode("x")); } }),
+                writable: new WritableStream(),
+                close: async () => { },
+            };
+            const closedOutcome = await (0, bridge_1.bridgeSession)(closedReader, closedWriter, closedUpstream, {
+                signal: new AbortController().signal,
+                session: { protocol: "trojan", principal: { id: "test", protocol: "trojan" }, destination: { host: "example.com", port: 443 }, initialPayload: new Uint8Array() },
+            });
+            if (closedOutcome.kind !== "client-closed")
+                throw new Error(`Client close misclassified as ${closedOutcome.kind}`);
+        }
+        // DS-L9: a hanging upstream close is bounded at ~1s during teardown.
+        {
+            const started = Date.now();
+            await (0, bridge_1.closeUpstreamWithTimeout)(() => new Promise(() => { }));
+            const elapsed = Date.now() - started;
+            if (elapsed < 950 || elapsed >= 3000)
+                throw new Error(`Hanging close was not bounded at ~1s: ${elapsed}ms`);
+            await (0, bridge_1.closeUpstreamWithTimeout)(async () => { });
+        }
     }));
     tests.push(await runOne("connection.bridge-session-deadline", "Bridge deadline is reported as TIMEOUT instead of successful completion", "connection", async () => {
         let upstreamReadReject;
@@ -3150,6 +3744,20 @@ async function runSelfTests(env) {
                 throw new Error(`Cooling endpoint was retried before half-open window: ${calls}`);
             if (Number(egress.diagnostics.cooled_down) !== 1)
                 throw new Error("ProxyIP diagnostics did not report the cooled endpoint");
+            // DS-I6: diagnostics count real successes, not EWMA priors.
+            {
+                const successConnector = { connect: async () => { throw new errors_1.CoreError("EGRESS_FAILED", "simulated proxy failure", true); } };
+                const successEgress = new proxyip_1.ProxyIpEgress({ ...env, PROXY_IP: "a.example.com:1080,b.example.com:1080,c.example.com:1080" }, 500, successConnector);
+                try {
+                    await successEgress.connect({ host: "example.com", port: 443 }, signal);
+                }
+                catch (error) {
+                    if (!(error instanceof errors_1.CoreError) || error.code !== "EGRESS_FAILED")
+                        throw error;
+                }
+                if (successEgress.diagnostics.successes !== 0)
+                    throw new Error(`Successes counted EWMA priors: ${JSON.stringify(successEgress.diagnostics)}`);
+            }
         }));
         tests.push(await runOne("egress.proxyip.half-open-abort", "Aborted half-open ProxyIP probes do not remain permanently locked", "egress", async (signal) => {
             const connector = { connect: async () => { throw new errors_1.CoreError("EGRESS_FAILED", "simulated proxy failure", true); } };
@@ -3206,6 +3814,63 @@ async function runSelfTests(env) {
             await connection.close();
             if (secure !== "on")
                 throw new Error(`Structured endpoint TLS mode was not propagated: ${secure}`);
+            // DS-M4: socks5:// legacy URLs parse to a bare host/port with
+            // per-endpoint credentials (never a credential-bearing hostname,
+            // never echoed in an error string).
+            {
+                const parsed = (0, proxyip_1.parseLegacyProxyIpEntry)("socks5://user:pass@proxy.example.com:1080", 1080);
+                if (parsed.host !== "proxy.example.com" || parsed.port !== 1080)
+                    throw new Error(`socks5 parse mismatch: ${JSON.stringify(parsed)}`);
+                if (parsed.credentials?.username !== "user" || parsed.credentials?.password !== "pass")
+                    throw new Error("socks5 credentials were not extracted");
+                if (parsed.host.includes("user") || parsed.host.includes("pass"))
+                    throw new Error("Credential-bearing string retained as hostname");
+                const noPort = (0, proxyip_1.parseLegacyProxyIpEntry)("socks5://proxy.example.com", 1080);
+                if (noPort.port !== 1080 || noPort.credentials !== undefined)
+                    throw new Error("socks5 default port / no-credential mismatch");
+                try {
+                    new proxyip_1.ProxyIpEgress({ ...env, PROXY_IP: "socks5://alice:TOPSECRET@proxy.example.com:1080, :bad" }, 500, { connect: async () => { throw new Error("x"); } });
+                    throw new Error("Bad legacy entry was accepted");
+                }
+                catch (error) {
+                    if (error instanceof Error && error.message.startsWith("Bad legacy entry"))
+                        throw error;
+                    if (!(error instanceof errors_1.CoreError) || error.code !== "CONFIGURATION_ERROR")
+                        throw error;
+                    if (error.message.includes("TOPSECRET"))
+                        throw new Error("Error message leaks the SOCKS5 password");
+                }
+            }
+            // DS-L13: bad legacy ProxyIP syntax surfaces as CONFIGURATION_ERROR (503), not a plain 500.
+            {
+                try {
+                    new proxyip_1.ProxyIpEgress({ ...env, PROXY_IP: ":443" }, 500, { connect: async () => { throw new Error("x"); } });
+                    throw new Error("Bad legacy endpoint was accepted");
+                }
+                catch (error) {
+                    if (error instanceof Error && error.message.startsWith("Bad legacy endpoint"))
+                        throw error;
+                    if (!(error instanceof errors_1.CoreError) || error.code !== "CONFIGURATION_ERROR")
+                        throw new Error(`Bad legacy syntax did not surface as CONFIGURATION_ERROR: ${error}`);
+                }
+            }
+            // DS-L12: parseHostPort rejects empty hosts and invalid IPv6 literals.
+            {
+                for (const bad of [":443", "[]:443", "1:2:3", "1:2:3:4:5:6:7:8:9", "2001:db8::1::2"]) {
+                    try {
+                        (0, binary_1.parseHostPort)(bad, 1080);
+                        throw new Error(`Accepted invalid endpoint: ${bad}`);
+                    }
+                    catch (error) {
+                        if (error instanceof Error && error.message.startsWith("Accepted invalid"))
+                            throw error;
+                    }
+                }
+                if ((0, binary_1.parseHostPort)("2001:db8::1", 1080).host !== "2001:db8::1")
+                    throw new Error("Valid IPv6 literal rejected");
+                if ((0, binary_1.parseHostPort)("[2001:db8::1]:8443", 1080).port !== 8443)
+                    throw new Error("Bracketed IPv6 port mismatch");
+            }
         }));
         tests.push(await runOne("egress.proxyip.credential-identity", "Structured ProxyIP endpoints with different passwords remain distinct", "egress", async () => {
             const egress = new proxyip_1.ProxyIpEgress({
@@ -3420,14 +4085,38 @@ async function runSelfTests(env) {
         }
         if ((0, nat64_1.parseNat64Prefixes)("2602:fc59:b0:64::")[0]?.prefixLength !== 96)
             throw new Error("Legacy trailing-:: NAT64 form must remain /96 compatible");
+        // DS-L14: NAT64 rejects an overfull :: address; the WKP still parses.
+        {
+            try {
+                (0, nat64_1.parseNat64Prefixes)("64:ff9b:0:0:0:0:0:0::/96");
+                throw new Error("Overfull NAT64 prefix was accepted");
+            }
+            catch (error) {
+                if (error instanceof Error && error.message.startsWith("Overfull NAT64"))
+                    throw error;
+                if (!(error instanceof errors_1.CoreError) || error.code !== "CONFIGURATION_ERROR")
+                    throw error;
+            }
+            const prefixes = (0, nat64_1.parseNat64Prefixes)("64:ff9b::/96");
+            if (prefixes.length !== 1 || prefixes[0].prefix !== "64:ff9b::/96")
+                throw new Error(`WKP prefix mismatch: ${JSON.stringify(prefixes)}`);
+        }
     }));
-    tests.push(await runOne("output.core-adapters", "Xray, Sing-box and Mihomo output adapters emit parseable configurations", "output", async () => {
+    tests.push(await runOne("output.core-adapters", "Xray, Sing-box and Mihomo output adapters emit expected fields", "output", async () => {
         const node = { protocol: "vless", server: "proxy.example.com", port: 443, credential: vlessUuid, name: "node", security: "tls", scheme: "https", endpointKind: "domain", tls: { serverName: "proxy.example.com", alpn: ["http/1.1"], fingerprint: "chrome" }, websocket: { path: "/vless", host: "proxy.example.com" } };
         const xray = (0, xray_1.buildXrayConfig)([node]);
         const sing = (0, singbox_1.buildSingboxConfig)([node]);
         const clash = (0, clash_1.buildClashConfig)([node]);
-        JSON.parse(JSON.stringify(xray));
-        JSON.parse(JSON.stringify(sing));
+        // DS-I19: a JSON round-trip here used to be described as a
+        // "parseability" proof, but JSON.stringify always re-parses, so it
+        // proves nothing about Xray/sing-box schema validity. The real
+        // strength of this test is the field assertions that follow
+        // (packetEncoding, Xray DoH DNS policy, the sing-box
+        // default_domain_resolver reference, rule order, group non-leakage,
+        // the Clash AND line, the quoted password). True schema validation
+        // happens in scripts/verify-client-configs.mjs with real client
+        // binaries; Clash YAML has no parser in this toolchain, so its
+        // validity rests on the substring checks here plus that binary check.
         if (!clash.includes("type: vless") || !clash.includes("network: ws"))
             throw new Error("Mihomo configuration was malformed");
         const xout = xray.outbounds;
@@ -3464,6 +4153,231 @@ async function runSelfTests(env) {
         const bestPing = (0, xray_1.buildXrayBestPingConfig)([node, { ...node, name: "node-2", server: "proxy2.example.com" }]);
         if (!bestPing.observatory?.probeUrl)
             throw new Error("Xray Observatory is missing for Best Ping");
+        // Client-side routing rules + custom outbounds (v1): user rules come first,
+        // the existing catch-all stays last, custom outbounds never join groups.
+        const routingRules = [
+            { domain_suffix: ["example.com"], action: "direct" },
+            { domain_suffix: ["ads.example.net"], action: "block" },
+            { domain_suffix: ["video.example.org"], port: [443], network: "tcp", action: "outbound", outbound: "warp-socks" },
+        ];
+        const singCustom = [{ type: "socks", tag: "warp-socks", server: "127.0.0.1", server_port: 40000, version: "5" }];
+        const singRouted = (0, singbox_1.buildSingboxConfig)([node], { routingRules, customOutbounds: singCustom });
+        const singRoutedRoute = singRouted.route;
+        const singRules = singRoutedRoute.rules;
+        if (singRules.length !== 3 || singRules[0]?.outbound !== "direct" || singRules[1]?.action !== "reject" || singRules[2]?.outbound !== "warp-socks")
+            throw new Error(`Sing-box user rules mismatch: ${JSON.stringify(singRules)}`);
+        if (singRoutedRoute.final !== "proxy-1")
+            throw new Error("Sing-box single-node final must stay the node tag");
+        const singTags = singRouted.outbounds.map((item) => String(item.tag));
+        if (!singTags.includes("warp-socks"))
+            throw new Error("Sing-box custom outbound was not appended");
+        const singGroup = singRouted.outbounds.find((item) => item.tag === "proxy");
+        if (singGroup?.outbounds?.includes("warp-socks"))
+            throw new Error("Sing-box custom outbound leaked into the selector group");
+        const xrayCustom = [{ tag: "warp-socks", protocol: "socks", settings: { servers: [{ address: "127.0.0.1", port: 40000 }] } }];
+        const xrayRouted = (0, xray_1.buildXrayConfig)([node], { routingRules, customOutbounds: xrayCustom });
+        const xrayRules = xrayRouted.routing.rules;
+        if (xrayRules.length !== 4 || xrayRules[3]?.outboundTag !== "proxy-1")
+            throw new Error(`Xray user rules must precede the catch-all: ${JSON.stringify(xrayRules)}`);
+        if (xrayRules[0]?.outboundTag !== "direct" || xrayRules[1]?.outboundTag !== "block" || xrayRules[2]?.outboundTag !== "warp-socks")
+            throw new Error("Xray rule targets mismatch");
+        const xrayTags = xrayRouted.outbounds.map((item) => String(item.tag));
+        if (!xrayTags.includes("warp-socks") || !xrayTags.includes("direct") || !xrayTags.includes("block"))
+            throw new Error("Xray custom/direct/block outbounds are missing");
+        const xrayMulti = (0, xray_1.buildXrayConfig)([node, { ...node, name: "node-2", server: "proxy2.example.com" }], { routingRules, customOutbounds: xrayCustom });
+        const xrayMultiRules = xrayMulti.routing.rules;
+        if (xrayMultiRules[0]?.outboundTag !== "direct" || xrayMultiRules.at(-1)?.balancerTag !== "proxy-balancer")
+            throw new Error("Xray multi-node rule targets mismatch");
+        const clashCustom = [{ type: "socks5", name: "warp-socks", server: "127.0.0.1", port: 40000, password: "p:ss#word" }];
+        const clashRouted = (0, clash_1.buildClashConfig)([node], { routingRules, customOutbounds: clashCustom });
+        if (!clashRouted.includes("  - DOMAIN-SUFFIX,example.com,DIRECT\n") || !clashRouted.includes("  - DOMAIN-SUFFIX,ads.example.net,REJECT\n"))
+            throw new Error("Clash user rule lines are missing");
+        if (!clashRouted.includes("AND,((DOMAIN-SUFFIX,video.example.org),(DST-PORT,443),(NETWORK,TCP)),warp-socks"))
+            throw new Error("Clash multi-matcher AND line is missing");
+        const matchIndex = clashRouted.indexOf("  - MATCH,PROXY");
+        const ruleIndex = clashRouted.indexOf("  - DOMAIN-SUFFIX,example.com,DIRECT");
+        if (ruleIndex < 0 || matchIndex < ruleIndex)
+            throw new Error("Clash user rules must precede MATCH,PROXY");
+        if (!clashRouted.includes('    name: "warp-socks"') || !clashRouted.includes('password: "p:ss#word"'))
+            throw new Error("Clash custom proxy was not emitted with quoted password");
+        const groupSection = clashRouted.slice(clashRouted.indexOf("proxy-groups:"), clashRouted.indexOf("dns:"));
+        if (groupSection.includes("warp-socks"))
+            throw new Error("Clash custom proxy leaked into the PROXY group");
+        // DS-M8: enableTun is forwarded through the adapters into both bundles.
+        {
+            const tunSing = JSON.parse(adapters_1.outputAdapters["sing-box"].render([node], "bundle", { enableTun: true }));
+            const tunInbounds = tunSing.inbounds;
+            if (!tunInbounds.some((item) => item.type === "tun"))
+                throw new Error("outputAdapters sing-box dropped enableTun");
+            const tunClash = adapters_1.outputAdapters.clash.render([node], "bundle", { enableTun: true });
+            if (!tunClash.includes("tun:\n  enable: true"))
+                throw new Error("outputAdapters Clash dropped enableTun");
+            const noTunSing = JSON.parse(adapters_1.outputAdapters["sing-box"].render([node], "bundle", {}));
+            if (noTunSing.inbounds.some((item) => item.type === "tun"))
+                throw new Error("TUN block appeared without enableTun");
+        }
+        // DS-I15: the Clash adapter fails closed on fragment artifacts
+        // instead of silently degrading to a plain bundle.
+        {
+            let clashFragmentRejected = false;
+            try {
+                adapters_1.outputAdapters.clash.render([node], "best-fragment");
+            }
+            catch (error) {
+                clashFragmentRejected = error instanceof errors_1.CoreError && error.code === "UNSUPPORTED_TRANSPORT";
+            }
+            if (!clashFragmentRejected)
+                throw new Error("Clash adapter silently degraded best-fragment to a plain bundle");
+            let clashPingFragmentRejected = false;
+            try {
+                adapters_1.outputAdapters.clash.render([node], "best-ping-fragment");
+            }
+            catch (error) {
+                clashPingFragmentRejected = error instanceof errors_1.CoreError && error.code === "UNSUPPORTED_TRANSPORT";
+            }
+            if (!clashPingFragmentRejected)
+                throw new Error("Clash adapter silently degraded best-ping-fragment to a plain bundle");
+        }
+        // DS-M12: the Clash YAML emitter rejects empty objects (never a raw
+        // TypeError, never a dangling `key:` line).
+        {
+            let arrayEmptyRejected = false;
+            try {
+                (0, clash_1.buildClashConfig)([node], { customOutbounds: [{ type: "socks5", name: "x", server: "1.2.3.4", port: 1080, opts: [{}] }] });
+            }
+            catch (error) {
+                arrayEmptyRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+            }
+            if (!arrayEmptyRejected)
+                throw new Error("Clash emitter accepted an empty object inside an array");
+            let nestedEmptyRejected = false;
+            try {
+                (0, clash_1.buildClashConfig)([node], { customOutbounds: [{ type: "socks5", name: "x", server: "1.2.3.4", port: 1080, headers: {} }] });
+            }
+            catch (error) {
+                nestedEmptyRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+            }
+            if (!nestedEmptyRejected)
+                throw new Error("Clash emitter accepted a nested empty object");
+        }
+        // Layer-2 failures are per-artifact: a geo rule fails sing-box only, a
+        // protocol rule fails Clash only.
+        let singGeoRejected = false;
+        try {
+            (0, singbox_1.buildSingboxConfig)([node], { routingRules: [{ geosite: ["category-ads"], action: "block" }] });
+        }
+        catch (error) {
+            singGeoRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+        }
+        if (!singGeoRejected)
+            throw new Error("Sing-box accepted a geosite rule");
+        const xrayGeo = (0, xray_1.buildXrayConfig)([node], { routingRules: [{ geosite: ["category-ads"], action: "block" }] });
+        if (!JSON.stringify(xrayGeo).includes("geosite:category-ads"))
+            throw new Error("Xray geosite rule was not emitted");
+        // DS-L22: special geoip values translate per target — Xray emits
+        // geoip:private, Clash emits GEOIP,PRIVATE / GEOIP,LAN, sing-box
+        // still fails closed on any geo, and Xray fails "lan" at layer 2.
+        {
+            const xrayPrivate = (0, xray_1.buildXrayConfig)([node], { routingRules: [{ geoip: ["private"], action: "direct" }] });
+            if (!JSON.stringify(xrayPrivate).includes("geoip:private"))
+                throw new Error("Xray geoip:private was not emitted");
+            let xrayLanRejected = false;
+            try {
+                (0, xray_1.buildXrayConfig)([node], { routingRules: [{ geoip: ["lan"], action: "direct" }] });
+            }
+            catch (error) {
+                xrayLanRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR" && /rule 0/.test(error.message);
+            }
+            if (!xrayLanRejected)
+                throw new Error("Xray accepted geoip 'lan'");
+            let singPrivateRejected = false;
+            try {
+                (0, singbox_1.buildSingboxConfig)([node], { routingRules: [{ geoip: ["private"], action: "direct" }] });
+            }
+            catch (error) {
+                singPrivateRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+            }
+            if (!singPrivateRejected)
+                throw new Error("Sing-box accepted geoip 'private'");
+            const clashPrivate = (0, clash_1.buildClashConfig)([node], { routingRules: [{ geoip: ["private"], action: "direct" }] });
+            if (!clashPrivate.includes("GEOIP,PRIVATE,DIRECT"))
+                throw new Error("Clash GEOIP,PRIVATE was not emitted");
+            const clashLan = (0, clash_1.buildClashConfig)([node], { routingRules: [{ geoip: ["lan"], action: "direct" }] });
+            if (!clashLan.includes("GEOIP,LAN,DIRECT"))
+                throw new Error("Clash GEOIP,LAN was not emitted");
+        }
+        let clashProtocolRejected = false;
+        try {
+            (0, clash_1.buildClashConfig)([node], { routingRules: [{ protocol: "bittorrent", action: "block" }] });
+        }
+        catch (error) {
+            clashProtocolRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+        }
+        if (!clashProtocolRejected)
+            throw new Error("Clash accepted a protocol rule");
+        // DS-M9: a protocol rule enables sniffing — Xray inbound sniffing
+        // with the explicit destOverride list in route-only mode, and exactly
+        // one leading sniff rule in sing-box. Rulesets without a protocol
+        // matcher are unchanged (no sniffing, no sniff rule).
+        {
+            const protoRules = [{ protocol: "bittorrent", action: "block" }];
+            const xrayProto = (0, xray_1.buildXrayConfig)([node], { routingRules: protoRules });
+            const xraySniff = xrayProto.inbounds[0]?.sniffing;
+            if (xraySniff?.enabled !== true || JSON.stringify(xraySniff?.destOverride) !== JSON.stringify(["http", "tls", "quic"]) || xraySniff?.routeOnly !== true)
+                throw new Error(`Xray protocol rule did not enable route-only sniffing: ${JSON.stringify(xraySniff)}`);
+            if (!JSON.stringify(xrayProto.routing).includes('"protocol":"bittorrent"'))
+                throw new Error("Xray protocol rule was not emitted");
+            const xrayPlain = (0, xray_1.buildXrayConfig)([node], { routingRules: [{ domain_suffix: ["example.com"], action: "direct" }] });
+            if (xrayPlain.inbounds[0]?.sniffing?.enabled !== false)
+                throw new Error("Non-protocol ruleset gained Xray sniffing");
+            const singProto = (0, singbox_1.buildSingboxConfig)([node], { routingRules: protoRules });
+            const singProtoRules = singProto.route.rules;
+            if (singProtoRules[0]?.action !== "sniff" || singProtoRules[1]?.protocol !== "bittorrent" || singProtoRules[1]?.action !== "reject")
+                throw new Error(`Sing-box protocol ruleset lacks a leading sniff rule: ${JSON.stringify(singProtoRules)}`);
+            const singPlain = (0, singbox_1.buildSingboxConfig)([node], { routingRules: [{ domain_suffix: ["example.com"], action: "direct" }] });
+            if (singPlain.route.rules.some((rule) => rule.action === "sniff"))
+                throw new Error("Non-protocol ruleset gained a sing-box sniff rule");
+        }
+        // DS-M10: protocol "dns" fails the Xray artifact with a rule-indexed
+        // layer-2 error; sing-box still renders the rule (with the DS-M9
+        // leading sniff rule).
+        {
+            let xrayDnsRejected = false;
+            try {
+                (0, xray_1.buildXrayConfig)([node], { routingRules: [{ protocol: "dns", action: "direct" }] });
+            }
+            catch (error) {
+                xrayDnsRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR" && /rule 0/.test(error.message);
+            }
+            if (!xrayDnsRejected)
+                throw new Error("Xray accepted a protocol 'dns' rule");
+            const singDns = (0, singbox_1.buildSingboxConfig)([node], { routingRules: [{ protocol: "dns", action: "direct" }] });
+            if (!singDns.route.rules.some((rule) => rule.protocol === "dns"))
+                throw new Error("Sing-box dns rule was not emitted");
+        }
+        let xrayPrefixRejected = false;
+        try {
+            (0, xray_1.buildXrayConfig)([node], { customOutbounds: [{ tag: "proxy-foo", protocol: "socks", settings: { servers: [] } }] });
+        }
+        catch (error) {
+            xrayPrefixRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+        }
+        if (!xrayPrefixRejected)
+            throw new Error("Xray accepted a custom tag with the balancer prefix");
+        // DS-L24 (YAML half): geosite and multi-matcher (AND) rulesets carry
+        // the Mihomo-only header comment; a plain ruleset carries neither it
+        // nor any marker.
+        {
+            const clashGeoHeader = (0, clash_1.buildClashConfig)([node], { routingRules: [{ geosite: ["category-ads"], action: "block" }] });
+            if (!clashGeoHeader.startsWith("# Requires Mihomo (not original Clash Premium)\n"))
+                throw new Error("Geosite Clash output lacks the Mihomo-only header");
+            const clashAndHeader = (0, clash_1.buildClashConfig)([node], { routingRules: [{ domain_suffix: ["video.example.org"], port: [443], action: "direct" }] });
+            if (!clashAndHeader.startsWith("# Requires Mihomo (not original Clash Premium)\n"))
+                throw new Error("AND Clash output lacks the Mihomo-only header");
+            const clashPlainHeader = (0, clash_1.buildClashConfig)([node], { routingRules: [{ domain_suffix: ["example.com"], action: "direct" }] });
+            if (clashPlainHeader.includes("Requires Mihomo"))
+                throw new Error("Plain Clash output wrongly gained the Mihomo-only header");
+        }
     }));
     tests.push(await runOne("output.core-adapters-plaintext", "Native/Sing-box/Mihomo target boundaries preserve the Worker plaintext model", "output", async () => {
         const node = { protocol: "trojan", server: "proxy.example.com", port: 80, credential: password, name: "trojan-http", security: "none", scheme: "http", endpointKind: "domain", websocket: { path: "/trojan", host: "proxy.example.com" } };
@@ -3645,6 +4559,72 @@ async function runSelfTests(env) {
         const urltest = singboxConfig.outbounds?.find((item) => item.type === "urltest");
         if (urltest?.url !== "https://probe.example.com/generate_204")
             throw new Error(`CORE_OUTPUT_PROBE_URL was not propagated to the sing-box urltest group: ${JSON.stringify(urltest)}`);
+        // DS-L39 (Mihomo half): the custom probe URL reaches the Mihomo
+        // url-test group, and with the variable unset all three targets
+        // fall back to the gstatic default.
+        {
+            const clashRendered = await (0, artifacts_1.renderOutputArtifact)(env, new Request("https://proxy.example.com/__core/outputs/clash?artifact=best-ping&protocol=vless"), provider, "clash");
+            if (!clashRendered.body.includes("    url: \"https://probe.example.com/generate_204\""))
+                throw new Error(`CORE_OUTPUT_PROBE_URL was not propagated to the Mihomo url-test group: ${clashRendered.body}`);
+            const unsetEnv = { VLESS_USERS: vlessUuid, OUTPUT_HOST: "proxy.example.com", OUTPUT_PORT: "443", CORE_OUTPUT_MAX_NODES: "20" };
+            const unsetClash = await (0, artifacts_1.renderOutputArtifact)(unsetEnv, new Request("https://proxy.example.com/__core/outputs/clash?artifact=best-ping&protocol=vless"), provider, "clash");
+            if (!unsetClash.body.includes('    url: "https://www.gstatic.com/generate_204"'))
+                throw new Error(`Unset CORE_OUTPUT_PROBE_URL did not default to gstatic in Mihomo: ${unsetClash.body}`);
+        }
+        // Render-level routing: the same env vars flow through baseOptions into
+        // all three artifacts, and a geo rule fails only the sing-box artifact.
+        const routingEnv = {
+            VLESS_USERS: vlessUuid, OUTPUT_HOST: "proxy.example.com", OUTPUT_PORT: "443",
+            CORE_OUTPUT_ROUTING_RULES: JSON.stringify([
+                { domain_suffix: ["example.com"], action: "direct" },
+                { domain_suffix: ["ads.example.net"], action: "block" },
+            ]),
+            CORE_OUTPUT_SINGBOX_OUTBOUNDS: JSON.stringify([{ type: "socks", tag: "warp-socks", server: "127.0.0.1", server_port: 40000 }]),
+            CORE_OUTPUT_XRAY_OUTBOUNDS: JSON.stringify([{ tag: "warp-socks", protocol: "socks", settings: { servers: [{ address: "127.0.0.1", port: 40000 }] } }]),
+            CORE_OUTPUT_CLASH_PROXIES: JSON.stringify([{ type: "socks5", name: "warp-socks", server: "127.0.0.1", port: 40000 }]),
+        };
+        const routingProvider = { authenticate: async () => null, count: async (protocol) => protocol === "vless" ? records.length : 0, listPage: async (protocol, offset, limit) => protocol === "vless" ? records.slice(offset, offset + limit) : [] };
+        const routedSing = JSON.parse((await (0, artifacts_1.renderOutputArtifact)(routingEnv, new Request("https://proxy.example.com/__core/outputs/sing-box?artifact=bundle&protocol=vless"), routingProvider, "sing-box")).body);
+        const routedSingRules = routedSing.route.rules;
+        if (routedSingRules.length !== 2 || routedSingRules[0]?.outbound !== "direct")
+            throw new Error("Rendered sing-box rules are missing");
+        const routedXray = JSON.parse((await (0, artifacts_1.renderOutputArtifact)(routingEnv, new Request("https://proxy.example.com/__core/outputs/xray?artifact=bundle&protocol=vless"), routingProvider, "xray")).body);
+        const routedXrayRules = routedXray.routing.rules;
+        if (routedXrayRules.length !== 3 || routedXrayRules[1]?.outboundTag !== "block")
+            throw new Error("Rendered Xray rules are missing");
+        if (!routedXray.outbounds.some((item) => item.tag === "block" && item.protocol === "blackhole"))
+            throw new Error("Rendered Xray blackhole is missing");
+        const routedClash = (await (0, artifacts_1.renderOutputArtifact)(routingEnv, new Request("https://proxy.example.com/__core/outputs/clash?artifact=bundle&protocol=vless"), routingProvider, "clash")).body;
+        if (!routedClash.includes("  - DOMAIN-SUFFIX,example.com,DIRECT\n") || routedClash.indexOf("  - DOMAIN-SUFFIX,example.com,DIRECT") > routedClash.indexOf("  - MATCH,PROXY"))
+            throw new Error("Rendered Clash rules are missing or misordered");
+        const geoEnv = { ...routingEnv, CORE_OUTPUT_ROUTING_RULES: JSON.stringify([{ geosite: ["category-ads"], action: "block" }]) };
+        let geoSingRejected = false;
+        try {
+            await (0, artifacts_1.renderOutputArtifact)(geoEnv, new Request("https://proxy.example.com/__core/outputs/sing-box?artifact=bundle&protocol=vless"), routingProvider, "sing-box");
+        }
+        catch (error) {
+            geoSingRejected = error instanceof errors_1.CoreError && error.code === "CONFIGURATION_ERROR";
+        }
+        if (!geoSingRejected)
+            throw new Error("Rendered sing-box accepted a geosite rule");
+        const geoXray = JSON.parse((await (0, artifacts_1.renderOutputArtifact)(geoEnv, new Request("https://proxy.example.com/__core/outputs/xray?artifact=bundle&protocol=vless"), routingProvider, "xray")).body);
+        if (!JSON.stringify(geoXray).includes("geosite:category-ads"))
+            throw new Error("Rendered Xray geosite rule is missing");
+        const geoClash = (await (0, artifacts_1.renderOutputArtifact)(geoEnv, new Request("https://proxy.example.com/__core/outputs/clash?artifact=bundle&protocol=vless"), routingProvider, "clash")).body;
+        if (!geoClash.includes("GEOSITE,category-ads,REJECT"))
+            throw new Error("Rendered Clash geosite rule is missing");
+        // DS-L24 (manifest half): a geosite Clash manifest carries the
+        // Mihomo clientRequirements entry; a plain manifest carries none.
+        {
+            const geoManifestEnv = { ...routingEnv, CORE_OUTPUT_ROUTING_RULES: JSON.stringify([{ geosite: ["category-ads"], action: "block" }]) };
+            const geoManifest = JSON.parse((await (0, artifacts_1.renderOutputArtifact)(geoManifestEnv, new Request("https://proxy.example.com/__core/outputs/clash?artifact=manifest&protocol=vless"), routingProvider, "clash")).body);
+            const geoBundleDesc = geoManifest.artifacts.find((item) => item.id === "bundle");
+            if (!JSON.stringify(geoBundleDesc?.clientRequirements ?? []).includes("Mihomo"))
+                throw new Error("Geosite Clash manifest lacks the Mihomo clientRequirements entry");
+            const plainManifest = JSON.parse((await (0, artifacts_1.renderOutputArtifact)(routingEnv, new Request("https://proxy.example.com/__core/outputs/clash?artifact=manifest&protocol=vless"), routingProvider, "clash")).body);
+            if (plainManifest.artifacts.find((item) => item.id === "bundle")?.clientRequirements)
+                throw new Error("Plain Clash manifest wrongly gained a clientRequirements entry");
+        }
     }));
     tests.push(await runOne("output.best-ping-fragment-composition", "Xray Best Fragment and Best Ping Fragment are documented aliases; Sing-box fragment groups use urltest selection", "output", async () => {
         const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: "proxy.example.com", OUTPUT_PORT: "443" };
@@ -3790,6 +4770,20 @@ async function runSelfTests(env) {
         const parsed = (0, rules_1.parseCoreRule)("host=Example.COM|direct");
         if (parsed.host !== "example.com" || parsed.egress !== "direct")
             throw new Error(`Shared CORE_RULES parser canonicalization failed: ${JSON.stringify(parsed)}`);
+        // DS-H2: comma-separated CORE_RULES must parse to the same rules the
+        // validator accepts (previously validation split on commas but the
+        // runtime parser split only on newlines, so a comma value passed
+        // startup validation and then threw in runtimeFor).
+        {
+            const commaRules = (0, rules_1.parseCoreRules)("host=a.com|direct,host=b.com|proxyip");
+            if (commaRules.length !== 2 || commaRules[0]?.host !== "a.com" || commaRules[1]?.egress !== "proxyip") {
+                throw new Error(`Comma-form CORE_RULES did not parse to 2 rules: ${JSON.stringify(commaRules)}`);
+            }
+            const newlineRules = (0, rules_1.parseCoreRules)("host=a.com|direct\nhost=b.com|proxyip");
+            if (newlineRules.length !== commaRules.length)
+                throw new Error("Comma-form and newline-form CORE_RULES disagree");
+            (0, validation_1.validateEnvironment)({ VLESS_USERS: vlessUuid, TROJAN_USERS: password, PROXY_IP: "proxy.example.com:1080", CORE_RULES: "host=a.com|direct,host=b.com|proxyip" });
+        }
     }));
     tests.push(await runOne("output.mihomo-trojan-sni", "Mihomo Trojan TLS output uses the documented sni field", "output", async () => {
         const node = { protocol: "trojan", server: "203.0.113.10", port: 443, credential: password, name: "trojan-clean-ip", security: "tls", scheme: "https", endpointKind: "clean-ip", tls: { serverName: "origin.example.com", alpn: ["http/1.1"], fingerprint: "chrome" }, websocket: { path: "/trojan", host: "origin.example.com" } };
@@ -3814,6 +4808,33 @@ async function runSelfTests(env) {
         }
         if (!rejected || calls !== 2)
             throw new Error(`Aggregation cache ignored maxBytes policy: rejected=${rejected}, calls=${calls}`);
+        // DS-L26: external subscriptions are commonly base64url without
+        // padding (normalized before decoding), and a source that yields
+        // zero lines warns on the console.warn channel instead of
+        // returning nothing silently.
+        {
+            const b64url = btoa("vless://uuid@proxy.example.com:443?type=ws&path=/vless#n1\ntrojan://pass@proxy.example.com:443?type=ws&path=/trojan#n2").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+            const l26Env = { OUTPUT_CUSTOM_SUBS: "https://b64.example.com/list,https://empty.example.com/list", CORE_OUTPUT_SUBS_ALLOWLIST: "b64.example.com,empty.example.com" };
+            const l26Resolver = { resolve: async () => [{ address: "93.184.216.34", family: 4, ttl: 60 }] };
+            const l26Fetch = async (input) => {
+                if (String(input).includes("empty.example.com"))
+                    return new Response("   \n", { status: 200 });
+                return new Response(b64url, { status: 200 });
+            };
+            const capturedWarnings = [];
+            const originalWarn = console.warn;
+            console.warn = (...args) => { capturedWarnings.push(args.map(String).join(" ")); };
+            try {
+                const aggregated = await (0, aggregation_1.fetchNativeSubscriptionSources)(l26Env, signal, 8, 256 * 1024, l26Fetch, l26Resolver);
+                if (aggregated.length !== 2 || !aggregated[0].startsWith("vless://"))
+                    throw new Error(`base64url subscription did not aggregate: ${JSON.stringify(aggregated)}`);
+            }
+            finally {
+                console.warn = originalWarn;
+            }
+            if (!capturedWarnings.some((warning) => warning.includes("yielded no lines")))
+                throw new Error("Zero-line subscription source did not warn");
+        }
     }));
     tests.push(await runOne("output.early-data-all-targets", "Early-data output is synchronized across native, Xray, Sing-box and Mihomo", "output", async () => {
         const node = { protocol: "vless", server: "proxy.example.com", port: 443, credential: vlessUuid, name: "node", security: "tls", scheme: "https", endpointKind: "domain", tls: { serverName: "proxy.example.com", alpn: ["http/1.1"], fingerprint: "chrome" }, websocket: { path: "/vless", host: "proxy.example.com", earlyData: 2560 } };
@@ -3879,6 +4900,26 @@ async function runSelfTests(env) {
         const next = await repo.listPage("vless", 2, 2, signal);
         if (next.length !== 2 || primaryListCalled || fallbackListCalled)
             throw new Error("Hybrid fallback paging used full-list materialization");
+        // DS-H3: hybrid list() returns every unique fallback credential when
+        // the primary count is not a multiple of 256 (previously short
+        // primary pages silently dropped fallback records).
+        {
+            const h3PrimaryRows = Array.from({ length: 100 }, (_, i) => ({ id: `p${i}`, protocol: "vless", credential: `p${i}`, enabled: true }));
+            const h3FallbackRows = [...Array.from({ length: 10 }, (_, i) => ({ id: `p${i}`, protocol: "vless", credential: `p${i}`, enabled: true })),
+                ...Array.from({ length: 40 }, (_, i) => ({ id: `f${i}`, protocol: "vless", credential: `f${i}`, enabled: true }))];
+            const h3Primary = { authenticate: async () => null, count: async () => 100, listPage: async (_p, offset, limit) => h3PrimaryRows.slice(offset, offset + limit) };
+            const h3Fallback = { authenticate: async () => null, count: async () => 50, listPage: async (_p, offset, limit) => h3FallbackRows.slice(offset, offset + limit) };
+            const h3Repo = new cloudflare_3.CredentialRepository(h3Primary, h3Fallback, "hybrid");
+            const h3Count = await h3Repo.count("vless", signal);
+            const h3List = await h3Repo.list("vless", signal);
+            if (h3Count !== 140)
+                throw new Error(`Hybrid count mismatch: ${h3Count}`);
+            if (h3List.length !== h3Count)
+                throw new Error(`Hybrid list() dropped fallback credentials: list=${h3List.length} count=${h3Count}`);
+            const h3Page = await h3Repo.listPage("vless", 90, 30, signal);
+            if (h3Page.length !== 30 || h3Page[10]?.id !== "f0")
+                throw new Error(`Hybrid boundary page did not span: len=${h3Page.length} page[10]=${h3Page[10]?.id}`);
+        }
     }));
     tests.push(await runOne("aggregation.ssrf-policy", "External subscriptions require an explicit public-domain allowlist", "security", async (signal) => {
         const base = { OUTPUT_CUSTOM_SUBS: "https://subs.example.com/list" };
@@ -3983,7 +5024,12 @@ async function runSelfTests(env) {
     }));
     tests.push(await runOne("aggregation.pagination-contract", "External aggregation never corrupts native pagination offsets", "output", async () => {
         const longHost = `${"a".repeat(60)}.${"b".repeat(60)}.${"c".repeat(60)}.${"d".repeat(60)}`;
-        const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: longHost, OUTPUT_PORT: "443", CORE_OUTPUT_MAX_NODES: "3", CORE_OUTPUT_MAX_BYTES: "1024", OUTPUT_CUSTOM_SUBS: "https://subs.example.com/list", CORE_OUTPUT_SUBS_ALLOWLIST: "subs.example.com" };
+        // DS-L25 consequence: native lines now carry a #remark fragment, so
+        // one line no longer fits the old 1024-byte budget (the service
+        // throws instead of truncating below one node). The budget itself
+        // is covered by the aggregation-cache-policy test; this test is
+        // about offset/total preservation, so its fixture budget is 2048.
+        const env = { VLESS_USERS: vlessUuid, OUTPUT_HOST: longHost, OUTPUT_PORT: "443", CORE_OUTPUT_MAX_NODES: "3", CORE_OUTPUT_MAX_BYTES: "2048", OUTPUT_CUSTOM_SUBS: "https://subs.example.com/list", CORE_OUTPUT_SUBS_ALLOWLIST: "subs.example.com" };
         const provider = { authenticate: async () => null, count: async (protocol) => protocol === "vless" ? 4 : 0, listPage: async (protocol, offset, limit) => protocol === "vless" ? [1, 2, 3, 4].slice(offset, offset + limit).map((id) => ({ id: String(id), protocol: "vless", credential: vlessUuid, rawCredential: vlessUuid, enabled: true })) : [] };
         const resolver = { resolve: async () => [{ address: "93.184.216.34", family: 4, ttl: 60 }] };
         const output = await (0, service_1.renderSubscriptionWithProvider)(env, new Request("https://proxy.example.com/sub?protocol=vless&limit=3&aggregate=true&encode=raw"), provider, resolver, async () => new Response("vless://external@example.com:443?security=tls&type=ws&host=example.com&path=%2Fvless"));
@@ -4119,6 +5165,88 @@ async function runSelfTests(env) {
         }
         finally {
             globalThis.fetch = originalFetch;
+        }
+        // DS-M7: the private-DoH dash form (<DOH_PATH>-<secret>) matches
+        // exactly like the slash form; a wrong secret matches neither.
+        {
+            const dashSecret = "test-doh-path-secret-0123456789abcdef";
+            const dashEnv = { CORE_DOH_PATH_SECRET: dashSecret };
+            const dash = new Request(`https://proxy.example.com/dns-query-${dashSecret}?dns=bad!`);
+            const slash = new Request(`https://proxy.example.com/dns-query/${dashSecret}?dns=bad!`);
+            const wrong = new Request("https://proxy.example.com/dns-query-wrongsecret0123456789abcdef?dns=bad!");
+            if (!(0, doh_3.privateDohPathSecretMatches)(dash, dashEnv))
+                throw new Error("Dash-form DoH path secret did not match");
+            if (!(0, doh_3.privateDohPathSecretMatches)(slash, dashEnv))
+                throw new Error("Slash-form DoH path secret stopped matching");
+            if ((0, doh_3.privateDohPathSecretMatches)(wrong, dashEnv))
+                throw new Error("Wrong dash-form DoH path secret matched");
+            let dashBadRequest = false;
+            try {
+                await (0, doh_3.handlePrivateDoh)(dash, dashEnv);
+            }
+            catch (error) {
+                dashBadRequest = error instanceof errors_1.CoreError && error.code === "BAD_REQUEST";
+                if (!dashBadRequest)
+                    throw error;
+            }
+            if (!dashBadRequest)
+                throw new Error("Dash-form DoH request with a malformed dns parameter was accepted");
+        }
+        // DS-L20: MESSAGE_TOO_LARGE is deterministic for the endpoint, so
+        // the handler must not retry it up to DNS_RETRIES.
+        {
+            const l20Query = new Uint8Array([
+                0x4a, 0x21, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x0a, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x66, 0x6c, 0x61, 0x72, 0x65,
+                0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01,
+            ]);
+            const l20Token = "c".repeat(40);
+            const l20Env = { CORE_DOH_TOKEN: l20Token, DNS_RESOLVERS: "https://dns.example/dns-query", DNS_RETRIES: "5", DNS_FALLBACK: "true" };
+            const l20Request = () => new Request("https://proxy.example.com/dns-query", {
+                method: "POST",
+                headers: { Authorization: `Bearer ${l20Token}`, "content-type": "application/dns-message" },
+                body: l20Query,
+            });
+            const l20OriginalFetch = globalThis.fetch;
+            try {
+                let l20Calls = 0;
+                globalThis.fetch = (async () => {
+                    l20Calls++;
+                    return new Response(new Uint8Array(0), { status: 200, headers: { "content-type": "application/dns-message", "content-length": "100000" } });
+                });
+                let l20Error = null;
+                try {
+                    await (0, doh_3.handlePrivateDoh)(l20Request(), l20Env);
+                }
+                catch (caught) {
+                    l20Error = caught;
+                }
+                if (l20Calls !== 1)
+                    throw new Error(`Oversize endpoint was retried: ${l20Calls} upstream fetches`);
+                if (!(l20Error instanceof errors_1.CoreError) || l20Error.code !== "MESSAGE_TOO_LARGE")
+                    throw new Error(`Expected MESSAGE_TOO_LARGE, got ${l20Error instanceof Error ? l20Error.message : String(l20Error)}`);
+            }
+            finally {
+                globalThis.fetch = l20OriginalFetch;
+            }
+        }
+        // DS-M18 (+ DS-L38 trailing-slash parity): Pages core-path
+        // detection covers every core route, path-secret forms and the
+        // no-ASSETS fallback shape; core routes always win over assets.
+        {
+            const cases = [
+                ["/vless", {}, true], ["/vless/", {}, true], ["/trojan", {}, true], ["/trojan/", {}, true],
+                ["/dns-query", {}, true], ["/dns-query/secret", {}, true], ["/dns-query-secret", {}, true],
+                ["/sub", {}, true], ["/sub/", {}, true], ["/sub/foo", {}, true],
+                ["/__core/health", {}, true], ["/__core/", {}, true], ["/__core", {}, true],
+                ["/index.html", {}, false], ["/static/app.js", {}, false], ["/other", {}, false],
+                ["/doh-secret", { DOH_PATH: "/doh" }, true], ["/dohx", { DOH_PATH: "/doh" }, false],
+                ["/custom-vless", { VLESS_PATH: "/custom-vless" }, true],
+            ];
+            for (const [path, env, want] of cases) {
+                if ((0, pages_entry_1.isCorePath)(path, env) !== want)
+                    throw new Error(`isCorePath(${path}) = ${!want}, want ${want}`);
+            }
         }
     }));
     tests.push(await runOne("metrics.histogram", "Runtime observations keep fixed-bucket latency histograms", "observability", async () => {
@@ -4332,9 +5460,13 @@ const bounded_cache_1 = __r("../util/bounded-cache");
 const hostname_1 = __r("../util/hostname");
 const lifecycle_1 = __r("../util/lifecycle");
 function decodeBase64(value) {
-    const normalized = value.replace(/\s+/g, "");
-    if (!normalized || normalized.length % 4 !== 0 || /[^A-Za-z0-9+/=]/.test(normalized))
+    // DS-L26: external subscriptions are commonly base64url without padding.
+    // Normalize that form before decoding (- to +, _ to /, re-pad to a
+    // multiple of 4); a length congruent to 1 mod 4 can never be valid.
+    const base = value.replace(/\s+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+    if (!base || base.length % 4 === 1 || /[^A-Za-z0-9+/=]/.test(base))
         return null;
+    const normalized = base + "=".repeat((4 - (base.length % 4)) % 4);
     try {
         const bytes = Uint8Array.from(atob(normalized), (char) => char.charCodeAt(0));
         return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -4600,6 +5732,11 @@ async function fetchNativeSubscriptionSources(env, signal, maxSources = limits_1
     for (const source of sources) {
         try {
             const lines = await (0, lifecycle_1.withTimeout)((sourceSignal) => fetchOne(source, env, sourceSignal, maxBytes, fetchImpl, resolver), boundedTimeout, signal, "External subscription fetch timeout");
+            // DS-L26: an HTTP-200 source that yields zero lines is as silent a
+            // failure as a fetch error was before the warn channel existed, so
+            // warn on the same console.warn channel instead of returning nothing.
+            if (!lines.length)
+                console.warn(`External subscription source yielded no lines (${subscriptionSourceLogLabel(source)})`);
             for (const line of lines) {
                 if (!seen.has(line)) {
                     seen.add(line);
@@ -4736,8 +5873,28 @@ async function withTimeout(factory, timeoutMs, parent, message) {
     }
 }
 async function raceWithAbort(operation, signal, onLateResolve) {
+    // DS-L29: onLateResolve is cleanup (the sole caller closes a late dial
+    // result), not a result channel. A throw/rejection inside it must
+    // therefore never become an unhandled rejection (the old void-then
+    // chains) nor replace the abort reason (the old awaited call). It is
+    // caught and swallowed here, deliberately: the caller has already
+    // aborted, the late value is being discarded, and surfacing a cleanup
+    // error through the race result would mask the abort that actually
+    // decided the outcome. Callers that need cleanup errors surfaced must
+    // handle them inside their own callback.
+    const invokeLateResolve = (value) => {
+        if (!onLateResolve)
+            return;
+        try {
+            const result = onLateResolve(value);
+            if (result && typeof result.catch === "function") {
+                void result.catch(() => { });
+            }
+        }
+        catch { /* cleanup failure on an already-aborted race: swallow */ }
+    };
     if (signal.aborted) {
-        void operation.then((value) => onLateResolve?.(value), () => { });
+        void operation.then((value) => invokeLateResolve(value), () => { });
         throw signal.reason;
     }
     let onAbort;
@@ -4750,14 +5907,14 @@ async function raceWithAbort(operation, signal, onLateResolve) {
         });
         const result = await Promise.race([operation, aborted]);
         if (signal.aborted) {
-            await onLateResolve?.(result);
+            invokeLateResolve(result);
             throw signal.reason;
         }
         return result;
     }
     catch (error) {
         if (signal.aborted) {
-            void operation.then((value) => onLateResolve?.(value), () => { });
+            void operation.then((value) => invokeLateResolve(value), () => { });
             void operation.catch(() => { });
         }
         throw error;
@@ -4818,6 +5975,1396 @@ exports.BoundedTtlLru = BoundedTtlLru;
 
 };
 
+__m["pages-entry"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.isCorePath = isCorePath;
+const worker_1 = __r("./worker");
+// Exported for the DS-M18 unit test (src/tests/runner.ts imports it);
+// the Pages default export below is unchanged.
+// DS-L38: mirror the control layer's trailing-slash normalization
+// (src/control/routes.ts strips trailing slashes from both the configured
+// path and the request pathname). Previously "/sub/" or "/vless/" fell
+// through to ASSETS here while the control layer treated them as core
+// routes, so Pages and Workers disagreed on the same request.
+function stripTrailingSlashes(value) {
+    return value.replace(/\/+$/, "") || "/";
+}
+function isCorePath(pathname, env) {
+    const path = stripTrailingSlashes(pathname);
+    const vlessPath = stripTrailingSlashes(env.VLESS_PATH?.trim() || "/vless");
+    const trojanPath = stripTrailingSlashes(env.TROJAN_PATH?.trim() || "/trojan");
+    const dohPath = stripTrailingSlashes(env.DOH_PATH?.trim() || "/dns-query");
+    return (path === vlessPath ||
+        path === trojanPath ||
+        path === dohPath ||
+        path.startsWith(`${dohPath}/`) ||
+        path.startsWith(`${dohPath}-`) ||
+        path === "/sub" ||
+        path.startsWith("/sub/") ||
+        // The stripped form of "/__core/" is "/__core", which no longer
+        // matches the "/__core/" prefix, so accept the bare prefix too.
+        path === "/__core" ||
+        path.startsWith("/__core/"));
+}
+exports.default = {
+    async fetch(request, env, ctx) {
+        const url = new URL(request.url);
+        if (!isCorePath(url.pathname, env) && env.ASSETS) {
+            try {
+                return await env.ASSETS.fetch(request);
+            }
+            catch {
+                // A failed asset fetch falls through to the core's generic 404
+                // rather than leaking an asset-layer error for an unknown path.
+            }
+        }
+        // The core entry only uses `ctx.waitUntil`; `passThroughOnException`
+        // and `props` are part of its context type but never invoked, so the
+        // adapted context below is behaviorally identical on Pages.
+        return worker_1.default.fetch(request, env, {
+            waitUntil: (promise) => ctx.waitUntil(promise),
+            passThroughOnException: () => ctx.passThroughOnException?.(),
+            props: ctx.props ?? {},
+        });
+    },
+};
+
+};
+
+__m["output/rules"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.WELL_KNOWN_OUTBOUND_TAGS = exports.MAX_CLASH_EXPANDED_LINES = exports.MAX_ROUTING_RULES = exports.MAX_ROUTING_RULES_BYTES = void 0;
+exports.collectRoutingRuleIssues = collectRoutingRuleIssues;
+exports.parseRoutingRules = parseRoutingRules;
+exports.translateSingboxRules = translateSingboxRules;
+exports.translateXrayRules = translateXrayRules;
+exports.translateClashRules = translateClashRules;
+exports.countClashExpandedLines = countClashExpandedLines;
+const errors_1 = __r("../core/errors");
+const hostname_1 = __r("../util/hostname");
+exports.MAX_ROUTING_RULES_BYTES = 128 * 1024;
+exports.MAX_ROUTING_RULES = 512;
+exports.MAX_CLASH_EXPANDED_LINES = 4096;
+const MATCHER_FIELDS = [
+    "domain", "domain_suffix", "domain_keyword", "domain_regex",
+    "ip_cidr", "source_ip_cidr", "port", "source_port", "port_range",
+    "network", "protocol", "geoip", "geosite",
+];
+const RULE_FIELDS = new Set([...MATCHER_FIELDS, "action", "outbound"]);
+const ACTIONS = new Set(["proxy", "direct", "block", "outbound"]);
+const NETWORKS = new Set(["tcp", "udp"]);
+const PROTOCOLS = new Set(["http", "tls", "quic", "dns", "bittorrent"]);
+exports.WELL_KNOWN_OUTBOUND_TAGS = new Set(["proxy", "direct", "block"]);
+function isRecord(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function asStringList(value) {
+    if (typeof value === "string")
+        return [value];
+    if (Array.isArray(value) && value.every((item) => typeof item === "string"))
+        return [...value];
+    return null;
+}
+function asNumberList(value) {
+    if (typeof value === "number")
+        return [value];
+    if (Array.isArray(value) && value.every((item) => typeof item === "number"))
+        return [...value];
+    return null;
+}
+function isIpv4Literal(value) {
+    const parts = value.split(".");
+    return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+function isIpv6Literal(value) {
+    if (!value.includes(":"))
+        return false;
+    const pieces = value.split("::");
+    if (pieces.length > 2)
+        return false;
+    const parseSide = (side) => {
+        if (!side)
+            return 0;
+        let count = 0;
+        for (const token of side.split(":")) {
+            if (token.includes(".")) {
+                if (!isIpv4Literal(token))
+                    return null;
+                count += 2;
+                continue;
+            }
+            if (!/^[0-9a-fA-F]{1,4}$/.test(token))
+                return null;
+            count += 1;
+        }
+        return count;
+    };
+    const left = parseSide(pieces[0]);
+    const right = parseSide(pieces[1] ?? "");
+    if (left === null || right === null)
+        return false;
+    return pieces.length === 2 ? left + right < 8 : left === 8;
+}
+function isIpLiteral(value) {
+    return isIpv4Literal(value) || isIpv6Literal(value);
+}
+// Real LDH validation, reusing the endpoints.ts approach (toAsciiHostname):
+// trims, strips the trailing dot and lowercases, and rejects underscores,
+// empty labels ("a..b.com"), IP literals and URL delimiters that the old
+// URL round-trip accepted. Returns the normalized form, or null if invalid.
+// A hostname can never contain ".." (that would be an empty label).
+function normalizeHostnameValue(value) {
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.includes(".."))
+        return null;
+    const ascii = (0, hostname_1.toAsciiHostname)(trimmed);
+    if (!ascii || isIpLiteral(ascii))
+        return null;
+    return ascii;
+}
+function validCidr(value) {
+    const index = value.lastIndexOf("/");
+    if (index <= 0 || index === value.length - 1)
+        return false;
+    const address = value.slice(0, index);
+    const prefixText = value.slice(index + 1);
+    if (!/^\d+$/.test(prefixText))
+        return false;
+    const prefix = Number(prefixText);
+    if (address.includes(":"))
+        return isIpv6Literal(address) && prefix <= 128;
+    return isIpv4Literal(address) && prefix <= 32;
+}
+// Normalizes one raw rule object into the parsed shape, returning issue strings
+// (empty = valid). Normalization is lenient where it is unambiguous: a single
+// string/int is accepted where a list is expected, and network/protocol are
+// lowercased. Everything else is strict.
+function normalizeRule(raw, index) {
+    const prefix = `rule ${index}`;
+    const issues = [];
+    if (!isRecord(raw))
+        return { rule: null, issues: [`${prefix}: must be an object`] };
+    for (const key of Object.keys(raw)) {
+        if (!RULE_FIELDS.has(key))
+            issues.push(`${prefix}: unknown field '${key}'`);
+    }
+    if (!MATCHER_FIELDS.some((field) => raw[field] !== undefined))
+        issues.push(`${prefix}: at least one matcher is required`);
+    const action = raw.action;
+    if (typeof action !== "string" || !ACTIONS.has(action)) {
+        issues.push(`${prefix}: action is required and must be one of proxy, direct, block, outbound`);
+    }
+    if (action === "outbound" && typeof raw.outbound !== "string")
+        issues.push(`${prefix}: action 'outbound' requires an 'outbound' tag`);
+    if (action !== "outbound" && raw.outbound !== undefined)
+        issues.push(`${prefix}: 'outbound' is only allowed with action 'outbound'`);
+    const normalized = { action };
+    if (typeof raw.outbound === "string")
+        normalized.outbound = raw.outbound;
+    for (const field of ["domain", "domain_suffix", "domain_keyword"]) {
+        if (raw[field] === undefined)
+            continue;
+        const list = asStringList(raw[field]);
+        if (list === null) {
+            issues.push(`${prefix}: ${field} must be a string or an array of strings`);
+            continue;
+        }
+        const normalizedList = [];
+        for (const value of list) {
+            // '*' and ',' are rejected at layer 1 for ALL targets: ',' would split
+            // a Clash rule line into extra fields, and '*' is not a wildcard in
+            // any target's domain/domain_suffix fields (Mihomo has a separate
+            // DOMAIN-WILDCARD type that v1 never emits).
+            if (value.includes("*") || value.includes(",")) {
+                issues.push(`${prefix}: ${field} '${value}' must not contain '*' or ','`);
+                continue;
+            }
+            const normalizedValue = normalizeHostnameValue(value);
+            if (!normalizedValue) {
+                issues.push(`${prefix}: ${field} '${value}' is not a valid hostname`);
+                continue;
+            }
+            normalizedList.push(normalizedValue);
+        }
+        // Store the TRIMMED, trailing-dot-stripped, lowercased form so what is
+        // validated is exactly what every target renders.
+        normalized[field] = normalizedList;
+    }
+    if (raw.domain_regex !== undefined) {
+        const list = asStringList(raw.domain_regex);
+        if (list === null)
+            issues.push(`${prefix}: domain_regex must be a string or an array of strings`);
+        else {
+            const normalizedRegexList = [];
+            for (const value of list) {
+                // ',' is rejected at layer 1 for ALL targets: Clash rule lines are
+                // comma-delimited with no escaping, so a comma would split the
+                // emitted DOMAIN-REGEX line into extra fields (DS-M13). '*' stays
+                // allowed here: it is legitimate regex syntax and breaks no
+                // target's line format (a literal comma can be written as [,]).
+                if (value.includes(",")) {
+                    issues.push(`${prefix}: domain_regex '${value}' must not contain ','`);
+                    continue;
+                }
+                try {
+                    new RegExp(value);
+                }
+                catch {
+                    issues.push(`${prefix}: domain_regex '${value}' does not compile`);
+                    continue;
+                }
+                normalizedRegexList.push(value);
+            }
+            normalized.domain_regex = normalizedRegexList;
+        }
+    }
+    for (const field of ["ip_cidr", "source_ip_cidr"]) {
+        if (raw[field] === undefined)
+            continue;
+        const list = asStringList(raw[field]);
+        if (list === null) {
+            issues.push(`${prefix}: ${field} must be a string or an array of strings`);
+            continue;
+        }
+        for (const value of list)
+            if (!validCidr(value))
+                issues.push(`${prefix}: ${field} '${value}' is not a valid CIDR`);
+        normalized[field] = list;
+    }
+    for (const field of ["port", "source_port"]) {
+        if (raw[field] === undefined)
+            continue;
+        const list = asNumberList(raw[field]);
+        if (list === null) {
+            issues.push(`${prefix}: ${field} must be an integer or an array of integers`);
+            continue;
+        }
+        for (const value of list)
+            if (!Number.isInteger(value) || value < 1 || value > 65535)
+                issues.push(`${prefix}: ${field} '${value}' is out of range (1..65535)`);
+        normalized[field] = list;
+    }
+    if (raw.port_range !== undefined) {
+        const match = typeof raw.port_range === "string" ? /^(\d+)-(\d+)$/.exec(raw.port_range) : null;
+        if (!match || Number(match[1]) < 1 || Number(match[2]) > 65535 || Number(match[1]) > Number(match[2])) {
+            issues.push(`${prefix}: port_range '${String(raw.port_range)}' must use lo-hi format with 1 <= lo <= hi <= 65535`);
+        }
+        else
+            normalized.port_range = raw.port_range;
+    }
+    if (raw.network !== undefined) {
+        const value = typeof raw.network === "string" ? raw.network.toLowerCase() : "";
+        if (!NETWORKS.has(value))
+            issues.push(`${prefix}: network must be tcp or udp`);
+        else
+            normalized.network = value;
+    }
+    if (raw.protocol !== undefined) {
+        const value = typeof raw.protocol === "string" ? raw.protocol.toLowerCase() : "";
+        if (!PROTOCOLS.has(value))
+            issues.push(`${prefix}: protocol must be one of http, tls, quic, dns, bittorrent`);
+        else
+            normalized.protocol = value;
+    }
+    for (const field of ["geoip"]) {
+        if (raw[field] === undefined)
+            continue;
+        const list = asStringList(raw[field]);
+        if (list === null) {
+            issues.push(`${prefix}: ${field} must be a string or an array of strings`);
+            continue;
+        }
+        const normalizedList = [];
+        for (const value of list) {
+            // Special values (DS-L22): Xray documents geoip:private, and Mihomo
+            // documents GEOIP,lan / GEOIP,private. They are stored lowercased so
+            // every translator sees one canonical form; per-target support is a
+            // layer-2 concern (sing-box still fails closed on any geo; Xray
+            // rejects 'lan' at render time).
+            const lower = value.toLowerCase();
+            if (lower === "private" || lower === "lan") {
+                normalizedList.push(lower);
+                continue;
+            }
+            if (!/^[A-Za-z]{2}$/.test(value)) {
+                issues.push(`${prefix}: ${field} '${value}' must be a two-letter country code, 'private', or 'lan'`);
+                continue;
+            }
+            normalizedList.push(value);
+        }
+        normalized[field] = normalizedList;
+    }
+    if (raw.geosite !== undefined) {
+        const list = asStringList(raw.geosite);
+        if (list === null)
+            issues.push(`${prefix}: geosite must be a string or an array of strings`);
+        else {
+            for (const value of list) {
+                if (!value || /\s/.test(value))
+                    issues.push(`${prefix}: geosite '${value}' must be a non-empty name without whitespace`);
+                else if (value.includes("*") || value.includes(","))
+                    issues.push(`${prefix}: geosite '${value}' must not contain '*' or ','`);
+            }
+            normalized.geosite = list;
+        }
+    }
+    return { rule: issues.length ? null : normalized, issues };
+}
+// Layer 1: returns every issue found in the raw env value (empty = valid). Used by
+// startup validation for the aggregated CONFIGURATION_ERROR report.
+function collectRoutingRuleIssues(raw, _field) {
+    const issues = [];
+    const trimmed = raw?.trim();
+    if (!trimmed)
+        return issues;
+    if (new TextEncoder().encode(trimmed).byteLength > exports.MAX_ROUTING_RULES_BYTES) {
+        issues.push(`must not exceed ${exports.MAX_ROUTING_RULES_BYTES} bytes`);
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(trimmed);
+    }
+    catch {
+        issues.push("must be valid JSON");
+        return issues;
+    }
+    if (!Array.isArray(parsed)) {
+        issues.push("must be a JSON array of routing rules");
+        return issues;
+    }
+    if (parsed.length > exports.MAX_ROUTING_RULES)
+        issues.push(`must not exceed ${exports.MAX_ROUTING_RULES} rules`);
+    parsed.forEach((entry, index) => {
+        issues.push(...normalizeRule(entry, index).issues);
+    });
+    return issues;
+}
+// Parses the raw env value, throwing the first issue as CONFIGURATION_ERROR. Used
+// at render time (after startup validation already passed) as defense in depth.
+function parseRoutingRules(raw) {
+    const trimmed = raw?.trim();
+    if (!trimmed)
+        return [];
+    const issues = collectRoutingRuleIssues(raw, "");
+    if (issues.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_OUTPUT_ROUTING_RULES: ${issues[0]}`);
+    const parsed = JSON.parse(trimmed);
+    return parsed.map((entry, index) => normalizeRule(entry, index).rule);
+}
+// A rule's explicit outbound tag resolves per target: the three well-known tags
+// always resolve, a custom tag must be defined for that target, anything else is
+// a render-time (layer 2) failure for that artifact only.
+function resolveTarget(rule, index, customTags) {
+    if (rule.action === "proxy")
+        return { kind: "proxy" };
+    if (rule.action === "direct")
+        return { kind: "direct" };
+    if (rule.action === "block")
+        return { kind: "block" };
+    const tag = rule.outbound ?? "";
+    if (tag === "proxy" || tag === "direct" || tag === "block")
+        return { kind: tag };
+    if (customTags.has(tag))
+        return { kind: "custom", tag };
+    throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: outbound tag '${tag}' is not defined for this target`);
+}
+function translateSingboxRules(rules, ctx) {
+    const translated = rules.map((rule, index) => {
+        // sing-box 1.12 removed the geoip/geosite rule fields (deprecated since 1.8);
+        // geo routing in sing-box goes through rule_set, which is v2 scope. Fail this
+        // artifact with a precise error instead of emitting a field the client rejects
+        // or silently dropping the rule.
+        if (rule.geoip?.length || rule.geosite?.length) {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: geoip/geosite matchers are not supported for sing-box in v1 (use rule_set in v2)`);
+        }
+        const target = resolveTarget(rule, index, ctx.customTags);
+        const out = {};
+        if (rule.domain?.length)
+            out.domain = [...rule.domain];
+        if (rule.domain_suffix?.length)
+            out.domain_suffix = [...rule.domain_suffix];
+        if (rule.domain_keyword?.length)
+            out.domain_keyword = [...rule.domain_keyword];
+        if (rule.domain_regex?.length)
+            out.domain_regex = [...rule.domain_regex];
+        if (rule.ip_cidr?.length)
+            out.ip_cidr = [...rule.ip_cidr];
+        if (rule.source_ip_cidr?.length)
+            out.source_ip_cidr = [...rule.source_ip_cidr];
+        if (rule.port?.length)
+            out.port = [...rule.port];
+        if (rule.port_range) {
+            const [lo, hi] = rule.port_range.split("-");
+            out.port_range = `${lo}:${hi}`;
+        }
+        if (rule.source_port?.length)
+            out.source_port = [...rule.source_port];
+        if (rule.network)
+            out.network = rule.network;
+        if (rule.protocol)
+            out.protocol = rule.protocol;
+        if (target.kind === "proxy")
+            out.outbound = ctx.finalTag;
+        else if (target.kind === "direct")
+            out.outbound = "direct";
+        else if (target.kind === "block")
+            out.action = "reject";
+        else
+            out.outbound = target.tag;
+        return out;
+    });
+    // sing-box matches `protocol` against sniffed metadata, and sniffing is a
+    // (non-final) route rule action: without a leading sniff rule a protocol
+    // rule can never match. Prepend exactly one sniff rule, before all
+    // matching rules, whenever ANY user rule uses `protocol`. Rulesets with
+    // no protocol matcher are byte-identical to before.
+    return rules.some((rule) => rule.protocol !== undefined) ? [{ action: "sniff" }, ...translated] : translated;
+}
+function translateXrayRules(rules, ctx) {
+    let needsDirect = false;
+    let needsBlock = false;
+    const out = rules.map((rule, index) => {
+        // Layer 2 (DS-M10): 'dns' is a sing-box sniff protocol, not an Xray
+        // routing protocol (Xray documents only http | tls | quic | bittorrent).
+        // Fail this artifact with a rule-indexed error, mirroring Clash's
+        // protocol rejection, instead of emitting a rule that can never match.
+        if (rule.protocol === "dns")
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: protocol 'dns' is not supported for Xray in v1`);
+        // Layer 2 (DS-L22): 'lan' has no Xray geoip form (only 'private' does).
+        if (rule.geoip?.some((value) => value.toLowerCase() === "lan"))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: geoip 'lan' is not supported for Xray in v1`);
+        const target = resolveTarget(rule, index, ctx.customTags);
+        const entry = { type: "field" };
+        const domain = [];
+        for (const value of rule.domain ?? [])
+            domain.push(`full:${value}`);
+        for (const value of rule.domain_suffix ?? [])
+            domain.push(`domain:${value}`);
+        for (const value of rule.domain_keyword ?? [])
+            domain.push(`keyword:${value}`);
+        for (const value of rule.domain_regex ?? [])
+            domain.push(`regexp:${value}`);
+        for (const value of rule.geosite ?? [])
+            domain.push(`geosite:${value}`);
+        if (domain.length)
+            entry.domain = domain;
+        const ip = [];
+        for (const value of rule.ip_cidr ?? [])
+            ip.push(value);
+        for (const value of rule.geoip ?? [])
+            ip.push(`geoip:${value.toLowerCase()}`);
+        if (ip.length)
+            entry.ip = ip;
+        if (rule.source_ip_cidr?.length)
+            entry.sourceIP = [...rule.source_ip_cidr];
+        const portParts = [...(rule.port ?? []).map(String)];
+        if (rule.port_range)
+            portParts.push(rule.port_range);
+        if (portParts.length)
+            entry.port = portParts.join(",");
+        if (rule.source_port?.length)
+            entry.sourcePort = rule.source_port.map(String).join(",");
+        if (rule.network)
+            entry.network = rule.network;
+        if (rule.protocol)
+            entry.protocol = rule.protocol;
+        if (target.kind === "proxy") {
+            if (ctx.multi)
+                entry.balancerTag = "proxy-balancer";
+            else
+                entry.outboundTag = ctx.finalTag;
+        }
+        else if (target.kind === "direct") {
+            entry.outboundTag = "direct";
+            needsDirect = true;
+        }
+        else if (target.kind === "block") {
+            entry.outboundTag = "block";
+            needsBlock = true;
+        }
+        else
+            entry.outboundTag = target.tag;
+        return entry;
+    });
+    return { rules: out, needsDirect, needsBlock };
+}
+// Groups a rule's matchers into Clash atom groups (one entry per rule type). A
+// single-type rule expands to one plain line per value; a multi-type rule expands
+// to the cartesian product of one value per type, joined as an AND(...) line.
+// Throws layer-2 errors for matchers Clash cannot express in v1.
+function clashAtomGroups(rule, index) {
+    const groups = new Map();
+    const push = (type, value) => {
+        const list = groups.get(type) ?? [];
+        list.push(value);
+        groups.set(type, list);
+    };
+    for (const value of rule.domain ?? [])
+        push("DOMAIN", value);
+    for (const value of rule.domain_suffix ?? [])
+        push("DOMAIN-SUFFIX", value);
+    for (const value of rule.domain_keyword ?? [])
+        push("DOMAIN-KEYWORD", value);
+    for (const value of rule.domain_regex ?? [])
+        push("DOMAIN-REGEX", value);
+    for (const value of rule.ip_cidr ?? [])
+        push(value.includes(":") ? "IP-CIDR6" : "IP-CIDR", value);
+    for (const value of rule.source_ip_cidr ?? []) {
+        if (value.includes(":"))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: source IPv6 CIDR is not supported for Clash in v1`);
+        push("SRC-IP-CIDR", value);
+    }
+    for (const value of rule.port ?? [])
+        push("DST-PORT", String(value));
+    if (rule.port_range !== undefined)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: port_range is not supported for Clash in v1`);
+    for (const value of rule.source_port ?? [])
+        push("SRC-PORT", String(value));
+    if (rule.network)
+        push("NETWORK", rule.network.toUpperCase());
+    if (rule.protocol !== undefined)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: protocol matcher is not supported for Clash in v1`);
+    for (const value of rule.geoip ?? [])
+        push("GEOIP", value.toUpperCase());
+    for (const value of rule.geosite ?? [])
+        push("GEOSITE", value);
+    return groups;
+}
+function translateClashRules(rules, ctx) {
+    const lines = [];
+    rules.forEach((rule, index) => {
+        const target = resolveTarget(rule, index, ctx.customNames);
+        const action = target.kind === "proxy" ? ctx.proxyGroup : target.kind === "direct" ? "DIRECT" : target.kind === "block" ? "REJECT" : target.tag;
+        const groups = clashAtomGroups(rule, index);
+        const types = [...groups.keys()];
+        if (types.length === 0)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `rule ${index}: at least one matcher is required`);
+        if (types.length === 1) {
+            for (const value of groups.get(types[0]) ?? [])
+                lines.push(`${types[0]},${value},${action}`);
+            return;
+        }
+        const combos = types.reduce((acc, type) => acc.flatMap((combo) => (groups.get(type) ?? []).map((value) => [...combo, `${type},${value}`])), [[]]);
+        for (const combo of combos)
+            lines.push(`AND,(${combo.map((atom) => `(${atom})`).join(",")}),${action}`);
+    });
+    return lines;
+}
+// Layer-1 expanded-line count for the Clash cap. Rules that fail translation
+// (layer 2) contribute nothing here: they fail their own artifact at render.
+function countClashExpandedLines(rules) {
+    let total = 0;
+    rules.forEach((rule, index) => {
+        try {
+            const groups = clashAtomGroups(rule, index);
+            const types = [...groups.keys()];
+            if (types.length === 0)
+                return;
+            if (types.length === 1)
+                total += groups.get(types[0])?.length ?? 0;
+            else
+                total += [...groups.values()].reduce((acc, values) => acc * values.length, 1);
+        }
+        catch {
+            // Layer-2 failure: counted nowhere, fails at render instead.
+        }
+    });
+    return total;
+}
+
+};
+
+__m["output/adapters"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.outputAdapters = void 0;
+const errors_1 = __r("../core/errors");
+const clash_1 = __r("./clash");
+const singbox_1 = __r("./singbox");
+const xray_1 = __r("./xray");
+function asRules(value) {
+    return Array.isArray(value) && value.every((item) => item !== null && typeof item === "object" && !Array.isArray(item))
+        ? value
+        : undefined;
+}
+function asOutbounds(value) {
+    return Array.isArray(value) && value.every((item) => item !== null && typeof item === "object" && !Array.isArray(item))
+        ? value
+        : undefined;
+}
+function xrayOptions(options) {
+    const routingRules = asRules(options?.routingRules);
+    const customOutbounds = asOutbounds(options?.xrayOutbounds);
+    return {
+        ...(routingRules ? { routingRules } : {}),
+        ...(customOutbounds ? { customOutbounds } : {}),
+        ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
+        ...(typeof options?.probeInterval === "string" ? { probeInterval: options.probeInterval } : {}),
+        ...(typeof options?.observatoryConcurrency === "boolean" ? { observatoryConcurrency: options.observatoryConcurrency } : {}),
+        ...(typeof options?.fragmentProfile === "object" && options.fragmentProfile !== null ? { fragmentProfile: options.fragmentProfile } : {}),
+        ...(options?.allowDirectFallback === true ? { allowDirectFallback: true } : {}),
+    };
+}
+function singboxOptions(options) {
+    const routingRules = asRules(options?.routingRules);
+    const customOutbounds = asOutbounds(options?.singboxOutbounds);
+    return {
+        ...(routingRules ? { routingRules } : {}),
+        ...(customOutbounds ? { customOutbounds } : {}),
+        ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
+        ...(typeof options?.interval === "string" ? { interval: options.interval } : {}),
+        ...(typeof options?.tolerance === "number" ? { tolerance: options.tolerance } : {}),
+        ...(typeof options?.fragmentProfile === "object" && options.fragmentProfile !== null ? { fragmentProfile: options.fragmentProfile } : {}),
+        ...(options?.useUtls === true ? { useUtls: true } : {}),
+        ...(options?.enableTun === true ? { enableTun: true } : {}),
+    };
+}
+function intervalSeconds(value) {
+    // Shared base options carry the interval as a sing-box duration string ("30s"), which the
+    // number-only check here used to drop silently for Mihomo (audit F16). Parse both forms.
+    if (typeof value === "number" && Number.isFinite(value) && value > 0)
+        return value;
+    if (typeof value === "string") {
+        const match = value.trim().match(/^(\d+)s?$/);
+        if (match)
+            return Number(match[1]);
+    }
+    return undefined;
+}
+function mihomoOptions(options) {
+    const interval = intervalSeconds(options?.interval);
+    const routingRules = asRules(options?.routingRules);
+    const customOutbounds = asOutbounds(options?.clashProxies);
+    return {
+        ...(routingRules ? { routingRules } : {}),
+        ...(customOutbounds ? { customOutbounds } : {}),
+        ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
+        ...(interval !== undefined ? { interval } : {}),
+        ...(typeof options?.tolerance === "number" ? { tolerance: options.tolerance } : {}),
+        ...(options?.enableTun === true ? { enableTun: true } : {}),
+    };
+}
+exports.outputAdapters = {
+    xray: {
+        format: "xray",
+        render: (nodes, kind = "bundle", options) => {
+            const x = xrayOptions(options);
+            if (kind === "best-ping")
+                return JSON.stringify((0, xray_1.buildXrayBestPingConfig)(nodes, x), null, 2);
+            if (kind === "best-fragment")
+                return JSON.stringify((0, xray_1.buildXrayBestFragmentConfig)(nodes, options?.fragmentProfiles ?? [], x), null, 2);
+            if (kind === "best-ping-fragment")
+                return JSON.stringify((0, xray_1.buildXrayBestPingFragmentConfig)(nodes, options?.fragmentProfiles ?? [], x), null, 2);
+            return JSON.stringify((0, xray_1.buildXrayConfig)(nodes, { ...x, strategy: "roundRobin" }), null, 2);
+        },
+    },
+    "sing-box": {
+        format: "sing-box",
+        render: (nodes, kind = "bundle", options) => {
+            const s = singboxOptions(options);
+            if (kind === "best-ping")
+                return JSON.stringify((0, singbox_1.buildSingboxBestPingConfig)(nodes, s), null, 2);
+            if (kind === "best-fragment")
+                return JSON.stringify((0, singbox_1.buildSingboxBestFragmentConfig)(nodes, options?.fragmentProfiles ?? [], s), null, 2);
+            if (kind === "best-ping-fragment")
+                return JSON.stringify((0, singbox_1.buildSingboxBestPingFragmentConfig)(nodes, options?.fragmentProfiles ?? [], s), null, 2);
+            return JSON.stringify((0, singbox_1.buildSingboxConfig)(nodes, s), null, 2);
+        },
+    },
+    clash: {
+        format: "clash",
+        render: (nodes, kind = "bundle", options) => {
+            // DS-I15: match the artifacts.ts HTTP guard instead of silently
+            // degrading a fragment kind to a plain bundle for direct callers.
+            if (kind === "best-fragment" || kind === "best-ping-fragment") {
+                throw new errors_1.CoreError("UNSUPPORTED_TRANSPORT", "Mihomo/Clash does not expose the Worker fragment profiles in this output model");
+            }
+            const m = mihomoOptions(options);
+            return kind === "best-ping" ? (0, clash_1.buildClashBestPingConfig)(nodes, m) : (0, clash_1.buildClashConfig)(nodes, m);
+        },
+    },
+};
+
+};
+
+__m["output/xray/index"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.buildXrayConfig = buildXrayConfig;
+exports.buildXrayBestPingConfig = buildXrayBestPingConfig;
+exports.buildXrayBestFragmentConfig = buildXrayBestFragmentConfig;
+exports.buildXrayBestPingFragmentConfig = buildXrayBestPingFragmentConfig;
+const errors_1 = __r("../../core/errors");
+const share_link_1 = __r("../share-link");
+const rules_1 = __r("../rules");
+// Render-time custom-outbound check (see the sing-box builder for why startup
+// alone cannot close this gap: generated node tags are dynamic here too).
+// The "proxy-" prefix is rejected because the proxy balancer selects by that
+// prefix: a custom tag with it would be silently absorbed into the balancer,
+// breaking the v1 promise of no automatic group membership.
+function validateCustomOutbounds(items, proxyTags) {
+    const generated = new Set([...proxyTags, "proxy", "proxy-balancer", "direct", "block"]);
+    const seen = new Set();
+    for (const item of items) {
+        const tag = item.tag;
+        if (typeof tag !== "string" || !tag)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Xray outbound requires a non-empty tag");
+        if (seen.has(tag))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' is duplicated`);
+        seen.add(tag);
+        if (generated.has(tag))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' collides with a generated tag`);
+        if (tag.startsWith("proxy-"))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Xray outbound tag '${tag}' must not start with 'proxy-' (the proxy balancer selector would absorb it)`);
+    }
+    return [...items];
+}
+function validateNode(node) {
+    if (node.security === "none") {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray public output requires transport TLS; use the Worker/native model or another compatible target for plaintext nodes");
+    }
+}
+function stream(node, fragmentProfile) {
+    validateNode(node);
+    const streamSettings = {
+        method: "websocket",
+        network: "ws",
+        security: "tls",
+        tlsSettings: {
+            serverName: node.tls?.serverName || node.server,
+            ...(node.tls?.alpn?.length ? { alpn: node.tls.alpn } : {}),
+            ...(node.tls?.fingerprint ? { fingerprint: node.tls.fingerprint } : {}),
+        },
+        wsSettings: {
+            path: (0, share_link_1.effectiveWebSocketPath)(node.websocket.path, node.websocket.earlyData),
+            ...(node.websocket.host ? { host: node.websocket.host } : {}),
+        },
+    };
+    if (fragmentProfile) {
+        streamSettings.finalmask = {
+            tcp: [{
+                    type: "fragment",
+                    settings: {
+                        packets: fragmentProfile.packets,
+                        lengths: [...fragmentProfile.lengths],
+                        delays: [...fragmentProfile.delays],
+                        ...(fragmentProfile.lengths[0] ? { length: fragmentProfile.lengths[0] } : {}),
+                        ...(fragmentProfile.delays[0] ? { delay: fragmentProfile.delays[0] } : {}),
+                        ...(fragmentProfile.maxSplit ? { maxSplit: fragmentProfile.maxSplit } : {}),
+                    },
+                }],
+        };
+    }
+    return streamSettings;
+}
+function outbound(node, index, fragmentProfile) {
+    validateNode(node);
+    const tag = `proxy-${index}`;
+    if (node.protocol === "vless") {
+        return {
+            tag,
+            protocol: "vless",
+            settings: {
+                vnext: [{
+                        address: node.server,
+                        port: node.port,
+                        users: [{ id: node.credential, encryption: "none" }],
+                    }],
+                packetEncoding: "packetaddr",
+            },
+            streamSettings: stream(node, fragmentProfile),
+        };
+    }
+    return {
+        tag,
+        protocol: "trojan",
+        settings: {
+            servers: [{ address: node.server, port: node.port, password: node.credential }],
+        },
+        streamSettings: stream(node, fragmentProfile),
+    };
+}
+function configWithOutbounds(nodes, options, prebuiltOutbounds) {
+    if (!nodes.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray output requires at least one TLS-compatible node");
+    for (const node of nodes)
+        validateNode(node);
+    const outbounds = prebuiltOutbounds ? [...prebuiltOutbounds] : nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile));
+    const proxyTags = outbounds.map((item) => String(item.tag));
+    const strategy = proxyTags.length <= 1 ? "manual" : (options.strategy ?? "roundRobin");
+    const finalTag = proxyTags[0];
+    // Observatory exists to feed leastPing/leastLoad balancers. A roundRobin balancer ignores
+    // probe results, so probing every outbound every interval was pure overhead (audit F14).
+    const observatory = proxyTags.length > 1 && strategy === "leastPing"
+        ? {
+            subjectSelector: ["proxy-"],
+            probeUrl: options.probeUrl ?? "https://www.gstatic.com/generate_204",
+            probeInterval: options.probeInterval ?? "30s",
+            enableConcurrency: options.observatoryConcurrency ?? true,
+        }
+        : undefined;
+    // DS-M9: Xray routing `protocol` rules only match against sniffed
+    // metadata (xtls docs: "You must enable the `sniffing` option in the
+    // inbound proxy to sniff the protocol"). Enable sniffing only when a
+    // user rule actually uses `protocol`, so non-protocol rulesets keep the
+    // previous `enabled: false` inbound byte-for-byte. destOverride is the
+    // explicit, documented set ["http" | "tls" | "quic" | "fakedns"] minus
+    // fakedns (this inbound never serves fake DNS, and bittorrent has no
+    // destination to override — its protocol metadata is still populated
+    // when sniffing is enabled). routeOnly: true is the documented
+    // routing-only mode: sniffed data feeds routing decisions without
+    // resetting the connection destination, which must stay the SOCKS
+    // target the client already chose.
+    const needsSniffing = (options.routingRules ?? []).some((rule) => rule.protocol !== undefined);
+    const singleManual = strategy === "manual" && nodes.length === 1;
+    const customOutbounds = validateCustomOutbounds(options.customOutbounds ?? [], proxyTags);
+    // User rules come first; the existing catch-all stays last. The "proxy"
+    // action resolves to the balancer in multi-node configs and to the single
+    // node tag in single-node configs, exactly like the catch-all does.
+    const translated = options.routingRules?.length
+        ? (0, rules_1.translateXrayRules)(options.routingRules, { multi: !singleManual, finalTag, customTags: new Set(customOutbounds.map((item) => String(item.tag))) })
+        : { rules: [], needsDirect: false, needsBlock: false };
+    // Freedom/blackhole are created on demand by direct/block actions, but only
+    // when no outbound with that tag exists yet (e.g. the opt-in fallback
+    // already provides freedom) — never duplicated.
+    const existingTags = new Set([...proxyTags, ...(options.allowDirectFallback ? ["direct"] : [])]);
+    const onDemand = [];
+    if (translated.needsDirect && !existingTags.has("direct")) {
+        onDemand.push({ tag: "direct", protocol: "freedom" });
+        existingTags.add("direct");
+    }
+    if (translated.needsBlock && !existingTags.has("block")) {
+        onDemand.push({ tag: "block", protocol: "blackhole" });
+        existingTags.add("block");
+    }
+    const routing = singleManual
+        ? { domainStrategy: "AsIs", rules: [...translated.rules, { type: "field", inboundTag: ["socks-in"], outboundTag: finalTag }] }
+        : {
+            domainStrategy: "AsIs",
+            rules: [...translated.rules, { type: "field", inboundTag: ["socks-in"], balancerTag: "proxy-balancer" }],
+            balancers: [{
+                    tag: "proxy-balancer",
+                    selector: ["proxy-"],
+                    strategy: { type: strategy === "leastPing" ? "leastPing" : "roundRobin" },
+                    ...(options.allowDirectFallback ? { fallbackTag: "direct" } : {}),
+                }],
+        };
+    return {
+        log: { loglevel: "warning" },
+        dns: {
+            servers: [
+                "https://cloudflare-dns.com/dns-query",
+                "https://dns.google/dns-query",
+            ],
+            disableFallback: true,
+        },
+        ...(observatory ? { observatory } : {}),
+        inbounds: [{
+                tag: "socks-in",
+                listen: options.listen ?? "127.0.0.1",
+                port: options.socksPort ?? 10808,
+                protocol: "socks",
+                // Trojan supports UDP association in Xray just as VLESS does; gating this on the
+                // presence of a VLESS node silently disabled all UDP for Trojan-only bundles (audit F2).
+                settings: { auth: "noauth", udp: true },
+                sniffing: needsSniffing
+                    ? { enabled: true, destOverride: ["http", "tls", "quic"], routeOnly: true }
+                    : { enabled: false },
+            }],
+        outbounds: [
+            ...outbounds,
+            ...(options.allowDirectFallback ? [{ tag: "direct", protocol: "freedom" }] : []),
+            ...customOutbounds,
+            ...onDemand,
+        ],
+        routing,
+    };
+}
+function buildXrayConfig(nodes, options = {}) {
+    return configWithOutbounds(nodes, options);
+}
+function buildXrayBestPingConfig(nodes, options = {}) {
+    return configWithOutbounds(nodes, { ...options, strategy: "leastPing" });
+}
+function buildXrayFragmentConfig(nodes, profiles, strategy, options = {}) {
+    if (!profiles.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment output requires at least one fragment profile");
+    const expanded = [];
+    for (const node of nodes) {
+        if (node.security !== "tls")
+            continue;
+        for (const profile of profiles)
+            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
+    }
+    if (!expanded.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment output requires at least one TLS-compatible node");
+    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile));
+    return configWithOutbounds(expanded.map((item) => item.node), { ...options, strategy }, outbounds);
+}
+function buildXrayBestFragmentConfig(nodes, profiles, options = {}) {
+    return buildXrayFragmentConfig(nodes, profiles, "leastPing", options);
+}
+function buildXrayBestPingFragmentConfig(nodes, profiles, options = {}) {
+    return buildXrayFragmentConfig(nodes, profiles, "leastPing", options);
+}
+
+};
+
+__m["output/share-link"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.generateShareLink = generateShareLink;
+exports.webSocketPathWithoutEarlyData = webSocketPathWithoutEarlyData;
+exports.effectiveWebSocketPath = effectiveWebSocketPath;
+function appendParams(params) {
+    return params.toString().replace(/%2C/gi, ",");
+}
+function generateShareLink(node, options = {}) {
+    const params = new URLSearchParams();
+    params.set("type", "ws");
+    if (node.websocket.host)
+        params.set("host", node.websocket.host);
+    params.set("path", effectiveWebSocketPath(node.websocket.path, node.websocket.earlyData));
+    if (node.security === "tls") {
+        params.set("security", "tls");
+        const tls = node.tls;
+        if (tls?.serverName)
+            params.set("sni", tls.serverName);
+        if (tls?.fingerprint)
+            params.set("fp", tls.fingerprint);
+        if (tls?.alpn?.length)
+            params.set("alpn", tls.alpn.join(","));
+    }
+    else {
+        params.set("security", "none");
+    }
+    const fragment = options.includeFragment && node.name ? `#${encodeURIComponent(node.name)}` : "";
+    if (node.protocol === "vless") {
+        params.set("encryption", "none");
+        return `vless://${encodeURIComponent(node.credential)}@${formatServer(node.server)}:${node.port}?${appendParams(params)}${fragment}`;
+    }
+    return `trojan://${encodeURIComponent(node.credential)}@${formatServer(node.server)}:${node.port}?${appendParams(params)}${fragment}`;
+}
+/**
+ * Path for cores that carry early data natively (sing-box max_early_data, Mihomo
+ * ws-opts.max-early-data): remove only the `ed=<n>` query parameter and preserve any
+ * other query components the operator configured (audit F8). Xray/share-links keep the
+ * full path including `ed`, per the Xray convention.
+ */
+function webSocketPathWithoutEarlyData(path) {
+    const queryIndex = path.indexOf("?");
+    if (queryIndex < 0)
+        return path;
+    const base = path.slice(0, queryIndex);
+    const kept = path.slice(queryIndex + 1).split("&").filter((pair) => pair && !/^ed=\d+$/.test(pair));
+    return kept.length ? `${base}?${kept.join("&")}` : base;
+}
+function effectiveWebSocketPath(path, earlyData) {
+    if (!earlyData || !Number.isInteger(earlyData) || earlyData <= 0)
+        return path;
+    const separator = path.includes("?") ? "&" : "?";
+    return /(?:^|[?&])ed=\d+(?:&|$)/.test(path) ? path : `${path}${separator}ed=${earlyData}`;
+}
+function formatServer(server) {
+    return server.includes(":") && !server.startsWith("[") ? `[${server}]` : server;
+}
+
+};
+
+__m["output/singbox/index"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.buildSingboxConfig = buildSingboxConfig;
+exports.buildSingboxBestPingConfig = buildSingboxBestPingConfig;
+exports.buildSingboxBestFragmentConfig = buildSingboxBestFragmentConfig;
+exports.buildSingboxBestPingFragmentConfig = buildSingboxBestPingFragmentConfig;
+const errors_1 = __r("../../core/errors");
+const share_link_1 = __r("../share-link");
+const rules_1 = __r("../rules");
+// Custom outbounds are validated here as well as at startup: startup cannot
+// know the generated node tags (proxy-N), so the render-time check closes the
+// collision gap. Order is preserved: custom outbounds follow node outbounds.
+function validateCustomOutbounds(items, proxyTags) {
+    const generated = new Set([...proxyTags, "proxy", "direct", "block"]);
+    const seen = new Set();
+    for (const item of items) {
+        const tag = item.tag;
+        if (typeof tag !== "string" || !tag)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom sing-box outbound requires a non-empty tag");
+        if (seen.has(tag))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom sing-box outbound tag '${tag}' is duplicated`);
+        seen.add(tag);
+        if (generated.has(tag))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom sing-box outbound tag '${tag}' collides with a generated tag`);
+    }
+    return [...items];
+}
+function outbound(node, index, fragmentProfile, _useUtls = false) {
+    // _useUtls is retained for call-site compatibility only. The selected TLS fingerprint is
+    // a first-class output selection: sing-box previously emitted uTLS only when a separate
+    // opt-in flag was set, silently dropping the fingerprint Xray/Mihomo always emit (audit F3).
+    const base = {
+        type: node.protocol,
+        tag: `proxy-${index}`,
+        server: node.server,
+        server_port: node.port,
+    };
+    if (node.protocol === "vless")
+        base.uuid = node.credential;
+    else
+        base.password = node.credential;
+    if (node.protocol === "vless")
+        base.packet_encoding = "packetaddr";
+    if (node.security === "tls") {
+        base.tls = {
+            enabled: true,
+            server_name: node.tls?.serverName || node.server,
+            ...(node.tls?.alpn?.length ? { alpn: node.tls.alpn } : {}),
+            ...(node.tls?.fingerprint ? { utls: { enabled: true, fingerprint: node.tls.fingerprint === "randomized" ? "random" : node.tls.fingerprint } } : {}),
+            ...(fragmentProfile?.fragment ? { fragment: true } : {}),
+            ...(fragmentProfile?.recordFragment ? { record_fragment: true } : {}),
+        };
+    }
+    base.transport = {
+        type: "ws",
+        path: (0, share_link_1.webSocketPathWithoutEarlyData)(node.websocket.path),
+        headers: node.websocket.host ? { Host: node.websocket.host } : {},
+        ...(node.websocket.earlyData ? { max_early_data: node.websocket.earlyData, early_data_header_name: "Sec-WebSocket-Protocol" } : {}),
+    };
+    return base;
+}
+function baseConfig(outbounds, proxyTags, options) {
+    if (!proxyTags.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Sing-box output requires at least one node");
+    const strategy = options.strategy ?? (proxyTags.length === 1 ? "manual" : "manual");
+    const routing = strategy === "manual" && proxyTags.length === 1
+        ? { final: proxyTags[0] }
+        : { final: "proxy" };
+    const customOutbounds = validateCustomOutbounds(options.customOutbounds ?? [], proxyTags);
+    // User rules come first; the existing final stays the catch-all. Custom
+    // outbounds are peers of node outbounds and are deliberately NOT added to
+    // the selector/urltest group (v1: reachable only via rules).
+    const userRules = options.routingRules?.length
+        ? (0, rules_1.translateSingboxRules)(options.routingRules, { finalTag: String(routing.final), customTags: new Set(customOutbounds.map((item) => String(item.tag))) })
+        : [];
+    const group = strategy === "urltest"
+        ? {
+            type: "urltest",
+            tag: "proxy",
+            outbounds: [...proxyTags],
+            url: options.probeUrl ?? "https://www.gstatic.com/generate_204",
+            interval: options.interval ?? "30s",
+            tolerance: options.tolerance ?? 50,
+        }
+        : {
+            type: "selector",
+            tag: "proxy",
+            outbounds: [...proxyTags],
+            default: proxyTags[0],
+        };
+    // sing-box has no `udp` toggle on the SOCKS inbound (UDP association is inherent to its
+    // SOCKS5 implementation); the field is not in the sing-box schema and risks rejection by
+    // strict validation (audit F12).
+    const inbounds = [{
+            type: "socks",
+            tag: "socks-in",
+            listen: "127.0.0.1",
+            listen_port: options.socksPort ?? 2080,
+        }];
+    if (options.enableTun) {
+        inbounds.push({
+            type: "tun",
+            tag: "tun-in",
+            address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+            auto_route: true,
+            auto_detect_interface: true,
+        });
+    }
+    return {
+        log: { level: "warn" },
+        dns: {
+            servers: [
+                { type: "https", tag: "doh-cf", server: "1.1.1.1", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "cloudflare-dns.com" } },
+                { type: "https", tag: "doh-google", server: "8.8.8.8", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "dns.google" } },
+            ],
+            final: "doh-cf",
+        },
+        inbounds,
+        outbounds: [
+            ...outbounds,
+            ...customOutbounds,
+            group,
+            { type: "direct", tag: "direct" },
+        ],
+        route: {
+            ...(userRules.length ? { rules: userRules } : {}),
+            ...routing,
+            // sing-box 1.12 deprecates dialing without a domain resolver: a config
+            // with neither `route.default_domain_resolver` nor a per-outbound
+            // `domain_resolver` is FATAL in strict clients (e.g. v2rayN's bundled
+            // sing-box core) and the legacy behavior is removed in sing-box 1.14.
+            // Point the route default at this config's own final DNS server so
+            // every outbound resolves through it; a per-outbound `domain_resolver`
+            // can still override this default.
+            default_domain_resolver: "doh-cf",
+            auto_detect_interface: true,
+        },
+    };
+}
+function buildSingboxConfig(nodes, socksPortOrOptions = 2080) {
+    const options = typeof socksPortOrOptions === "number" ? { socksPort: socksPortOrOptions } : socksPortOrOptions;
+    const outbounds = nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, options.useUtls));
+    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), options);
+}
+function buildSingboxBestPingConfig(nodes, options = {}) {
+    const outbounds = nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, options.useUtls));
+    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
+}
+function buildSingboxBestFragmentConfig(nodes, profiles, options = {}) {
+    const expanded = [];
+    for (const node of nodes) {
+        if (node.security !== "tls")
+            continue;
+        for (const profile of profiles)
+            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
+    }
+    if (!expanded.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Best Fragment requires at least one TLS-compatible node");
+    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.useUtls));
+    // "Best Fragment" must actually select: a manual selector never tests the fragment
+    // variants, diverging from the Xray leastPing semantics of the same artifact (audit F4).
+    // urltest over the expanded variants mirrors Best Ping Fragment, as in Xray's alias pair.
+    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
+}
+function buildSingboxBestPingFragmentConfig(nodes, profiles, options = {}) {
+    const expanded = [];
+    for (const node of nodes) {
+        if (node.security !== "tls")
+            continue;
+        for (const profile of profiles)
+            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
+    }
+    if (!expanded.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Best Ping Fragment requires at least one TLS-compatible node");
+    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.useUtls));
+    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
+}
+
+};
+
+__m["output/clash/index"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.buildClashConfig = buildClashConfig;
+exports.buildClashBestPingConfig = buildClashBestPingConfig;
+const share_link_1 = __r("../share-link");
+const errors_1 = __r("../../core/errors");
+const rules_1 = __r("../rules");
+function yamlString(value) {
+    // JSON double-quoted strings are valid YAML double-quoted scalars and correctly escape control characters.
+    return JSON.stringify(value);
+}
+// Generic JSON -> YAML block-style emitter for custom proxies. Reuses yamlString
+// for every string scalar, so passwords containing ':' or '#' stay quoted. Keys
+// that are not plain identifiers are quoted as well. Throws on undefined and
+// non-finite numbers instead of emitting something Mihomo would misread.
+function yamlScalar(value) {
+    if (typeof value === "string")
+        return yamlString(value);
+    if (typeof value === "number" && Number.isFinite(value))
+        return String(value);
+    if (typeof value === "boolean")
+        return value ? "true" : "false";
+    if (value === null)
+        return "null";
+    throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Clash proxy contains an unsupported value type");
+}
+function yamlKey(key) {
+    return /^[A-Za-z0-9_-]+$/.test(key) ? key : yamlString(key);
+}
+function yamlValueLines(value, indent) {
+    const pad = " ".repeat(indent);
+    if (Array.isArray(value)) {
+        if (!value.length)
+            return [`${pad}[]`];
+        const lines = [];
+        for (const item of value) {
+            if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+                const sub = yamlObjectLines(item, indent + 2);
+                lines.push(`${pad}- ${sub[0].slice(indent + 2)}`, ...sub.slice(1));
+            }
+            else if (Array.isArray(item)) {
+                lines.push(`${pad}-`);
+                lines.push(...yamlValueLines(item, indent + 2));
+            }
+            else {
+                lines.push(`${pad}- ${yamlScalar(item)}`);
+            }
+        }
+        return lines;
+    }
+    if (value !== null && typeof value === "object")
+        return yamlObjectLines(value, indent);
+    return [`${pad}${yamlScalar(value)}`];
+}
+function yamlObjectLines(obj, indent) {
+    // DS-M12: an empty object has no YAML block form here. Emitting it would
+    // either crash the array branch (sub[0] of []) with a raw TypeError or
+    // leave a dangling `key:` that parses as null. Fail closed instead.
+    // This single guard covers array items (via yamlValueLines), nested
+    // objects (via the object branch below) and the top-level proxy object.
+    if (Object.keys(obj).length === 0)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Clash proxy contains an empty object, which has no valid YAML block form");
+    const pad = " ".repeat(indent);
+    const lines = [];
+    for (const [key, value] of Object.entries(obj)) {
+        if (value === undefined)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Clash proxy contains an undefined value");
+        if (Array.isArray(value)) {
+            if (!value.length) {
+                lines.push(`${pad}${yamlKey(key)}: []`);
+                continue;
+            }
+            lines.push(`${pad}${yamlKey(key)}:`);
+            lines.push(...yamlValueLines(value, indent + 2));
+        }
+        else if (value !== null && typeof value === "object") {
+            lines.push(`${pad}${yamlKey(key)}:`);
+            lines.push(...yamlObjectLines(value, indent + 2));
+        }
+        else {
+            lines.push(`${pad}${yamlKey(key)}: ${yamlScalar(value)}`);
+        }
+    }
+    return lines;
+}
+// One proxy object as a "- " block item at the proxies: indentation.
+function proxyYamlLines(proxy) {
+    const lines = yamlObjectLines(proxy, 4);
+    if (!lines.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Clash proxy must not be empty");
+    lines[0] = `  - ${lines[0].slice(4)}`;
+    return lines;
+}
+// Render-time custom-proxy check (startup cannot know generated node names).
+// PROXY is the generated group name; DIRECT/REJECT are rule actions, so a proxy
+// with those names could never be targeted by a rule.
+function validateCustomProxies(items, nodeNames) {
+    const generated = new Set(nodeNames);
+    const seen = new Set();
+    for (const item of items) {
+        const name = item.name;
+        if (typeof name !== "string" || !name)
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "Custom Clash proxy requires a non-empty name");
+        if (seen.has(name))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Clash proxy name '${name}' is duplicated`);
+        seen.add(name);
+        if (name === "PROXY" || name.toUpperCase() === "DIRECT" || name.toUpperCase() === "REJECT") {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Clash proxy name '${name}' collides with a generated name or a rule action`);
+        }
+        if (generated.has(name))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", `Custom Clash proxy name '${name}' collides with a generated node name`);
+    }
+    return [...items];
+}
+function nodeYaml(node) {
+    const lines = [
+        `  - name: ${yamlString(node.name)}`,
+        `    type: ${node.protocol}`,
+        `    server: ${yamlString(node.server)}`,
+        `    port: ${node.port}`,
+    ];
+    if (node.protocol === "vless") {
+        lines.push(`    uuid: ${yamlString(node.credential)}`);
+    }
+    else {
+        if (node.security !== "tls")
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "Mihomo Trojan output requires TLS for public configurations");
+        lines.push(`    password: ${yamlString(node.credential)}`);
+    }
+    // Mihomo supports UDP for Trojan as well as VLESS; emitting udp:false for Trojan silently
+    // disabled UDP for Trojan-only bundles (audit F2).
+    lines.push("    udp: true");
+    if (node.security === "tls") {
+        lines.push("    tls: true");
+        const tlsServerName = yamlString(node.tls?.serverName || node.server);
+        lines.push(`    ${node.protocol === "trojan" ? "sni" : "servername"}: ${tlsServerName}`);
+        if (node.tls?.alpn?.length) {
+            lines.push("    alpn:");
+            for (const value of node.tls.alpn)
+                lines.push(`      - ${yamlString(value)}`);
+        }
+        if (node.tls?.fingerprint)
+            lines.push(`    client-fingerprint: ${yamlString(node.tls.fingerprint === "randomized" ? "random" : node.tls.fingerprint)}`);
+    }
+    lines.push("    network: ws", "    ws-opts:");
+    lines.push(`      path: ${yamlString((0, share_link_1.webSocketPathWithoutEarlyData)(node.websocket.path))}`);
+    if (node.websocket.earlyData) {
+        lines.push(`      max-early-data: ${node.websocket.earlyData}`);
+        lines.push("      early-data-header-name: Sec-WebSocket-Protocol");
+    }
+    if (node.websocket.host)
+        lines.push("      headers:", `        Host: ${yamlString(node.websocket.host)}`);
+    return lines;
+}
+function baseYaml(nodes, groupType, groupUrl, interval, tolerance, mixedPort = 7890, optionsEnableTunPlaceholder = false, routingRules = [], customProxies = []) {
+    if (!nodes.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Mihomo output requires at least one node");
+    const custom = validateCustomProxies(customProxies, nodes.map((node) => node.name));
+    // User rules come first; MATCH,PROXY stays last. Custom proxies are peers
+    // of node proxies and are deliberately NOT added to the PROXY group (v1:
+    // reachable only via rules). GEOSITE/AND lines mean this output targets
+    // Mihomo, not original Clash Premium (documented in OUTPUTS.md).
+    const ruleLines = routingRules.length
+        ? (0, rules_1.translateClashRules)(routingRules, { proxyGroup: "PROXY", customNames: new Set(custom.map((item) => String(item.name))) })
+        : [];
+    // DS-L24: GEOSITE lines and AND(...) multi-matcher lines are Mihomo-only
+    // (original Clash Premium has neither). Flag the file in-band so an
+    // operator importing it into Clash Premium sees the requirement instead
+    // of silently unsupported rules; the matching manifest entry is added
+    // in artifacts.ts.
+    const needsMihomo = ruleLines.some((line) => line.startsWith("GEOSITE,") || line.startsWith("AND,"));
+    const lines = [
+        ...(needsMihomo ? ["# Requires Mihomo (not original Clash Premium)"] : []),
+        `mixed-port: ${mixedPort}`,
+        "allow-lan: false",
+        "mode: rule",
+        "proxies:",
+    ];
+    for (const node of nodes)
+        lines.push(...nodeYaml(node));
+    for (const proxy of custom)
+        lines.push(...proxyYamlLines(proxy));
+    lines.push("proxy-groups:", "  - name: PROXY", `    type: ${groupType}`, "    proxies:");
+    for (const node of nodes)
+        lines.push(`      - ${yamlString(node.name)}`);
+    if (groupType === "url-test") {
+        lines.push(`    url: ${yamlString(groupUrl ?? "https://www.gstatic.com/generate_204")}`);
+        lines.push(`    interval: ${interval ?? 30}`);
+        lines.push(`    tolerance: ${tolerance ?? 50}`);
+    }
+    lines.push("dns:", "  enable: true", "  ipv6: true", "  enhanced-mode: fake-ip", "  nameserver:", "    - https://cloudflare-dns.com/dns-query", "    - https://dns.google/dns-query", "  fallback:", "    - tls://1.1.1.1:853", "    - tls://8.8.8.8:853", "  respect-rules: true");
+    if (optionsEnableTunPlaceholder) {
+        lines.push("tun:", "  enable: true", "  stack: system", "  auto-route: true", "  auto-detect-interface: true", "  dns-hijack:", "    - any:53");
+    }
+    lines.push("rules:");
+    for (const line of ruleLines)
+        lines.push(`  - ${line}`);
+    lines.push("  - MATCH,PROXY", "");
+    return lines.join("\n");
+}
+function buildClashConfig(nodes, options = 7890) {
+    const config = typeof options === "number" ? { mixedPort: options } : options;
+    return baseYaml(nodes, config.groupStrategy ?? "select", config.probeUrl, config.interval, config.tolerance, config.mixedPort ?? 7890, config.enableTun ?? false, config.routingRules ?? [], config.customOutbounds ?? []);
+}
+function buildClashBestPingConfig(nodes, options = {}) {
+    return baseYaml(nodes, "url-test", options.probeUrl, options.interval, options.tolerance, options.mixedPort ?? 7890, options.enableTun ?? false, options.routingRules ?? [], options.customOutbounds ?? []);
+}
+
+};
+
 __m["runtime/runtime"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -4851,7 +7398,7 @@ function signature(env, config) {
         raw: [
             env.CORE_PROXYIP_HANDSHAKE_TIMEOUT_MS, env.CORE_CREDENTIAL_MODE, env.EGRESS_MODE, env.PROXY_IP, env.PROXY_IPS, env.PROXY_IP_ENDPOINTS_JSON, env.PROXY_IP_TLS, env.PROXY_IP_USERNAME, env.PROXY_IP_PASSWORD,
             env.NAT64_PREFIXES, env.PROXY_RELAY_ENDPOINTS, env.CORE_MAX_PROXYIP_FAILURES, env.CORE_PROXYIP_COOLDOWN_MS, env.CORE_RULES, env.DNS_ENABLED, env.DNS_RESOLVERS, env.DNS_CACHE, env.DNS_CACHE_MAX_ENTRIES, env.DNS_CACHE_MAX_TTL, env.DNS_CACHE_NEGATIVE_TTL,
-            env.DNS_TIMEOUT_MS, env.DNS_RETRIES, env.DNS_FALLBACK, env.DNS_IP_PREFERENCE, env.DNS_HOSTS, Boolean(env.DB), env.VLESS_USERS, env.TROJAN_USERS,
+            env.DNS_TIMEOUT_MS, env.DNS_RETRIES, env.DNS_FALLBACK, env.DNS_IP_PREFERENCE, env.DNS_HOSTS, env.DNS_MAX_RESOLVERS, Boolean(env.DB), env.VLESS_USERS, env.TROJAN_USERS,
         ],
     });
 }
@@ -4867,12 +7414,28 @@ function runtimeFor(env) {
     egress.register(new direct_1.DirectEgress(config.egressConnectTimeoutMs, dns, config.addressRace));
     const mode = (0, router_1.parseEgressMode)(env.EGRESS_MODE);
     const proxyip = (0, proxyip_1.hasProxyIp)(env);
-    if ((mode === "proxyip" || mode === "fallback" || mode === "smart") && proxyip) {
+    const parsedRules = (0, rules_1.parseCoreRules)(env.CORE_RULES);
+    const rulesUseProxyIp = parsedRules.some((rule) => rule.egress === "proxyip" || rule.fallbackEgress === "proxyip");
+    const rulesUseNat64 = parsedRules.some((rule) => rule.egress === "nat64" || rule.fallbackEgress === "nat64");
+    // DS-M3: mirror the A5 relay pattern for proxyip and nat64. A provider
+    // that is configured (or selected by a rule) must be registered
+    // regardless of EGRESS_MODE: previously EGRESS_MODE=direct with a
+    // proxyip/nat64 rule passed startup validation and reported ready, yet
+    // every matching session failed with ROUTE_FAILED because no dialer was
+    // registered. Providers that are genuinely unconfigured still yield
+    // ROUTE_FAILED (the registry simply has no such dialer), and the router's
+    // mode switch is untouched, so non-rule traffic keeps its mode behavior.
+    // The NAT64 default (WKP) counts as available prefixes here, matching the
+    // previous nat64/smart defaulting; startup validation still rejects a
+    // nat64 rule when neither explicit prefixes nor a nat64/smart mode
+    // declare the provider, so the validated path cannot silently gain a
+    // translator it did not declare.
+    if (proxyip || rulesUseProxyIp) {
         egress.register((0, proxyip_pool_1.buildProxyIpPool)(env, config.egressConnectTimeoutMs));
     }
-    const nat64Raw = env.NAT64_PREFIXES?.trim() || (((mode === "nat64" || mode === "smart") ? defaults_1.DEFAULT_NAT64_PREFIXES.join(",") : ""));
+    const nat64Raw = env.NAT64_PREFIXES?.trim() || defaults_1.DEFAULT_NAT64_PREFIXES.join(",");
     const prefixes = (0, nat64_1.parseNat64Prefixes)(nat64Raw);
-    const nat64 = (mode === "nat64" || mode === "smart") && prefixes.length > 0;
+    const nat64 = prefixes.length > 0 && (rulesUseNat64 || mode === "nat64" || mode === "smart" || Boolean(env.NAT64_PREFIXES?.trim()));
     if (nat64) {
         egress.register(new nat64_1.Nat64Egress(prefixes, config.egressConnectTimeoutMs, new nat64_1.DnsNat64AddressResolver(dns)));
     }
@@ -4882,7 +7445,7 @@ function runtimeFor(env) {
     // CORE_RULES here while the router was told relay exists purely from
     // endpoint presence, so the router could select an unregistered dialer (or
     // vice versa). Parse the rules with the canonical parser instead.
-    const rulesUseRelay = (0, rules_1.parseCoreRules)(env.CORE_RULES).some((rule) => rule.egress === "relay" || rule.fallbackEgress === "relay");
+    const rulesUseRelay = parsedRules.some((rule) => rule.egress === "relay" || rule.fallbackEgress === "relay");
     const relay = relayEndpoints.length > 0 && (mode === "smart" || rulesUseRelay);
     if (relay) {
         egress.register(new relay_1.RawTcpRelayEgress(relayEndpoints, config.egressConnectTimeoutMs));
@@ -5243,7 +7806,38 @@ class CredentialRepository {
         const primaryCount = await this.primary.count?.(protocol, signal) ?? 0;
         if (offset < primaryCount) {
             const page = await this.primary.listPage?.(protocol, offset, limit, signal) ?? [];
-            return page.filter((record) => record.enabled !== false);
+            const primaryPage = page.filter((record) => record.enabled !== false);
+            // DS-H3: a short primary page is NOT the end of the combined list.
+            // When the requested window reaches past the primary region, fill the
+            // remainder of the page with unique fallback records, mirroring the
+            // offset >= primaryCount branch below. Without this, list() stopped
+            // at the first page shorter than 256 (e.g. 100 D1 + 50 env records
+            // returned only the 100 D1 records) while count() reported 150.
+            // A full primary page needs no fallback records, and a window that
+            // does not reach the primary end cannot be filled yet.
+            if (primaryPage.length >= limit || offset + primaryPage.length < primaryCount)
+                return primaryPage;
+            const primaryKeys = await this.getPrimaryKeys(protocol, signal);
+            const out = [...primaryPage];
+            const pageSize = Math.max(256, Math.min(1024, limit * 4));
+            for (let sourceOffset = 0; out.length < limit; sourceOffset += pageSize) {
+                const fallbackPage = await this.fallback.listPage?.(protocol, sourceOffset, pageSize, signal)
+                    ?? (sourceOffset === 0 ? (await this.fallback.list?.(protocol, signal) ?? []) : []);
+                if (!fallbackPage.length)
+                    break;
+                for (const record of fallbackPage) {
+                    if (record.enabled === false)
+                        continue;
+                    if (primaryKeys.has(credentialKey(record)))
+                        continue;
+                    out.push(record);
+                    if (out.length >= limit)
+                        return out;
+                }
+                if (fallbackPage.length < pageSize || !this.fallback.listPage)
+                    break;
+            }
+            return out;
         }
         const primaryKeys = await this.getPrimaryKeys(protocol, signal);
         let logicalOffset = offset - primaryCount;
@@ -5408,15 +8002,64 @@ function bytesToUuid(bytes) {
     const hex = bytesToHex(bytes);
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
+// DS-L12: a multi-colon host is only meaningful as an IPv6 literal, so it
+// is validated here instead of failing later in a SOCKS address encoder.
+// Mirrors the sibling IPv6 parsers (proxyip/nat64): "::" must compress at
+// least one group, a dotted-quad tail counts as two groups and is only
+// legal as the final token, and every other group is 1-4 hex digits.
+function isValidIpv6Literal(input) {
+    if (!input.includes(":"))
+        return false;
+    const sides = input.split("::");
+    if (sides.length > 2)
+        return false;
+    const countSide = (side, isFinalSide) => {
+        if (!side)
+            return 0;
+        const tokens = side.split(":");
+        let count = 0;
+        for (const [index, token] of tokens.entries()) {
+            if (token.includes(".")) {
+                if (!isFinalSide || index !== tokens.length - 1)
+                    return null;
+                const octets = token.split(".");
+                if (octets.length !== 4 || octets.some((part) => !/^\d{1,3}$/.test(part) || Number(part) > 255))
+                    return null;
+                count += 2;
+                continue;
+            }
+            if (!/^[0-9a-fA-F]{1,4}$/.test(token))
+                return null;
+            count += 1;
+        }
+        return count;
+    };
+    const left = countSide(sides[0], sides.length === 1);
+    const right = sides.length === 2 ? countSide(sides[1], true) : null;
+    if (left === null || right === null)
+        return false;
+    return sides.length === 2 ? left + right < 8 : left === 8;
+}
 function parseHostPort(value, defaultPort) {
     const raw = value.trim();
     if (!raw)
         throw new Error("Empty endpoint");
+    // DS-M4: a host:port value is never a URL. Characters that only make
+    // sense as URL syntax (scheme slashes, userinfo "@", query/fragment)
+    // mean a credential-bearing or otherwise non-host string was passed in;
+    // rejecting it here guarantees such a string can never be retained as a
+    // hostname (and later echoed into an error message) by any caller.
+    if (/[\s/?#@]/.test(raw))
+        throw new Error("Invalid endpoint");
     if (raw.startsWith("[")) {
         const close = raw.indexOf("]");
         if (close < 0)
             throw new Error("Invalid bracketed endpoint");
         const host = raw.slice(1, close);
+        if (!host)
+            throw new Error("Empty host");
+        if (!isValidIpv6Literal(host))
+            throw new Error("Invalid IPv6 literal");
         const rest = raw.slice(close + 1);
         if (!rest)
             return { host, port: defaultPort };
@@ -5430,12 +8073,17 @@ function parseHostPort(value, defaultPort) {
         return { host, port };
     }
     const colonCount = (raw.match(/:/g) ?? []).length;
-    if (colonCount > 1)
+    if (colonCount > 1) {
+        if (!isValidIpv6Literal(raw))
+            throw new Error("Invalid IPv6 literal");
         return { host: raw, port: defaultPort };
+    }
     const idx = raw.lastIndexOf(":");
     if (idx < 0)
         return { host: raw, port: defaultPort };
     const host = raw.slice(0, idx);
+    if (!host)
+        throw new Error("Empty host");
     const portText = raw.slice(idx + 1);
     if (!/^\d+$/.test(portText))
         throw new Error("Invalid port");
@@ -5606,7 +8254,14 @@ function parseCoreRule(entry) {
     }
 }
 function parseCoreRules(raw) {
-    return (raw ?? "").split(/[\r\n]+/).map((value) => value.trim()).filter(Boolean).map(parseCoreRule);
+    // DS-H2: split on commas as well as newlines, exactly like validation's
+    // splitList (src/config/validation.ts) and the documented grammar
+    // ("Comma-separated ordered rules"). Splitting only on newlines let a
+    // comma-form value pass startup validation and then throw in runtimeFor
+    // before any session was accepted. Rule entries contain no commas
+    // (hostnames, ports and egress names cannot), so the comma is an
+    // unambiguous entry separator here.
+    return (raw ?? "").split(/[\r\n,]+/).map((value) => value.trim()).filter(Boolean).map(parseCoreRule);
 }
 exports.CORE_RULE_EGRESS_TYPES = Object.freeze(["direct", "proxyip", "relay", "nat64"]);
 
@@ -5743,6 +8398,12 @@ function parseIpv6Bytes(value) {
     };
     const left = parseSide(sides[0] ?? "", sides.length === 1);
     const right = parseSide(sides[1] ?? "", sides.length === 2);
+    // DS-L14: "::" must compress at least one group. An address that
+    // already has 8 explicit groups plus "::" (e.g.
+    // "64:ff9b:0:0:0:0:0:0::") is overfull and must be rejected, not
+    // silently normalised to "64:ff9b::" — matching the sibling parsers.
+    if (sides.length === 2 && 8 - left.length - right.length < 1)
+        throw new Error("invalid IPv6 group count");
     const groups = sides.length === 2
         ? [...left, ...new Array(8 - left.length - right.length).fill(0), ...right]
         : left;
@@ -5990,7 +8651,13 @@ async function connectTcp(destination, signal, timeoutMs, secureTransport = "off
         if (error instanceof DOMException && error.name === "AbortError") {
             throw new errors_1.CoreError("CLIENT_CLOSED", "Connection aborted", false, { cause: error });
         }
-        throw new errors_1.CoreError("EGRESS_FAILED", `TCP connection failed to ${destination.host}:${destination.port}`, true, { cause: error });
+        // DS-M4: the destination host is operator/client-controlled data and
+        // must never be echoed when it looks credential-bearing (a legacy
+        // socks5:// URL that escaped parsing). Ordinary hosts/IPv6 literals
+        // keep the useful host:port detail; anything URL-shaped gets a
+        // generic message so a password can never reach logs via this path.
+        const hostLooksCredentialBearing = /[\s/?#@]/.test(destination.host) || destination.host.includes("://");
+        throw new errors_1.CoreError("EGRESS_FAILED", hostLooksCredentialBearing ? "TCP connection failed" : `TCP connection failed to ${destination.host}:${destination.port}`, true, { cause: error });
     }
     finally {
         if (timer !== undefined)
@@ -6165,6 +8832,7 @@ __m["egress/proxyip"] = function(module, exports, __r) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ProxyIpEgress = void 0;
 exports.performSocks5Connect = performSocks5Connect;
+exports.parseLegacyProxyIpEntry = parseLegacyProxyIpEntry;
 exports.hasProxyIp = hasProxyIp;
 const limits_1 = __r("../core/limits");
 const errors_1 = __r("../core/errors");
@@ -6241,7 +8909,10 @@ class ProxyIpEgress {
             tls: tlsModes.size === 1 ? [...tlsModes][0] : "mixed",
             authentication: authModes.size === 1 ? [...authModes][0] : "mixed",
             cooled_down: states.filter((state) => state.state === "open" && state.cooldownUntil > now).length,
-            successes: Math.round(states.reduce((sum, state) => sum + state.successEwma, 0)),
+            // DS-I6: successes is a real integer count, never the sum of the
+            // 0.5 EWMA scoring priors (a fresh pool previously reported
+            // round(3 x 0.5) = 2 successes with zero real successes).
+            successes: states.reduce((sum, state) => sum + state.successes, 0),
             failures: states.reduce((sum, state) => sum + state.consecutiveFailures, 0),
         };
     }
@@ -6252,7 +8923,7 @@ class ProxyIpEgress {
         const existing = this.health.get(key);
         if (existing)
             return existing;
-        const created = { consecutiveFailures: 0, successEwma: 0.5, ewmaLatencyMs: null, cooldownUntil: 0, state: "closed", probeInFlight: false };
+        const created = { consecutiveFailures: 0, successEwma: 0.5, successes: 0, ewmaLatencyMs: null, cooldownUntil: 0, state: "closed", probeInFlight: false };
         this.health.set(key, created);
         return created;
     }
@@ -6279,6 +8950,7 @@ class ProxyIpEgress {
     }
     markSuccess(key, latency) {
         const state = this.stateFor(key);
+        state.successes += 1;
         state.successEwma = state.successEwma * 0.8 + 1 * 0.2;
         state.consecutiveFailures = 0;
         state.cooldownUntil = 0;
@@ -6682,15 +9354,71 @@ async function raceWithAbort(promise, signal) {
             signal.removeEventListener("abort", onAbort);
     }
 }
+// DS-M4: the documented legacy grammar (docs/CONFIGURATION.md,
+// docs/EGRESS.md §3.1) is [socks5://[user:pass@]]host[:port], plus the
+// plain host / host:port / [ipv6]:port forms. The scheme is stripped and
+// userinfo is extracted into per-endpoint credentials (RFC 1929); the
+// stored host is always the bare host, so a credential-bearing string is
+// never retained as a hostname and never interpolated into an error.
+// Userinfo is percent-decoded (URL semantics); a malformed escape, an
+// empty host, or a bad port throws and is wrapped by the caller as
+// CONFIGURATION_ERROR without echoing the raw entry.
+function parseLegacyProxyIpEntry(value, defaultPort) {
+    const raw = value.trim();
+    if (!raw)
+        throw new Error("Empty endpoint");
+    let remainder = raw;
+    let credentials;
+    if (/^socks5:\/\//i.test(raw)) {
+        remainder = raw.slice("socks5://".length);
+        if (!remainder)
+            throw new Error("Empty socks5 endpoint");
+        const at = remainder.lastIndexOf("@");
+        if (at >= 0) {
+            const userinfo = remainder.slice(0, at);
+            remainder = remainder.slice(at + 1);
+            if (!userinfo || !remainder)
+                throw new Error("Invalid socks5 endpoint");
+            const colon = userinfo.indexOf(":");
+            const decode = (text) => {
+                try {
+                    return decodeURIComponent(text);
+                }
+                catch {
+                    throw new Error("Invalid socks5 userinfo encoding");
+                }
+            };
+            credentials = colon < 0
+                ? { username: decode(userinfo) }
+                : { username: decode(userinfo.slice(0, colon)), password: decode(userinfo.slice(colon + 1)) };
+        }
+    }
+    const parsed = (0, binary_1.parseHostPort)(remainder, defaultPort);
+    if (!parsed.host)
+        throw new Error("Empty host");
+    return { host: parsed.host, port: parsed.port, credentials };
+}
 function parseProxyIpEndpoints(env) {
     const structuredRaw = env.PROXY_IP_ENDPOINTS_JSON?.trim();
     const result = [];
     const seen = new Set();
     const add = (host, port, tls, credentials) => {
         const normalizedHost = host.trim();
-        (0, binary_1.validatePort)(port);
+        // DS-L13: a plain Error from validatePort would surface as 500
+        // INTERNAL via worker.ts; every parse failure here is a configuration
+        // error and must surface as 503 CONFIGURATION_ERROR.
+        try {
+            (0, binary_1.validatePort)(port);
+        }
+        catch (error) {
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "ProxyIP endpoint port must be an integer from 1 to 65535", false, { cause: error });
+        }
         if (!normalizedHost)
             throw new errors_1.CoreError("CONFIGURATION_ERROR", "ProxyIP host is empty");
+        // DS-M4: never retain a credential-bearing string as a hostname, on
+        // either the structured or the legacy path (see parseLegacyEntry).
+        if (/[\s/?#@]/.test(normalizedHost))
+            throw new errors_1.CoreError("CONFIGURATION_ERROR", "ProxyIP host must not contain URL syntax");
         if ((credentials.username && !credentials.password) || (!credentials.username && credentials.password))
             throw new errors_1.CoreError("CONFIGURATION_ERROR", "ProxyIP endpoint username/password must be configured together");
         const key = endpointIdentityKey(normalizedHost, port, tls, credentials.username, credentials.password);
@@ -6724,7 +9452,11 @@ function parseProxyIpEndpoints(env) {
         }
     }
     else {
-        const rawValues = [env.PROXY_IP ?? "", ...(env.PROXY_IPS ?? "").split(/[,\r\n]+/)];
+        // DS-M4: PROXY_IP is documented (and validated in config/validation)
+        // as a comma-separated list, same as PROXY_IPS — not a single value.
+        // Splitting it here too means a comma-separated PROXY_IP actually
+        // yields its endpoints instead of one un-dialable comma-joined host.
+        const rawValues = [...(env.PROXY_IP ?? "").split(/[,\r\n]+/), ...(env.PROXY_IPS ?? "").split(/[,\r\n]+/)];
         const tls = parseBoolean(env.PROXY_IP_TLS);
         const username = env.PROXY_IP_USERNAME?.trim();
         const password = env.PROXY_IP_PASSWORD;
@@ -6735,8 +9467,20 @@ function parseProxyIpEndpoints(env) {
             const value = raw.trim();
             if (!value)
                 continue;
-            const parsed = (0, binary_1.parseHostPort)(value, limits_1.CORE_LIMITS.defaultProxyIpPort);
-            add(parsed.host, parsed.port ?? limits_1.CORE_LIMITS.defaultProxyIpPort, tls, credentials);
+            try {
+                const entry = parseLegacyProxyIpEntry(value, limits_1.CORE_LIMITS.defaultProxyIpPort);
+                // Per-endpoint credentials from a socks5:// URL win over the
+                // global PROXY_IP_USERNAME/PROXY_IP_PASSWORD for that endpoint;
+                // entries without userinfo fall back to the global pair.
+                add(entry.host, entry.port ?? limits_1.CORE_LIMITS.defaultProxyIpPort, tls, entry.credentials ?? credentials);
+            }
+            catch (error) {
+                if (error instanceof errors_1.CoreError)
+                    throw error;
+                // DS-M4/DS-L13: never echo the raw entry — it may carry a
+                // password — and never let a plain parse Error become a 500.
+                throw new errors_1.CoreError("CONFIGURATION_ERROR", "Invalid PROXY_IP/PROXY_IPS endpoint", false, { cause: error });
+            }
             if (result.length > limits_1.CORE_LIMITS.maxProxyIpEndpoints)
                 throw new errors_1.CoreError("CONFIGURATION_ERROR", `Too many ProxyIP endpoints; maximum is ${limits_1.CORE_LIMITS.maxProxyIpEndpoints}`);
         }
@@ -6787,7 +9531,6 @@ __m["egress/relay"] = function(module, exports, __r) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.RawTcpRelayEgress = void 0;
 exports.parseRelayEndpoints = parseRelayEndpoints;
-exports.hasRelay = hasRelay;
 const errors_1 = __r("../core/errors");
 const limits_1 = __r("../core/limits");
 const lifecycle_1 = __r("../util/lifecycle");
@@ -6855,10 +9598,15 @@ function parseRelayEndpoints(raw) {
             out.push(endpoint);
         }
     }
+    // DS-I7: same 64 cap as maxProxyIpEndpoints, for symmetry. The
+    // per-connect rotation already sliced to 64, but the parsed list,
+    // dedupe set and per-endpoint health map previously grew without
+    // bound with the operator's list. Fail closed (throw) rather than
+    // silently truncating, matching the ProxyIP over-cap behaviour.
+    if (out.length > limits_1.CORE_LIMITS.maxProxyIpEndpoints) {
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `Too many relay endpoints; maximum is ${limits_1.CORE_LIMITS.maxProxyIpEndpoints}`);
+    }
     return out;
-}
-function hasRelay(env) {
-    return parseRelayEndpoints(env.PROXY_RELAY_ENDPOINTS).length > 0;
 }
 // Raw TCP relay semantics (audit fix E4, explicit): this egress dials the
 // operator-configured relay endpoint and hands over the raw byte stream.
@@ -7218,6 +9966,14 @@ function decodeVlessFlow(addons) {
         const wireType = tag % 8;
         if (field === 0)
             throw invalid();
+        // DS-L11: field 1 is the flow string, which is a length-delimited
+        // (wire type 2) field. Any other wire type for field 1 (e.g. the
+        // varint addons [0x08, 0x01]) is malformed protobuf for this message
+        // and must be rejected, not silently skipped as an unknown field —
+        // skipping it would accept a purported flow-carrying addon as a plain
+        // stream. Unknown fields keep protobuf skip semantics.
+        if (field === 1 && wireType !== 2)
+            throw invalid();
         switch (wireType) {
             case 0:
                 readVarint();
@@ -7453,7 +10209,13 @@ class ProxyEngine {
             engineAbort.abort("connection finished");
             sessionSignal.dispose();
             baseSignal.dispose();
-            await sessionConnection?.close().catch(() => { });
+            // DS-L9: same 1 s close bound as bridgeSession (see
+            // closeUpstreamWithTimeout): a hanging egress close must not stall
+            // the engine finally block.
+            if (sessionConnection) {
+                const connection = sessionConnection;
+                await (0, bridge_1.closeUpstreamWithTimeout)(() => connection.close());
+            }
         }
     }
     orderForDecision(decision) {
@@ -7583,6 +10345,7 @@ __m["connection/bridge"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.bridgeSession = bridgeSession;
+exports.closeUpstreamWithTimeout = closeUpstreamWithTimeout;
 const errors_1 = __r("../core/errors");
 const lifecycle_1 = __r("../util/lifecycle");
 /** Streaming read chunk size for the upload pump; deliberately independent of
@@ -7723,6 +10486,13 @@ async function bridgeSession(reader, clientWriter, upstream, options) {
             const safeToRetry = !state.clientClosed && state.uploadedAfterHandshake === 0 && isReplaySafeInitialPayload(options.session.initialPayload);
             return { kind: "upstream-empty", firstByteReceived: false, firstByteLatencyMs: undefined, responseHeaderSent: state.responseHeaderSent, safeToRetry, error: new errors_1.CoreError("UPSTREAM_CLOSED", "Upstream closed before sending data", true) };
         }
+        // DS-L8: a client that closed mid-download is not a "completed"
+        // session, even though no failure was recorded and resources were
+        // freed; report it as client-closed so metrics do not count it as a
+        // successful completion.
+        if (state.clientClosed) {
+            return { kind: "client-closed", firstByteReceived: state.firstByteReceived, firstByteLatencyMs: firstByteAt === undefined ? undefined : Math.max(0, firstByteAt - bridgeStartedAt), responseHeaderSent: state.responseHeaderSent, safeToRetry: false };
+        }
         return { kind: "completed", firstByteReceived: state.firstByteReceived, firstByteLatencyMs: firstByteAt === undefined ? undefined : Math.max(0, firstByteAt - bridgeStartedAt), responseHeaderSent: state.responseHeaderSent, safeToRetry: false };
     }
     catch (error) {
@@ -7738,15 +10508,55 @@ async function bridgeSession(reader, clientWriter, upstream, options) {
         combined.signal.removeEventListener("abort", recordDeadlineAbort);
         combined.dispose();
         base.dispose();
-        await upstream.close().catch(() => { });
+        await closeUpstreamWithTimeout(() => upstream.close());
+    }
+}
+// DS-L9: an upstream close that never settles must not stall the bridge
+// (or engine) finally block forever. 1 s is principled here because every
+// egress close in this tree is cancel + socket.close with errors
+// swallowed — it is already observed to settle immediately, so 1 s is a
+// generous bound for a teardown that should be near-instant, not a
+// deadline for useful work. The losing close promise keeps running with
+// its rejection swallowed, so a late settle cannot surface afterwards.
+async function closeUpstreamWithTimeout(close, timeoutMs = 1000) {
+    let timer;
+    try {
+        await Promise.race([
+            close().catch(() => { }),
+            new Promise((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+        ]);
+    }
+    finally {
+        if (timer !== undefined)
+            clearTimeout(timer);
     }
 }
 function isReplaySafeInitialPayload(payload) {
     if (payload.byteLength === 0)
         return true;
-    // A VLESS/Trojan payload that is a TLS ClientHello can be safely replayed
-    // to the next egress when the upstream closed before sending any byte.
-    return payload.byteLength >= 6 && payload[0] === 0x16 && payload[1] === 0x03 && payload[5] === 0x01;
+    // DS-L42: a VLESS/Trojan payload that is a TLS ClientHello can be
+    // safely replayed to the next egress when the upstream closed before
+    // sending any byte — but only when it is EXACTLY one complete record.
+    // Previously only bytes 0, 1 and 5 were checked, so a record header
+    // claiming length 0 followed by arbitrary non-idempotent bytes was
+    // accepted and could be replayed as an application request. Now the
+    // TLS record length (bytes 3-4) must equal the remaining payload, the
+    // handshake type (byte 5) must be 0x01 ClientHello, and the handshake
+    // length (bytes 6-8) must account for exactly the rest of the record,
+    // leaving no trailing application bytes. A fragmented or multi-record
+    // initial payload is conservatively NOT replay-safe (fail closed: the
+    // session fails instead of replaying a partial prefix).
+    if (payload.byteLength < 9)
+        return false;
+    if (payload[0] !== 0x16 || payload[1] !== 0x03)
+        return false;
+    const recordLength = (payload[3] << 8) | payload[4];
+    if (recordLength !== payload.byteLength - 5)
+        return false;
+    if (payload[5] !== 0x01)
+        return false;
+    const handshakeLength = (payload[6] << 16) | (payload[7] << 8) | payload[8];
+    return handshakeLength === recordLength - 4;
 }
 
 };
@@ -7806,12 +10616,14 @@ class DnsEngine {
         if (message.byteLength < 1 || message.byteLength > limits_1.CORE_LIMITS.maxDoHQueryBytes)
             throw new errors_1.CoreError("MESSAGE_TOO_LARGE", `DNS message must be 1..${limits_1.CORE_LIMITS.maxDoHQueryBytes} bytes`);
         let lastError;
+        // DS-M6: one fresh budget per call, shared across all resolvers.
+        const attemptBudget = new doh_1.DnsAttemptBudgetCounter();
         for (const resolver of this.resolvers) {
             const rawResolver = resolver;
             if (!rawResolver.queryRaw)
                 continue;
             try {
-                return await rawResolver.queryRaw(message, signal);
+                return await rawResolver.queryRaw(message, signal, attemptBudget);
             }
             catch (error) {
                 lastError = error;
@@ -7843,9 +10655,14 @@ class DnsEngine {
         if (!this.enabled)
             return [];
         let lastError;
+        // DS-M6: one fresh budget per call, shared across resolvers, both
+        // families (auto) and every CNAME hop. A fresh counter per call (not
+        // a shared engine field) is what keeps concurrent resolves in one
+        // isolate from consuming each other's budget.
+        const attemptBudget = new doh_1.DnsAttemptBudgetCounter();
         for (const resolver of this.resolvers) {
             try {
-                const values = await resolver.resolve(clean, strategy, signal);
+                const values = await resolver.resolve(clean, strategy, signal, attemptBudget);
                 if (values.length)
                     return values;
                 if (!this.fallback)
@@ -7918,8 +10735,13 @@ exports.literalDestination = literalDestination;
 function isIpLiteral(value) {
     const input = value.trim().replace(/^\[|\]$/g, "");
     const v4 = input.split(".");
+    // DS-I13: strict canonical dotted quad only — a leading zero
+    // ("010.0.0.1") is rejected, not silently read as decimal 10 (or, by
+    // a downstream parser, as octal 8). This is what makes DNS_HOSTS
+    // values strict: HostsResolver treats a non-literal as a
+    // CONFIGURATION_ERROR, so "010.0.0.1" is now rejected at construction.
     if (v4.length === 4 && v4.every((part) => /^\d{1,3}$/.test(part))) {
-        return v4.every((part) => Number(part) >= 0 && Number(part) <= 255);
+        return v4.every((part) => (part.length === 1 || !part.startsWith("0")) && Number(part) >= 0 && Number(part) <= 255);
     }
     if (!input.includes(":"))
         return false;
@@ -7933,7 +10755,7 @@ function isIpLiteral(value) {
         for (const part of side.split(":")) {
             if (part.includes(".")) {
                 const octets = part.split(".");
-                if (octets.length !== 4 || octets.some((x) => !/^\d{1,3}$/.test(x) || Number(x) > 255))
+                if (octets.length !== 4 || octets.some((x) => !/^\d{1,3}$/.test(x) || (x.length > 1 && x.startsWith("0")) || Number(x) > 255))
                     return null;
                 count += 2;
             }
@@ -8050,7 +10872,10 @@ class DnsCache {
             this.setNegative(host, type);
             return;
         }
-        if (ttlSeconds <= 0)
+        // DS-I12: mirror the setNegative non-finite guard — a NaN TTL
+        // previously slipped past `<= 0` (NaN comparisons are false) and
+        // produced a NaN expiresAt that never expired.
+        if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0)
             return;
         const ttl = Math.min(Math.floor(ttlSeconds), this.maxTtlSeconds);
         // Store a defensive copy: callers keep (and return) the array they passed
@@ -8058,6 +10883,12 @@ class DnsCache {
         this.setEntry(host, type, { values: values.map((item) => ({ ...item })), expiresAt: Date.now() + ttl * 1000, negative: false });
     }
     setNegative(host, type, ttlSeconds) {
+        // DS-L15 (RFC 2308 §5): an EXPLICIT negative TTL of 0 means "do not
+        // cache", and must be distinguished from an unset TTL (which takes
+        // the configured default, 30 s). Previously 0 fell through to the
+        // default, caching a negative answer the zone said not to cache.
+        if (ttlSeconds === 0)
+            return;
         // RFC 2308 §5: when the caller supplies the zone-derived negative TTL
         // (min of SOA record TTL and SOA MINIMUM) it wins, still capped by the
         // cache-wide maximum; otherwise the configured default applies.
@@ -8200,6 +11031,37 @@ class WebSocketByteWriter {
         for (const item of pending)
             item.reject(reason);
     }
+    // DS-M5: abort-aware teardown for the bridge/engine abort path. The
+    // bridge passes its combined AbortSignal into write(), so queued items
+    // already carry their signal; abort() additionally lets a caller that
+    // holds only the writer (e.g. a future bridge abort hook) settle every
+    // pending write immediately instead of leaving the drain loop polling.
+    // It deliberately does NOT close the socket itself: socket lifecycle
+    // stays with the transport adapter.
+    abort(reason = new errors_1.CoreError("CLIENT_CLOSED", "WebSocket write aborted")) {
+        this.markClosed(reason);
+    }
+    // DS-M5: reject every queued item whose own signal has aborted, and
+    // reclaim its bytes. Called at the top of each drain iteration and
+    // after every backpressure wait, so an aborted session can never leave
+    // a write promise pending behind a full send buffer.
+    rejectAbortedQueued() {
+        if (!this.queue.length)
+            return;
+        const kept = [];
+        for (const item of this.queue) {
+            if (item.signal?.aborted) {
+                this.queuedBytes -= item.data.byteLength;
+                item.reject(item.signal.reason);
+            }
+            else {
+                kept.push(item);
+            }
+        }
+        if (kept.length !== this.queue.length) {
+            this.queue.splice(0, this.queue.length, ...kept);
+        }
+    }
     /** Bytes handed to the runtime send buffer but not yet consumed by the peer. */
     socketBufferedBytes() {
         const buffered = this.socket.bufferedAmount;
@@ -8248,6 +11110,9 @@ class WebSocketByteWriter {
         this.draining = true;
         try {
             while (this.queue.length) {
+                this.rejectAbortedQueued();
+                if (!this.queue.length)
+                    break;
                 if (this.closed || this.socket.readyState !== WebSocket.OPEN) {
                     const error = new errors_1.CoreError("CLIENT_CLOSED", "WebSocket is closed");
                     const pending = this.queue.splice(0);
@@ -8262,6 +11127,10 @@ class WebSocketByteWriter {
                 // peer to consume before handing over more; pending write() promises
                 // stay unresolved, which is what throttles upstream readers.
                 if (this.socketBufferedBytes() + this.queuedBytes > this.maxQueuedBytes) {
+                    // DS-M5: the backpressure wait is abort-aware. The 10 ms poll
+                    // remains, but every iteration now also settles aborted queued
+                    // items (via the rejectAbortedQueued() call at the loop top)
+                    // instead of polling forever while the session is already dead.
                     await new Promise((resolve) => setTimeout(resolve, 10));
                     continue;
                 }
@@ -8376,7 +11245,10 @@ async function renderSubscriptionWithProvider(env, request, provider, resolver, 
     const selection = (0, planning_1.parseOutputSelection)(env, url.searchParams);
     const limits = budget(env);
     const page = await (0, planning_1.buildOutputNodePage)(env, url.hostname, selection, (0, planning_1.createOutputCredentialSource)(provider), limits, request.signal, "native");
-    const lines = page.items.map((node) => (0, share_link_1.generateShareLink)(node));
+    // DS-L25: native subscription lines carry the node name as a #remark
+    // fragment, matching the remark + unique-passport naming the
+    // sing-box/Xray/Clash outputs already use.
+    const lines = page.items.map((node) => (0, share_link_1.generateShareLink)(node, { includeFragment: true }));
     if ((url.searchParams.get("aggregate") ?? "false").trim().toLowerCase() === "true") {
         const external = await (0, aggregation_1.fetchNativeSubscriptionSources)(env, request.signal, 8, 256 * 1024, fetchImpl, resolver);
         const output = [...lines];
@@ -8431,6 +11303,8 @@ const runtime_1 = __r("../config/runtime");
 const planning_1 = __r("./planning");
 const adapters_1 = __r("./adapters");
 const profiles_1 = __r("./profiles");
+const rules_1 = __r("./rules");
+const outbounds_1 = __r("./outbounds");
 const compatibility_1 = __r("./compatibility");
 function budget(env) {
     return (0, runtime_1.buildRuntimeConfig)(env).output;
@@ -8495,8 +11369,27 @@ function fragmentClientRequirements(target, kind) {
         return ["sing-box >= 1.12.0 (TLS fragment/record_fragment support)"];
     return undefined;
 }
-function descriptor(id, kind, target, protocol, url, supported = true, reason, itemCount, auth) {
-    const clientRequirements = fragmentClientRequirements(target, kind);
+// DS-L24: the manifest counterpart of the Mihomo-only header comment in
+// the Clash YAML. Derived from the actually translated lines (not from a
+// re-implementation of the expansion), so header and manifest cannot drift.
+// A layer-2 failure yields no entry here; the bundle render itself still
+// fails with the precise error when requested.
+function clashMihomoRequirement(rules, customNames) {
+    let lines;
+    try {
+        lines = (0, rules_1.translateClashRules)(rules, { proxyGroup: "PROXY", customNames });
+    }
+    catch {
+        return undefined;
+    }
+    return lines.some((line) => line.startsWith("GEOSITE,") || line.startsWith("AND,"))
+        ? ["Mihomo (Clash Meta) — this configuration uses GEOSITE/AND rules, which are not supported by original Clash Premium"]
+        : undefined;
+}
+function descriptor(id, kind, target, protocol, url, supported = true, reason, itemCount, auth, extraClientRequirements) {
+    const fragmentRequirements = fragmentClientRequirements(target, kind);
+    const merged = [...(fragmentRequirements ?? []), ...(extraClientRequirements ?? [])];
+    const clientRequirements = merged.length ? merged : undefined;
     return { id, kind, target, protocol, endpointScope: kind === "best-fragment" || kind === "best-ping-fragment" ? "tls-only" : "selected", ...(itemCount === undefined ? {} : { itemCount }), url, supported, ...(auth ? { auth } : {}), ...(reason ? { reason } : {}), ...(clientRequirements ? { clientRequirements } : {}) };
 }
 function fragmentCompatibilityHeaders(target) {
@@ -8515,6 +11408,14 @@ async function pageFor(env, request, provider, target, selection, limitOverride)
 function baseOptions(env, fragmentArtifact = false) {
     const earlyData = (0, planning_1.parseOutputEarlyData)(env) ?? 0;
     return {
+        // Client-side routing rules and custom outbounds. Startup validation has
+        // already passed by the time a render runs (worker startup + control
+        // routes both validate); the parse calls below are defense in depth for
+        // direct renderers and fail the artifact closed on malformed input.
+        routingRules: (0, rules_1.parseRoutingRules)(env.CORE_OUTPUT_ROUTING_RULES),
+        singboxOutbounds: (0, outbounds_1.parseOutbounds)("sing-box", env.CORE_OUTPUT_SINGBOX_OUTBOUNDS),
+        xrayOutbounds: (0, outbounds_1.parseOutbounds)("xray", env.CORE_OUTPUT_XRAY_OUTBOUNDS),
+        clashProxies: (0, outbounds_1.parseOutbounds)("clash", env.CORE_OUTPUT_CLASH_PROXIES),
         probeUrl: env.CORE_OUTPUT_PROBE_URL?.trim() || "https://www.gstatic.com/generate_204",
         probeInterval: fragmentArtifact
             ? env.CORE_XRAY_FRAGMENT_PROBE_INTERVAL?.trim() || "1s"
@@ -8586,10 +11487,14 @@ async function renderOutputArtifact(env, request, provider, format) {
     const artifactAuth = queryAuthUsed ? "authorization-bearer" : undefined;
     if (artifact === "manifest") {
         const probePage = await pageFor(env, request, provider, target, selection, 1);
+        const manifestOptions = baseOptions(env);
+        const mihomoRequirement = format === "clash"
+            ? clashMihomoRequirement(manifestOptions.routingRules ?? [], new Set((manifestOptions.clashProxies ?? []).map((item) => String(item.name))))
+            : undefined;
         const descriptors = [];
-        descriptors.push(descriptor("nodes", "node", format, selection.protocol === "all" ? "mixed" : selection.protocol, artifactUrl(request, "node", format, "?offset=0&limit=1"), true, undefined, probePage.candidateCount, artifactAuth));
-        descriptors.push(descriptor("bundle", "bundle", format, selection.protocol === "all" ? "mixed" : selection.protocol, artifactUrl(request, "bundle", format), true, undefined, undefined, artifactAuth));
-        descriptors.push(descriptor("best-ping", "best-ping", format, "mixed", artifactUrl(request, "best-ping", format), true, undefined, undefined, artifactAuth));
+        descriptors.push(descriptor("nodes", "node", format, selection.protocol === "all" ? "mixed" : selection.protocol, artifactUrl(request, "node", format, "?offset=0&limit=1"), true, undefined, probePage.candidateCount, artifactAuth, mihomoRequirement));
+        descriptors.push(descriptor("bundle", "bundle", format, selection.protocol === "all" ? "mixed" : selection.protocol, artifactUrl(request, "bundle", format), true, undefined, undefined, artifactAuth, mihomoRequirement));
+        descriptors.push(descriptor("best-ping", "best-ping", format, "mixed", artifactUrl(request, "best-ping", format), true, undefined, undefined, artifactAuth, mihomoRequirement));
         if ((0, profiles_1.isProfileSupported)(format, "best-fragment")) {
             descriptors.push(descriptor("best-fragment", "best-fragment", format, "mixed", artifactUrl(request, "best-fragment", format), true, undefined, undefined, artifactAuth));
             descriptors.push(descriptor("best-ping-fragment", "best-ping-fragment", format, "mixed", artifactUrl(request, "best-ping-fragment", format), true, undefined, undefined, artifactAuth));
@@ -8741,6 +11646,197 @@ function outputTargetLabel(target) {
 
 };
 
+__m["output/outbounds"] = function(module, exports, __r) {
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.MAX_OUTBOUNDS_PER_TARGET = exports.MAX_OUTBOUNDS_BYTES = void 0;
+exports.outboundTagField = outboundTagField;
+exports.collectOutboundIssues = collectOutboundIssues;
+exports.parseOutbounds = parseOutbounds;
+exports.outboundTags = outboundTags;
+const errors_1 = __r("../core/errors");
+exports.MAX_OUTBOUNDS_BYTES = 128 * 1024;
+exports.MAX_OUTBOUNDS_PER_TARGET = 128;
+const SINGBOX_TYPES = new Set([
+    "direct", "block", "dns", "socks", "http", "shadowsocks", "vmess", "vless",
+    "trojan", "hysteria", "hysteria2", "tuic", "wireguard", "selector", "urltest",
+]);
+const XRAY_TYPES = new Set([
+    "freedom", "blackhole", "socks", "http", "shadowsocks", "vmess", "vless",
+    "trojan", "wireguard", "dns",
+]);
+const CLASH_TYPES = new Set([
+    "ss", "ssr", "vmess", "vless", "trojan", "hysteria", "hysteria2", "tuic",
+    "wireguard", "socks5", "http", "snell", "ssh", "direct", "reject", "dns",
+    // DS-M15 (v1 scope): group types (selector, url-test, fallback,
+    // load-balance) and relay are deliberately NOT allow-listed. Mihomo
+    // defines groups under `proxy-groups:`, not `proxies:`, and upstream
+    // removed relay; emitting them under `proxies:` would break the whole
+    // config at import. A selector is itself a group, which contradicts the
+    // v1 promise that custom proxies never join groups.
+]);
+const REQUIRED_FIELDS = {
+    "sing-box": {
+        socks: ["server", "server_port"],
+        http: ["server", "server_port"],
+        shadowsocks: ["server", "server_port", "method", "password"],
+        vmess: ["server", "server_port", "uuid"],
+        vless: ["server", "server_port", "uuid"],
+        trojan: ["server", "server_port", "password"],
+        hysteria2: ["server", "server_port", "password"],
+        wireguard: ["server", "server_port", "private_key", "peer_public_key"],
+    },
+    xray: {
+        socks: ["servers"],
+        http: ["servers"],
+        shadowsocks: ["servers"],
+        vmess: ["vnext"],
+        vless: ["vnext"],
+        trojan: ["servers"],
+        wireguard: ["secretKey", "peers"],
+    },
+    clash: {
+        ss: ["server", "port", "cipher", "password"],
+        vmess: ["server", "port", "uuid"],
+        vless: ["server", "port", "uuid"],
+        trojan: ["server", "port", "password"],
+        socks5: ["server", "port"],
+        http: ["server", "port"],
+        hysteria2: ["server", "port", "password"],
+        wireguard: ["server", "port", "private-key", "public-key"],
+    },
+};
+function outboundTagField(target) {
+    return target === "clash" ? "name" : "tag";
+}
+function outboundTypeField(target) {
+    return target === "xray" ? "protocol" : "type";
+}
+function typeAllowList(target) {
+    return target === "sing-box" ? SINGBOX_TYPES : target === "xray" ? XRAY_TYPES : CLASH_TYPES;
+}
+// Static reserved tags: generated group names and built-in outbounds. Generated
+// node tags (proxy-N) and node names are dynamic and checked by the builders.
+function reservedTags(target) {
+    if (target === "clash")
+        return new Set(["PROXY"]);
+    // DS-L21: "proxy-balancer" is a generated Xray tag (the multi-node
+    // balancer), so a custom Xray outbound with that tag must fail whole
+    // worker startup validation, not just the Xray render.
+    if (target === "xray")
+        return new Set(["proxy", "direct", "block", "proxy-balancer"]);
+    return new Set(["proxy", "direct", "block"]);
+}
+// Layer 1: returns every issue found in the raw env value (empty = valid).
+function collectOutboundIssues(target, raw, _field) {
+    const issues = [];
+    const trimmed = raw?.trim();
+    if (!trimmed)
+        return issues;
+    if (new TextEncoder().encode(trimmed).byteLength > exports.MAX_OUTBOUNDS_BYTES) {
+        issues.push(`must not exceed ${exports.MAX_OUTBOUNDS_BYTES} bytes`);
+    }
+    let parsed;
+    try {
+        parsed = JSON.parse(trimmed);
+    }
+    catch {
+        issues.push("must be valid JSON");
+        return issues;
+    }
+    if (!Array.isArray(parsed)) {
+        issues.push("must be a JSON array of outbounds");
+        return issues;
+    }
+    if (parsed.length > exports.MAX_OUTBOUNDS_PER_TARGET)
+        issues.push(`must not exceed ${exports.MAX_OUTBOUNDS_PER_TARGET} outbounds`);
+    const tagField = outboundTagField(target);
+    const typeField = outboundTypeField(target);
+    const types = typeAllowList(target);
+    const reserved = reservedTags(target);
+    const seen = new Set();
+    parsed.forEach((item, index) => {
+        const prefix = `outbound ${index}`;
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+            issues.push(`${prefix}: must be an object`);
+            return;
+        }
+        const entry = item;
+        const tag = entry[tagField];
+        if (typeof tag !== "string" || !tag) {
+            issues.push(`${prefix}: ${tagField} is required and must be a non-empty string`);
+            return;
+        }
+        if (seen.has(tag))
+            issues.push(`${prefix}: duplicate ${tagField} '${tag}'`);
+        seen.add(tag);
+        if (reserved.has(tag))
+            issues.push(`${prefix}: ${tagField} '${tag}' collides with a generated tag`);
+        if (target === "clash" && (tag.toUpperCase() === "DIRECT" || tag.toUpperCase() === "REJECT")) {
+            issues.push(`${prefix}: ${tagField} '${tag}' collides with a rule action and can never be targeted`);
+        }
+        if (target === "sing-box" && /^proxy-\d+$/.test(tag)) {
+            issues.push(`${prefix}: ${tagField} '${tag}' collides with a generated node tag`);
+        }
+        if (target === "xray" && tag.startsWith("proxy-")) {
+            // The Xray balancer selects by the "proxy-" prefix, so a custom tag with
+            // that prefix would be silently absorbed into the proxy balancer even
+            // though the design promises no automatic group membership.
+            issues.push(`${prefix}: ${tagField} '${tag}' must not start with 'proxy-' (the Xray balancer selector would absorb it)`);
+        }
+        const type = entry[typeField];
+        if (typeof type !== "string" || !types.has(type)) {
+            issues.push(`${prefix}: unknown ${typeField} '${String(type)}'`);
+            return;
+        }
+        // Xray outbound settings live under `settings` (vnext/servers/secretKey),
+        // while sing-box and Clash fields are top-level. Check the right holder.
+        const holder = target === "xray" && entry.settings !== null && typeof entry.settings === "object" && !Array.isArray(entry.settings)
+            ? entry.settings
+            : entry;
+        for (const field of REQUIRED_FIELDS[target][type] ?? []) {
+            if (holder[field] === undefined) {
+                issues.push(`${prefix}: '${type}' requires field '${field}'`);
+                continue;
+            }
+            // DS-M14 (minimum, v1 envelope scope): presence alone let wrong
+            // types, out-of-range ports and empty arrays pass startup and break
+            // the client config at import instead. Deeper per-element shape
+            // checks stay out of scope.
+            if (field === "server_port" || field === "port") {
+                const port = holder[field];
+                if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+                    issues.push(`${prefix}: '${type}' field '${field}' must be an integer 1..65535`);
+                }
+            }
+            else if (field === "servers" || field === "vnext" || field === "peers") {
+                if (!Array.isArray(holder[field]) || holder[field].length === 0) {
+                    issues.push(`${prefix}: '${type}' field '${field}' must be a non-empty array`);
+                }
+            }
+        }
+    });
+    return issues;
+}
+// Parses the raw env value, throwing the first issue as CONFIGURATION_ERROR.
+// Used at render time (after startup validation already passed).
+function parseOutbounds(target, raw) {
+    const trimmed = raw?.trim();
+    if (!trimmed)
+        return [];
+    const issues = collectOutboundIssues(target, raw, "");
+    if (issues.length)
+        throw new errors_1.CoreError("CONFIGURATION_ERROR", `custom outbounds: ${issues[0]}`);
+    return JSON.parse(trimmed);
+}
+// Extracts the tag/name list from already-parsed outbounds (startup cross-checks).
+function outboundTags(target, items) {
+    const field = outboundTagField(target);
+    return items.map((item) => String(item[field]));
+}
+
+};
+
 __m["output/profiles"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -8815,7 +11911,13 @@ function normalizeXrayProfile(value, index) {
     if (!packets)
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `CORE_FRAGMENT_PROFILES[${index}].packets must be 1-3 or tlshello`);
     const field = `CORE_FRAGMENT_PROFILES[${index}]`;
-    const lengths = parseRangeList(raw.lengths, `${field}.lengths`, packets === "tlshello" ? { min: 1 } : {});
+    // DS-M11: the official Xray FragmentMask struct has only singular
+    // `length` / `delay` (one Int32Range each); the builder emits only
+    // lengths[0] / delays[0] and the loader ignores unknown plural fields.
+    // Accepting several ranges therefore silently dropped every range after
+    // the first. Fail closed on multi-range profiles instead. Built-in
+    // defaults are all single-range, so they are unaffected.
+    const lengths = parseRangeList(raw.lengths, `${field}.lengths`, packets === "tlshello" ? { min: 1 } : {}, 1);
     if (packets === "1-3" && rangeBounds(lengths[lengths.length - 1])[0] === 0) {
         throw new errors_1.CoreError("CONFIGURATION_ERROR", `${field}.lengths: the final range must be positive; a final zero can idle indefinitely`);
     }
@@ -8824,7 +11926,7 @@ function normalizeXrayProfile(value, index) {
         packets,
         lengths,
         // A zero delay is valid in FinalMask; cap the upper bound to avoid pathological stalls.
-        delays: parseRangeList(raw.delays, `${field}.delays`, { min: 0, max: MAX_FRAGMENT_DELAY_MS }),
+        delays: parseRangeList(raw.delays, `${field}.delays`, { min: 0, max: MAX_FRAGMENT_DELAY_MS }, 1),
         // FinalMask defines maxSplit=0 as unlimited. This generator intentionally requires a finite
         // positive bound so custom profiles cannot opt into unbounded splitting by mistake.
         ...(raw.maxSplit === undefined || raw.maxSplit === null || raw.maxSplit === "" ? {} : { maxSplit: parseRange(raw.maxSplit, `${field}.maxSplit`, { min: 1, max: MAX_FRAGMENT_SPLITS }) }),
@@ -8909,552 +12011,6 @@ function expandSingboxFragments(nodes, profiles) {
             out.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
     }
     return out;
-}
-
-};
-
-__m["output/adapters"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.outputAdapters = void 0;
-const clash_1 = __r("./clash");
-const singbox_1 = __r("./singbox");
-const xray_1 = __r("./xray");
-function xrayOptions(options) {
-    return {
-        ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
-        ...(typeof options?.probeInterval === "string" ? { probeInterval: options.probeInterval } : {}),
-        ...(typeof options?.observatoryConcurrency === "boolean" ? { observatoryConcurrency: options.observatoryConcurrency } : {}),
-        ...(typeof options?.fragmentProfile === "object" && options.fragmentProfile !== null ? { fragmentProfile: options.fragmentProfile } : {}),
-        ...(options?.allowDirectFallback === true ? { allowDirectFallback: true } : {}),
-    };
-}
-function singboxOptions(options) {
-    return {
-        ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
-        ...(typeof options?.interval === "string" ? { interval: options.interval } : {}),
-        ...(typeof options?.tolerance === "number" ? { tolerance: options.tolerance } : {}),
-        ...(typeof options?.fragmentProfile === "object" && options.fragmentProfile !== null ? { fragmentProfile: options.fragmentProfile } : {}),
-        ...(options?.useUtls === true ? { useUtls: true } : {}),
-    };
-}
-function intervalSeconds(value) {
-    // Shared base options carry the interval as a sing-box duration string ("30s"), which the
-    // number-only check here used to drop silently for Mihomo (audit F16). Parse both forms.
-    if (typeof value === "number" && Number.isFinite(value) && value > 0)
-        return value;
-    if (typeof value === "string") {
-        const match = value.trim().match(/^(\d+)s?$/);
-        if (match)
-            return Number(match[1]);
-    }
-    return undefined;
-}
-function mihomoOptions(options) {
-    const interval = intervalSeconds(options?.interval);
-    return {
-        ...(typeof options?.probeUrl === "string" ? { probeUrl: options.probeUrl } : {}),
-        ...(interval !== undefined ? { interval } : {}),
-        ...(typeof options?.tolerance === "number" ? { tolerance: options.tolerance } : {}),
-    };
-}
-exports.outputAdapters = {
-    xray: {
-        format: "xray",
-        render: (nodes, kind = "bundle", options) => {
-            const x = xrayOptions(options);
-            if (kind === "best-ping")
-                return JSON.stringify((0, xray_1.buildXrayBestPingConfig)(nodes, x), null, 2);
-            if (kind === "best-fragment")
-                return JSON.stringify((0, xray_1.buildXrayBestFragmentConfig)(nodes, options?.fragmentProfiles ?? [], x), null, 2);
-            if (kind === "best-ping-fragment")
-                return JSON.stringify((0, xray_1.buildXrayBestPingFragmentConfig)(nodes, options?.fragmentProfiles ?? [], x), null, 2);
-            return JSON.stringify((0, xray_1.buildXrayConfig)(nodes, { ...x, strategy: "roundRobin" }), null, 2);
-        },
-    },
-    "sing-box": {
-        format: "sing-box",
-        render: (nodes, kind = "bundle", options) => {
-            const s = singboxOptions(options);
-            if (kind === "best-ping")
-                return JSON.stringify((0, singbox_1.buildSingboxBestPingConfig)(nodes, s), null, 2);
-            if (kind === "best-fragment")
-                return JSON.stringify((0, singbox_1.buildSingboxBestFragmentConfig)(nodes, options?.fragmentProfiles ?? [], s), null, 2);
-            if (kind === "best-ping-fragment")
-                return JSON.stringify((0, singbox_1.buildSingboxBestPingFragmentConfig)(nodes, options?.fragmentProfiles ?? [], s), null, 2);
-            return JSON.stringify((0, singbox_1.buildSingboxConfig)(nodes, s), null, 2);
-        },
-    },
-    clash: {
-        format: "clash",
-        render: (nodes, kind = "bundle", options) => {
-            const m = mihomoOptions(options);
-            return kind === "best-ping" ? (0, clash_1.buildClashBestPingConfig)(nodes, m) : (0, clash_1.buildClashConfig)(nodes, m);
-        },
-    },
-};
-
-};
-
-__m["output/xray/index"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.buildXrayConfig = buildXrayConfig;
-exports.buildXrayBestPingConfig = buildXrayBestPingConfig;
-exports.buildXrayBestFragmentConfig = buildXrayBestFragmentConfig;
-exports.buildXrayBestPingFragmentConfig = buildXrayBestPingFragmentConfig;
-const errors_1 = __r("../../core/errors");
-const share_link_1 = __r("../share-link");
-function validateNode(node) {
-    if (node.security === "none") {
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray public output requires transport TLS; use the Worker/native model or another compatible target for plaintext nodes");
-    }
-}
-function stream(node, fragmentProfile) {
-    validateNode(node);
-    const streamSettings = {
-        method: "websocket",
-        network: "ws",
-        security: "tls",
-        tlsSettings: {
-            serverName: node.tls?.serverName || node.server,
-            ...(node.tls?.alpn?.length ? { alpn: node.tls.alpn } : {}),
-            ...(node.tls?.fingerprint ? { fingerprint: node.tls.fingerprint } : {}),
-        },
-        wsSettings: {
-            path: (0, share_link_1.effectiveWebSocketPath)(node.websocket.path, node.websocket.earlyData),
-            ...(node.websocket.host ? { host: node.websocket.host } : {}),
-        },
-    };
-    if (fragmentProfile) {
-        streamSettings.finalmask = {
-            tcp: [{
-                    type: "fragment",
-                    settings: {
-                        packets: fragmentProfile.packets,
-                        lengths: [...fragmentProfile.lengths],
-                        delays: [...fragmentProfile.delays],
-                        ...(fragmentProfile.lengths[0] ? { length: fragmentProfile.lengths[0] } : {}),
-                        ...(fragmentProfile.delays[0] ? { delay: fragmentProfile.delays[0] } : {}),
-                        ...(fragmentProfile.maxSplit ? { maxSplit: fragmentProfile.maxSplit } : {}),
-                    },
-                }],
-        };
-    }
-    return streamSettings;
-}
-function outbound(node, index, fragmentProfile) {
-    validateNode(node);
-    const tag = `proxy-${index}`;
-    if (node.protocol === "vless") {
-        return {
-            tag,
-            protocol: "vless",
-            settings: {
-                vnext: [{
-                        address: node.server,
-                        port: node.port,
-                        users: [{ id: node.credential, encryption: "none" }],
-                    }],
-                packetEncoding: "packetaddr",
-            },
-            streamSettings: stream(node, fragmentProfile),
-        };
-    }
-    return {
-        tag,
-        protocol: "trojan",
-        settings: {
-            servers: [{ address: node.server, port: node.port, password: node.credential }],
-        },
-        streamSettings: stream(node, fragmentProfile),
-    };
-}
-function configWithOutbounds(nodes, options, prebuiltOutbounds) {
-    if (!nodes.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Xray output requires at least one TLS-compatible node");
-    for (const node of nodes)
-        validateNode(node);
-    const outbounds = prebuiltOutbounds ? [...prebuiltOutbounds] : nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile));
-    const proxyTags = outbounds.map((item) => String(item.tag));
-    const strategy = proxyTags.length <= 1 ? "manual" : (options.strategy ?? "roundRobin");
-    const finalTag = proxyTags[0];
-    // Observatory exists to feed leastPing/leastLoad balancers. A roundRobin balancer ignores
-    // probe results, so probing every outbound every interval was pure overhead (audit F14).
-    const observatory = proxyTags.length > 1 && strategy === "leastPing"
-        ? {
-            subjectSelector: ["proxy-"],
-            probeUrl: options.probeUrl ?? "https://www.gstatic.com/generate_204",
-            probeInterval: options.probeInterval ?? "30s",
-            enableConcurrency: options.observatoryConcurrency ?? true,
-        }
-        : undefined;
-    const routing = strategy === "manual" && nodes.length === 1
-        ? { domainStrategy: "AsIs", rules: [{ type: "field", inboundTag: ["socks-in"], outboundTag: finalTag }] }
-        : {
-            domainStrategy: "AsIs",
-            rules: [{ type: "field", inboundTag: ["socks-in"], balancerTag: "proxy-balancer" }],
-            balancers: [{
-                    tag: "proxy-balancer",
-                    selector: ["proxy-"],
-                    strategy: { type: strategy === "leastPing" ? "leastPing" : "roundRobin" },
-                    ...(options.allowDirectFallback ? { fallbackTag: "direct" } : {}),
-                }],
-        };
-    return {
-        log: { loglevel: "warning" },
-        dns: {
-            servers: [
-                "https://cloudflare-dns.com/dns-query",
-                "https://dns.google/dns-query",
-            ],
-            disableFallback: true,
-        },
-        ...(observatory ? { observatory } : {}),
-        inbounds: [{
-                tag: "socks-in",
-                listen: options.listen ?? "127.0.0.1",
-                port: options.socksPort ?? 10808,
-                protocol: "socks",
-                // Trojan supports UDP association in Xray just as VLESS does; gating this on the
-                // presence of a VLESS node silently disabled all UDP for Trojan-only bundles (audit F2).
-                settings: { auth: "noauth", udp: true },
-                sniffing: { enabled: false },
-            }],
-        outbounds: [
-            ...outbounds,
-            ...(options.allowDirectFallback ? [{ tag: "direct", protocol: "freedom" }] : []),
-        ],
-        routing,
-    };
-}
-function buildXrayConfig(nodes, options = {}) {
-    return configWithOutbounds(nodes, options);
-}
-function buildXrayBestPingConfig(nodes, options = {}) {
-    return configWithOutbounds(nodes, { ...options, strategy: "leastPing" });
-}
-function buildXrayFragmentConfig(nodes, profiles, strategy, options = {}) {
-    if (!profiles.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment output requires at least one fragment profile");
-    const expanded = [];
-    for (const node of nodes) {
-        if (node.security !== "tls")
-            continue;
-        for (const profile of profiles)
-            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
-    }
-    if (!expanded.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Fragment output requires at least one TLS-compatible node");
-    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile));
-    return configWithOutbounds(expanded.map((item) => item.node), { ...options, strategy }, outbounds);
-}
-function buildXrayBestFragmentConfig(nodes, profiles, options = {}) {
-    return buildXrayFragmentConfig(nodes, profiles, "leastPing", options);
-}
-function buildXrayBestPingFragmentConfig(nodes, profiles, options = {}) {
-    return buildXrayFragmentConfig(nodes, profiles, "leastPing", options);
-}
-
-};
-
-__m["output/share-link"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.generateShareLink = generateShareLink;
-exports.webSocketPathWithoutEarlyData = webSocketPathWithoutEarlyData;
-exports.effectiveWebSocketPath = effectiveWebSocketPath;
-function appendParams(params) {
-    return params.toString().replace(/%2C/gi, ",");
-}
-function generateShareLink(node, options = {}) {
-    const params = new URLSearchParams();
-    params.set("type", "ws");
-    if (node.websocket.host)
-        params.set("host", node.websocket.host);
-    params.set("path", effectiveWebSocketPath(node.websocket.path, node.websocket.earlyData));
-    if (node.security === "tls") {
-        params.set("security", "tls");
-        const tls = node.tls;
-        if (tls?.serverName)
-            params.set("sni", tls.serverName);
-        if (tls?.fingerprint)
-            params.set("fp", tls.fingerprint);
-        if (tls?.alpn?.length)
-            params.set("alpn", tls.alpn.join(","));
-    }
-    else {
-        params.set("security", "none");
-    }
-    const fragment = options.includeFragment && node.name ? `#${encodeURIComponent(node.name)}` : "";
-    if (node.protocol === "vless") {
-        params.set("encryption", "none");
-        return `vless://${encodeURIComponent(node.credential)}@${formatServer(node.server)}:${node.port}?${appendParams(params)}${fragment}`;
-    }
-    return `trojan://${encodeURIComponent(node.credential)}@${formatServer(node.server)}:${node.port}?${appendParams(params)}${fragment}`;
-}
-/**
- * Path for cores that carry early data natively (sing-box max_early_data, Mihomo
- * ws-opts.max-early-data): remove only the `ed=<n>` query parameter and preserve any
- * other query components the operator configured (audit F8). Xray/share-links keep the
- * full path including `ed`, per the Xray convention.
- */
-function webSocketPathWithoutEarlyData(path) {
-    const queryIndex = path.indexOf("?");
-    if (queryIndex < 0)
-        return path;
-    const base = path.slice(0, queryIndex);
-    const kept = path.slice(queryIndex + 1).split("&").filter((pair) => pair && !/^ed=\d+$/.test(pair));
-    return kept.length ? `${base}?${kept.join("&")}` : base;
-}
-function effectiveWebSocketPath(path, earlyData) {
-    if (!earlyData || !Number.isInteger(earlyData) || earlyData <= 0)
-        return path;
-    const separator = path.includes("?") ? "&" : "?";
-    return /(?:^|[?&])ed=\d+(?:&|$)/.test(path) ? path : `${path}${separator}ed=${earlyData}`;
-}
-function formatServer(server) {
-    return server.includes(":") && !server.startsWith("[") ? `[${server}]` : server;
-}
-
-};
-
-__m["output/singbox/index"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.buildSingboxConfig = buildSingboxConfig;
-exports.buildSingboxBestPingConfig = buildSingboxBestPingConfig;
-exports.buildSingboxBestFragmentConfig = buildSingboxBestFragmentConfig;
-exports.buildSingboxBestPingFragmentConfig = buildSingboxBestPingFragmentConfig;
-const errors_1 = __r("../../core/errors");
-const share_link_1 = __r("../share-link");
-function outbound(node, index, fragmentProfile, _useUtls = false) {
-    // _useUtls is retained for call-site compatibility only. The selected TLS fingerprint is
-    // a first-class output selection: sing-box previously emitted uTLS only when a separate
-    // opt-in flag was set, silently dropping the fingerprint Xray/Mihomo always emit (audit F3).
-    const base = {
-        type: node.protocol,
-        tag: `proxy-${index}`,
-        server: node.server,
-        server_port: node.port,
-    };
-    if (node.protocol === "vless")
-        base.uuid = node.credential;
-    else
-        base.password = node.credential;
-    if (node.protocol === "vless")
-        base.packet_encoding = "packetaddr";
-    if (node.security === "tls") {
-        base.tls = {
-            enabled: true,
-            server_name: node.tls?.serverName || node.server,
-            ...(node.tls?.alpn?.length ? { alpn: node.tls.alpn } : {}),
-            ...(node.tls?.fingerprint ? { utls: { enabled: true, fingerprint: node.tls.fingerprint === "randomized" ? "random" : node.tls.fingerprint } } : {}),
-            ...(fragmentProfile?.fragment ? { fragment: true } : {}),
-            ...(fragmentProfile?.recordFragment ? { record_fragment: true } : {}),
-        };
-    }
-    base.transport = {
-        type: "ws",
-        path: (0, share_link_1.webSocketPathWithoutEarlyData)(node.websocket.path),
-        headers: node.websocket.host ? { Host: node.websocket.host } : {},
-        ...(node.websocket.earlyData ? { max_early_data: node.websocket.earlyData, early_data_header_name: "Sec-WebSocket-Protocol" } : {}),
-    };
-    return base;
-}
-function baseConfig(outbounds, proxyTags, options) {
-    if (!proxyTags.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Sing-box output requires at least one node");
-    const strategy = options.strategy ?? (proxyTags.length === 1 ? "manual" : "manual");
-    const routing = strategy === "manual" && proxyTags.length === 1
-        ? { final: proxyTags[0] }
-        : { final: "proxy" };
-    const group = strategy === "urltest"
-        ? {
-            type: "urltest",
-            tag: "proxy",
-            outbounds: [...proxyTags],
-            url: options.probeUrl ?? "https://www.gstatic.com/generate_204",
-            interval: options.interval ?? "30s",
-            tolerance: options.tolerance ?? 50,
-        }
-        : {
-            type: "selector",
-            tag: "proxy",
-            outbounds: [...proxyTags],
-            default: proxyTags[0],
-        };
-    // sing-box has no `udp` toggle on the SOCKS inbound (UDP association is inherent to its
-    // SOCKS5 implementation); the field is not in the sing-box schema and risks rejection by
-    // strict validation (audit F12).
-    const inbounds = [{
-            type: "socks",
-            tag: "socks-in",
-            listen: "127.0.0.1",
-            listen_port: options.socksPort ?? 2080,
-        }];
-    if (options.enableTun) {
-        inbounds.push({
-            type: "tun",
-            tag: "tun-in",
-            address: ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
-            auto_route: true,
-            auto_detect_interface: true,
-        });
-    }
-    return {
-        log: { level: "warn" },
-        dns: {
-            servers: [
-                { type: "https", tag: "doh-cf", server: "1.1.1.1", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "cloudflare-dns.com" } },
-                { type: "https", tag: "doh-google", server: "8.8.8.8", server_port: 443, path: "/dns-query", tls: { enabled: true, server_name: "dns.google" } },
-            ],
-            final: "doh-cf",
-        },
-        inbounds,
-        outbounds: [
-            ...outbounds,
-            group,
-            { type: "direct", tag: "direct" },
-        ],
-        route: {
-            ...routing,
-            // sing-box 1.12 deprecates dialing without a domain resolver: a config
-            // with neither `route.default_domain_resolver` nor a per-outbound
-            // `domain_resolver` is FATAL in strict clients (e.g. v2rayN's bundled
-            // sing-box core) and the legacy behavior is removed in sing-box 1.14.
-            // Point the route default at this config's own final DNS server so
-            // every outbound resolves through it; a per-outbound `domain_resolver`
-            // can still override this default.
-            default_domain_resolver: "doh-cf",
-            auto_detect_interface: true,
-        },
-    };
-}
-function buildSingboxConfig(nodes, socksPortOrOptions = 2080) {
-    const options = typeof socksPortOrOptions === "number" ? { socksPort: socksPortOrOptions } : socksPortOrOptions;
-    const outbounds = nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, options.useUtls));
-    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), options);
-}
-function buildSingboxBestPingConfig(nodes, options = {}) {
-    const outbounds = nodes.map((node, index) => outbound(node, index + 1, options.fragmentProfile, options.useUtls));
-    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
-}
-function buildSingboxBestFragmentConfig(nodes, profiles, options = {}) {
-    const expanded = [];
-    for (const node of nodes) {
-        if (node.security !== "tls")
-            continue;
-        for (const profile of profiles)
-            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
-    }
-    if (!expanded.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Best Fragment requires at least one TLS-compatible node");
-    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.useUtls));
-    // "Best Fragment" must actually select: a manual selector never tests the fragment
-    // variants, diverging from the Xray leastPing semantics of the same artifact (audit F4).
-    // urltest over the expanded variants mirrors Best Ping Fragment, as in Xray's alias pair.
-    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
-}
-function buildSingboxBestPingFragmentConfig(nodes, profiles, options = {}) {
-    const expanded = [];
-    for (const node of nodes) {
-        if (node.security !== "tls")
-            continue;
-        for (const profile of profiles)
-            expanded.push({ node: { ...node, name: `${node.name}-${profile.id}` }, profile });
-    }
-    if (!expanded.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Best Ping Fragment requires at least one TLS-compatible node");
-    const outbounds = expanded.map((item, index) => outbound(item.node, index + 1, item.profile, options.useUtls));
-    return baseConfig(outbounds, outbounds.map((item) => String(item.tag)), { ...options, strategy: "urltest" });
-}
-
-};
-
-__m["output/clash/index"] = function(module, exports, __r) {
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.buildClashConfig = buildClashConfig;
-exports.buildClashBestPingConfig = buildClashBestPingConfig;
-const share_link_1 = __r("../share-link");
-const errors_1 = __r("../../core/errors");
-function yamlString(value) {
-    // JSON double-quoted strings are valid YAML double-quoted scalars and correctly escape control characters.
-    return JSON.stringify(value);
-}
-function nodeYaml(node) {
-    const lines = [
-        `  - name: ${yamlString(node.name)}`,
-        `    type: ${node.protocol}`,
-        `    server: ${yamlString(node.server)}`,
-        `    port: ${node.port}`,
-    ];
-    if (node.protocol === "vless") {
-        lines.push(`    uuid: ${yamlString(node.credential)}`);
-    }
-    else {
-        if (node.security !== "tls")
-            throw new errors_1.CoreError("CONFIGURATION_ERROR", "Mihomo Trojan output requires TLS for public configurations");
-        lines.push(`    password: ${yamlString(node.credential)}`);
-    }
-    // Mihomo supports UDP for Trojan as well as VLESS; emitting udp:false for Trojan silently
-    // disabled UDP for Trojan-only bundles (audit F2).
-    lines.push("    udp: true");
-    if (node.security === "tls") {
-        lines.push("    tls: true");
-        const tlsServerName = yamlString(node.tls?.serverName || node.server);
-        lines.push(`    ${node.protocol === "trojan" ? "sni" : "servername"}: ${tlsServerName}`);
-        if (node.tls?.alpn?.length) {
-            lines.push("    alpn:");
-            for (const value of node.tls.alpn)
-                lines.push(`      - ${yamlString(value)}`);
-        }
-        if (node.tls?.fingerprint)
-            lines.push(`    client-fingerprint: ${yamlString(node.tls.fingerprint === "randomized" ? "random" : node.tls.fingerprint)}`);
-    }
-    lines.push("    network: ws", "    ws-opts:");
-    lines.push(`      path: ${yamlString((0, share_link_1.webSocketPathWithoutEarlyData)(node.websocket.path))}`);
-    if (node.websocket.earlyData) {
-        lines.push(`      max-early-data: ${node.websocket.earlyData}`);
-        lines.push("      early-data-header-name: Sec-WebSocket-Protocol");
-    }
-    if (node.websocket.host)
-        lines.push("      headers:", `        Host: ${yamlString(node.websocket.host)}`);
-    return lines;
-}
-function baseYaml(nodes, groupType, groupUrl, interval, tolerance, mixedPort = 7890, optionsEnableTunPlaceholder = false) {
-    if (!nodes.length)
-        throw new errors_1.CoreError("CONFIGURATION_ERROR", "Mihomo output requires at least one node");
-    const lines = [
-        `mixed-port: ${mixedPort}`,
-        "allow-lan: false",
-        "mode: rule",
-        "proxies:",
-    ];
-    for (const node of nodes)
-        lines.push(...nodeYaml(node));
-    lines.push("proxy-groups:", "  - name: PROXY", `    type: ${groupType}`, "    proxies:");
-    for (const node of nodes)
-        lines.push(`      - ${yamlString(node.name)}`);
-    if (groupType === "url-test") {
-        lines.push(`    url: ${yamlString(groupUrl ?? "https://www.gstatic.com/generate_204")}`);
-        lines.push(`    interval: ${interval ?? 30}`);
-        lines.push(`    tolerance: ${tolerance ?? 50}`);
-    }
-    lines.push("dns:", "  enable: true", "  ipv6: true", "  enhanced-mode: fake-ip", "  nameserver:", "    - https://cloudflare-dns.com/dns-query", "    - https://dns.google/dns-query", "  fallback:", "    - tls://1.1.1.1:853", "    - tls://8.8.8.8:853", "  respect-rules: true");
-    if (optionsEnableTunPlaceholder) {
-        lines.push("tun:", "  enable: true", "  stack: system", "  auto-route: true", "  auto-detect-interface: true", "  dns-hijack:", "    - any:53");
-    }
-    lines.push("rules:", "  - MATCH,PROXY", "");
-    return lines.join("\n");
-}
-function buildClashConfig(nodes, options = 7890) {
-    const config = typeof options === "number" ? { mixedPort: options } : options;
-    return baseYaml(nodes, config.groupStrategy ?? "select", config.probeUrl, config.interval, config.tolerance, config.mixedPort ?? 7890, config.enableTun ?? false);
-}
-function buildClashBestPingConfig(nodes, options = {}) {
-    return baseYaml(nodes, "url-test", options.probeUrl, options.interval, options.tolerance, options.mixedPort ?? 7890, options.enableTun ?? false);
 }
 
 };
@@ -10383,14 +12939,24 @@ __m["transport/websocket/adapter"] = function(module, exports, __r) {
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.CloudflareWebSocketAdapter = void 0;
+exports.hasWebSocketUpgradeToken = hasWebSocketUpgradeToken;
 exports.tryExtractEarlyData = tryExtractEarlyData;
 exports.websocketUpgradeRequiredResponse = websocketUpgradeRequiredResponse;
 const byte_queue_1 = __r("../../core/byte-queue");
 const errors_1 = __r("../../core/errors");
 const types_1 = __r("../../core/types");
 const byte_writer_1 = __r("./byte-writer");
+// DS-I2 (RFC 6455 §4.2.1): the Upgrade header must CONTAIN the
+// "websocket" token, not equal it — "WebSocket, h2c" is a valid upgrade
+// offer. Split on commas, trim, and compare case-insensitively.
+function hasWebSocketUpgradeToken(request) {
+    const header = request.headers.get("Upgrade");
+    if (!header)
+        return false;
+    return header.split(",").some((token) => token.trim().toLowerCase() === "websocket");
+}
 function isWebSocketUpgrade(request) {
-    return request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+    return hasWebSocketUpgradeToken(request);
 }
 function decodeBase64Url(value) {
     const normalized = value.trim().replace(/-/g, "+").replace(/_/g, "/");
@@ -10417,13 +12983,31 @@ function extractEarlyData(request, options) {
     const encoded = tokens[0] ?? "";
     if (!encoded)
         return null;
+    const max = Math.min(types_1.CORE_LIMITS.maxEarlyDataBytes, options.maxEarlyDataBytes ?? types_1.CORE_LIMITS.maxEarlyDataBytes);
+    // DS-L10: a decodable-but-oversize first token is rejected with
+    // BAD_REQUEST instead of being silently dropped (which previously left
+    // the handshake waiting until the 10s timeout produced a 1011
+    // "Timeout"). Undecodable tokens still return null (they are not early
+    // data at all), and the A9 printable-ASCII disambiguation still applies:
+    // an all-printable token is a subprotocol name, never early data, so it
+    // is left for negotiation regardless of size. The encoded-length
+    // pre-check keeps the same rule for overlong tokens: decode them, and
+    // reject only if they are decodable, non-printable, and oversize.
+    if (encoded.length > Math.ceil(max * 4 / 3) + 8) {
+        try {
+            const bytes = decodeBase64Url(encoded);
+            if (bytes.byteLength > max && !bytes.every((byte) => byte >= 0x20 && byte <= 0x7e)) {
+                throw new errors_1.CoreError("BAD_REQUEST", "WebSocket early data exceeds the configured size limit");
+            }
+        }
+        catch (error) {
+            if (error instanceof errors_1.CoreError)
+                throw error;
+        }
+        return null;
+    }
     try {
-        const max = Math.min(types_1.CORE_LIMITS.maxEarlyDataBytes, options.maxEarlyDataBytes ?? types_1.CORE_LIMITS.maxEarlyDataBytes);
-        if (encoded.length > Math.ceil(max * 4 / 3) + 8)
-            return null;
         const bytes = decodeBase64Url(encoded);
-        if (bytes.byteLength > max)
-            return null;
         // Disambiguation (A9): a token that base64url-decodes to printable ASCII
         // is an ordinary RFC 6455 subprotocol name, not a binary protocol payload
         // (real early data is a VLESS/Trojan header or TLS ClientHello — always
@@ -10431,9 +13015,13 @@ function extractEarlyData(request, options) {
         // corrupt the handshake, so such tokens are left for negotiation instead.
         if (bytes.every((byte) => byte >= 0x20 && byte <= 0x7e))
             return null;
+        if (bytes.byteLength > max)
+            throw new errors_1.CoreError("BAD_REQUEST", "WebSocket early data exceeds the configured size limit");
         return { bytes, tokenIndex: 0 };
     }
-    catch {
+    catch (error) {
+        if (error instanceof errors_1.CoreError)
+            throw error;
         return null;
     }
 }
@@ -10556,7 +13144,9 @@ function truncateUtf8(value, maxBytes) {
     return value.slice(0, end);
 }
 function websocketUpgradeRequiredResponse() {
-    return new Response("Expected Upgrade: websocket", { status: 426 });
+    // DS-I1 (RFC 9110 §15.5.22): a 426 response carries the Upgrade header
+    // naming the required protocol.
+    return new Response("Expected Upgrade: websocket", { status: 426, headers: { upgrade: "websocket" } });
 }
 
 };
@@ -10738,6 +13328,8 @@ const defaults_1 = __r("../egress/defaults");
 const relay_1 = __r("../egress/relay");
 const rules_1 = __r("../routing/rules");
 const profiles_1 = __r("../output/profiles");
+const rules_2 = __r("../output/rules");
+const outbounds_1 = __r("../output/outbounds");
 class ConfigurationValidationError extends errors_1.CoreError {
     constructor(issues) {
         super("CONFIGURATION_ERROR", `Worker configuration is invalid (${issues.length} issue${issues.length === 1 ? "" : "s"})`, false, { cause: issues });
@@ -10780,6 +13372,7 @@ const STRING_ENV_FIELDS = new Set([
     "CORE_XRAY_PROBE_INTERVAL", "CORE_XRAY_OBSERVATORY_CONCURRENCY",
     "CORE_XRAY_FRAGMENT_PROBE_INTERVAL", "CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY",
     "CORE_OUTPUT_PROBE_URL",
+    "CORE_OUTPUT_ROUTING_RULES", "CORE_OUTPUT_SINGBOX_OUTBOUNDS", "CORE_OUTPUT_XRAY_OUTBOUNDS", "CORE_OUTPUT_CLASH_PROXIES",
     "CORE_OUTPUT_TOKEN", "CORE_OUTPUT_ALLOW_QUERY_TOKEN", "CORE_OUTPUT_ALLOW_RAW",
     "CORE_OUTPUT_DEFAULT_NODES", "CORE_OUTPUT_MAX_NODES", "CORE_OUTPUT_MAX_BYTES",
     "CORE_OUTPUT_MAX_ENDPOINTS", "CORE_OUTPUT_MAX_CREDENTIALS",
@@ -10925,10 +13518,16 @@ function validatePath(issues, field, raw, fallback) {
         || !value.startsWith("/")
         || value.includes("?") || value.includes("#") || value.includes("\\")
         || value.includes("%")
+        // DS-L3: reject the WHATWG path percent-encode set (" < > ` { }) and
+        // non-ASCII characters. The URL parser percent-encodes those in
+        // `pathname`, so such a configured path could never equal any request
+        // pathname and the endpoint would 404 forever.
+        || /["<>`{}]/.test(value)
+        || /[^\x00-\x7f]/.test(value)
         || /[\s\u0000-\u001f\u007f]/.test(value)
         || (value.length > 1 && value.endsWith("/"))
         || value.split("/").some((segment) => segment === "." || segment === "..")) {
-        pushIssue(issues, field, "must be a canonical URL pathname starting with / and must not contain query, fragment, backslash, percent-encoding, spaces, control characters, dot segments or a trailing slash");
+        pushIssue(issues, field, "must be a canonical URL pathname starting with / and must not contain query, fragment, backslash, percent-encoding, spaces, control characters, the characters \" < > ` { }, non-ASCII characters, dot segments or a trailing slash");
         return fallback;
     }
     return value;
@@ -11009,7 +13608,7 @@ function validateUsers(issues, env) {
     }
 }
 const PLACEHOLDER_PASSWORDS = new Set([
-    "change-me", "changeme", "change_me", "replace-me", "replace_me", "placeholder",
+    "change-me", "changeme", "change_me", "password", "replace-me", "replace_me", "placeholder",
     "your-password", "your-trojan-password", "example-password", "default-password",
     "trojan-password", "generate-a-password",
 ]);
@@ -11025,6 +13624,23 @@ function validateToken(issues, field, value, required) {
         pushIssue(issues, field, `must not exceed ${MAX_TOKEN_LENGTH} characters`);
     if (trimmed && /[\r\n]/.test(trimmed))
         pushIssue(issues, field, "must not contain CR/LF characters");
+}
+// DS-L4: path secrets travel inside `url.pathname`, which the URL parser
+// serializes with percent-encoding, so a secret containing a character
+// from the WHATWG path percent-encode set (space, " # < > ? ` { }), a
+// stray "%" (re-encoded unless it already forms a valid escape), a control
+// character, or a non-ASCII character can never equal a request pathname
+// and silently deadens path-secret access (the header-token path keeps
+// working, masking the failure). Bearer tokens are NOT restricted this
+// way — they travel in a header, not a pathname. A "/" inside a secret
+// DOES work via multi-segment exact equality (base/secret is compared as
+// a whole path), so "/" is deliberately allowed.
+function validatePathSecret(issues, field, value) {
+    validateToken(issues, field, value, false);
+    const trimmed = value?.trim() ?? "";
+    if (trimmed && (/["#<>?`{}%]/.test(trimmed) || /[\s\u0000-\u001f\u007f]/.test(trimmed) || /[^\x00-\x7f]/.test(trimmed))) {
+        pushIssue(issues, field, "must use URL-path-safe characters only (no spaces, controls, %, \", #, <, >, ?, `, {, } or non-ASCII characters); '/' is allowed");
+    }
 }
 // Tokens and path secrets are documented as distinct capabilities; reusing one value across
 // capabilities silently merges them, so reuse is rejected (C1). CORE_TEST_TOKEN is the legacy
@@ -11118,30 +13734,68 @@ function validateProxyIp(issues, env) {
     }
 }
 function parseEndpoint(value) {
+    // DS-L13 (validation half; the egress side wraps parse errors as
+    // CoreError in src/egress/proxyip.ts): legacy entries follow the shared
+    // grammar [socks5://[user:pass@]]host:port, plus the plain host /
+    // host:port / [ipv6]:port forms. The scheme and userinfo are stripped
+    // here so the host/port checks in validateProxyIp see the bare host —
+    // previously a "socks5://user:pass@host:port" entry reached those checks
+    // as one opaque string and any failure surfaced later as an unclassified
+    // 500 instead of a startup CONFIGURATION_ERROR (503). A scheme other
+    // than socks5, an empty user or host, an unbracketed multi-colon host
+    // that is not a valid IPv6 literal, or a non-numeric port all throw.
+    // The port is optional (default 1080, as before); when present it must
+    // be digits, and the 1..65535 range is enforced by the caller, mirroring
+    // the field-by-field JSON-path checks.
     const raw = value.trim();
     if (!raw)
         throw new Error("empty endpoint");
-    if (raw.startsWith("[")) {
-        const close = raw.indexOf("]");
+    let rest = raw;
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) {
+        if (!/^socks5:\/\//i.test(raw))
+            throw new Error("unsupported endpoint scheme");
+        rest = raw.slice("socks5://".length);
+        if (!rest)
+            throw new Error("empty socks5 endpoint");
+        const at = rest.lastIndexOf("@");
+        if (at >= 0) {
+            const userinfo = rest.slice(0, at);
+            rest = rest.slice(at + 1);
+            const user = userinfo.slice(0, userinfo.indexOf(":") < 0 ? userinfo.length : userinfo.indexOf(":"));
+            if (!user || !rest)
+                throw new Error("invalid socks5 endpoint");
+        }
+    }
+    if (!rest)
+        throw new Error("empty endpoint");
+    if (rest.startsWith("[")) {
+        const close = rest.indexOf("]");
         if (close < 0)
             throw new Error("bad ipv6 endpoint");
-        const host = raw.slice(1, close);
-        const rest = raw.slice(close + 1);
-        if (!rest)
+        const host = rest.slice(1, close);
+        const tail = rest.slice(close + 1);
+        if (!host || !isIpv6Literal(host))
+            throw new Error("bad ipv6 endpoint");
+        if (!tail)
             return { host, port: 1080 };
-        if (!/^:\d+$/.test(rest))
+        if (!/^:\d+$/.test(tail))
             throw new Error("bad port");
-        return { host, port: Number(rest.slice(1)) };
+        return { host, port: Number(tail.slice(1)) };
     }
-    const colonCount = (raw.match(/:/g) ?? []).length;
-    if (colonCount > 1 && isIpv6Literal(raw))
-        return { host: raw, port: 1080 };
-    const index = raw.lastIndexOf(":");
+    const colonCount = (rest.match(/:/g) ?? []).length;
+    if (colonCount > 1) {
+        if (!isIpv6Literal(rest))
+            throw new Error("bad ipv6 endpoint");
+        return { host: rest, port: 1080 };
+    }
+    const index = rest.lastIndexOf(":");
     if (index < 0)
-        return { host: raw, port: 1080 };
-    if (!/^\d+$/.test(raw.slice(index + 1)))
+        return { host: rest, port: 1080 };
+    if (index === 0)
+        throw new Error("empty host");
+    if (!/^\d+$/.test(rest.slice(index + 1)))
         throw new Error("bad port");
-    return { host: raw.slice(0, index), port: Number(raw.slice(index + 1)) };
+    return { host: rest.slice(0, index), port: Number(rest.slice(index + 1)) };
 }
 function validateDns(issues, env) {
     const egressMode = (env.EGRESS_MODE?.trim().toLowerCase() || "smart");
@@ -11191,16 +13845,22 @@ function validateOutput(issues, env, securityConfig) {
         ports = (0, endpoints_1.getOutputPorts)(env);
     }
     catch (error) {
+        // DS-L2: record and CONTINUE instead of early-returning, so the
+        // endpoint, probe-URL and OUTPUT_NAME/OUTPUT_REMARK checks below still
+        // run and validation stays aggregated as documented. With no usable
+        // ports, only the dependent security-mapping loop is skipped.
         pushIssue(issues, issueFieldFromError(error, "OUTPUT_PORT"), error instanceof errors_1.CoreError ? error.message : "contains an invalid output port");
-        return;
+        ports = [];
     }
-    try {
-        for (const port of ports)
-            (0, security_1.securityForPort)(port, securityConfig);
-    }
-    catch (error) {
-        pushIssue(issues, issueFieldFromError(error, "OUTPUT_TLS_PORTS/OUTPUT_HTTP_PORTS"), error instanceof errors_1.CoreError ? error.message : "contains an invalid port security mapping");
-        return;
+    if (ports.length) {
+        try {
+            for (const port of ports)
+                (0, security_1.securityForPort)(port, securityConfig);
+        }
+        catch (error) {
+            // DS-L2: same aggregation fix for the security-mapping step.
+            pushIssue(issues, issueFieldFromError(error, "OUTPUT_TLS_PORTS/OUTPUT_HTTP_PORTS"), error instanceof errors_1.CoreError ? error.message : "contains an invalid port security mapping");
+        }
     }
     try {
         (0, endpoints_1.buildOutputEndpoints)(env, { requestHost: env.OUTPUT_HOST?.trim() || env.WS_HOST?.trim() || "example.com" });
@@ -11415,6 +14075,66 @@ function validateAdvanced(issues, env) {
     validateRoutingProviders(issues, env);
     validateExternalSubscriptions(issues, env);
 }
+// Layer-1 validation for client-side routing rules and custom outbounds (see
+// src/output/rules.ts for the two-layer model). Rules are shared input across
+// all three targets, so an explicit outbound tag must resolve in EVERY target
+// (or be one of the well-known proxy/direct/block tags): a rule that only works
+// for one target would otherwise fail the other artifacts at render time with
+// no startup signal. Per-target untranslatability (geo for sing-box, port_range
+// for Clash) is deliberately NOT a startup error — it fails only that artifact.
+function validateCustomRouting(issues, env) {
+    const ruleIssues = (0, rules_2.collectRoutingRuleIssues)(env.CORE_OUTPUT_ROUTING_RULES, "CORE_OUTPUT_ROUTING_RULES");
+    for (const message of ruleIssues)
+        pushIssue(issues, "CORE_OUTPUT_ROUTING_RULES", message);
+    const outboundVars = [
+        { field: "CORE_OUTPUT_SINGBOX_OUTBOUNDS", target: "sing-box" },
+        { field: "CORE_OUTPUT_XRAY_OUTBOUNDS", target: "xray" },
+        { field: "CORE_OUTPUT_CLASH_PROXIES", target: "clash" },
+    ];
+    const tagsByTarget = new Map();
+    for (const { field, target } of outboundVars) {
+        const value = env[field];
+        const outboundIssues = (0, outbounds_1.collectOutboundIssues)(target, value, field);
+        for (const message of outboundIssues)
+            pushIssue(issues, field, message);
+        // Only cross-check tags when both sides parsed cleanly; otherwise the
+        // individual issues above already explain the failure.
+        if (!outboundIssues.length && value?.trim()) {
+            try {
+                tagsByTarget.set(target, new Set((0, outbounds_1.outboundTags)(target, (0, outbounds_1.parseOutbounds)(target, value))));
+            }
+            catch {
+                tagsByTarget.set(target, new Set());
+            }
+        }
+        else
+            tagsByTarget.set(target, new Set());
+    }
+    if (ruleIssues.length)
+        return;
+    let rules = [];
+    try {
+        rules = (0, rules_2.parseRoutingRules)(env.CORE_OUTPUT_ROUTING_RULES);
+    }
+    catch {
+        return;
+    }
+    rules.forEach((rule, index) => {
+        if (rule.action !== "outbound" || !rule.outbound)
+            return;
+        const tag = rule.outbound;
+        if (rules_2.WELL_KNOWN_OUTBOUND_TAGS.has(tag))
+            return;
+        const missing = ["sing-box", "xray", "clash"].filter((target) => !tagsByTarget.get(target)?.has(tag));
+        if (missing.length) {
+            pushIssue(issues, "CORE_OUTPUT_ROUTING_RULES", `rule ${index}: outbound tag '${tag}' is not defined for ${missing.join(", ")}; define it in every target or use a well-known tag (proxy, direct, block)`);
+        }
+    });
+    const expandedLines = (0, rules_2.countClashExpandedLines)(rules);
+    if (expandedLines > rules_2.MAX_CLASH_EXPANDED_LINES) {
+        pushIssue(issues, "CORE_OUTPUT_ROUTING_RULES", `expands to ${expandedLines} Clash rule lines, exceeding the ${rules_2.MAX_CLASH_EXPANDED_LINES} cap`);
+    }
+}
 function validateEnvironment(env) {
     // The cache key must distinguish everything validation actually depends on (C20): string
     // values are JSON-encoded (so no separator value can forge a collision), and object bindings
@@ -11452,6 +14172,11 @@ function validateEnvironment(env) {
     validateToken(issues, "CORE_ADMIN_TOKEN", env.CORE_ADMIN_TOKEN, false);
     validateToken(issues, "CORE_OUTPUT_TOKEN", env.CORE_OUTPUT_TOKEN, false);
     validateToken(issues, "CORE_TEST_TOKEN", env.CORE_TEST_TOKEN, false);
+    // DS-L5: the legacy-test-token opt-in was the only boolean never
+    // validated at startup, so a typo like "ture" silently behaved as false.
+    // src/security/authorize.ts treats only 1/true/yes/on as enabled, which
+    // is exactly the TRUE_VALUES set parseBooleanField accepts.
+    parseBooleanField(issues, "CORE_ALLOW_LEGACY_TEST_TOKEN", env.CORE_ALLOW_LEGACY_TEST_TOKEN, false);
     validateToken(issues, "CORE_DOH_TOKEN", env.CORE_DOH_TOKEN, false);
     parseIntegerField(issues, "CORE_MAX_CONCURRENT_ADDRESS_TRIES", env.CORE_MAX_CONCURRENT_ADDRESS_TRIES, 4, 1, 4);
     parseIntegerField(issues, "CORE_ADDRESS_TRY_STAGGER_MS", env.CORE_ADDRESS_TRY_STAGGER_MS, 100, 0, 5_000);
@@ -11470,6 +14195,7 @@ function validateEnvironment(env) {
         outputSecurity = { tlsPorts: [], httpPorts: [], explicitTlsPorts: [], explicitHttpPorts: [] };
     }
     validateOutput(issues, env, outputSecurity);
+    validateCustomRouting(issues, env);
     const probeInterval = env.CORE_XRAY_PROBE_INTERVAL?.trim();
     if (probeInterval && !/^\d+(?:ms|s|m|h)$/.test(probeInterval)) {
         pushIssue(issues, "CORE_XRAY_PROBE_INTERVAL", "must be an Xray duration such as 30s, 60s, 5m or 1h");
@@ -11502,8 +14228,8 @@ function validateEnvironment(env) {
         }
     }
     parseBooleanField(issues, "CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY", env.CORE_XRAY_FRAGMENT_OBSERVATORY_CONCURRENCY, false);
-    validateToken(issues, "CORE_DOH_PATH_SECRET", env.CORE_DOH_PATH_SECRET, false);
-    validateToken(issues, "CORE_OUTPUT_PATH_SECRET", env.CORE_OUTPUT_PATH_SECRET, false);
+    validatePathSecret(issues, "CORE_DOH_PATH_SECRET", env.CORE_DOH_PATH_SECRET);
+    validatePathSecret(issues, "CORE_OUTPUT_PATH_SECRET", env.CORE_OUTPUT_PATH_SECRET);
     validateTokenUniqueness(issues, env);
     if (issues.length) {
         const error = new ConfigurationValidationError(issues);
